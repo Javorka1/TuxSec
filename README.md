@@ -72,3 +72,4 @@ cd parsec-linux-host
 ## 📄 Créditos e Licença
 
 Baseado no projeto [`lowlat`](https://github.com/nomi-san/lowlat) sob licença MIT, estendido com suporte universal de conectores DRM/Wayland FP16, Painel de Controle Gráfico (`lowlat-gui`) e Isolamento Automático de Áudio PipeWire (`lowlat-audio-guard`).
+# TuxSec
