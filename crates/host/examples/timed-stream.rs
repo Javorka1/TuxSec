@@ -1,0 +1,156 @@
+//! The stream loop against the real display, with a local seat.
+//!
+//!   sudo timed-stream [seconds]
+//!   LOWLAT_SYNTH=1 timed-stream [seconds]     the generator, no display needed
+//!
+//! Starts the same encode loop the daemon runs, capturing the display named
+//! in `LOWLAT_OUTPUT` (default `card0:HDMI-A-1`) and encoding on the backend
+//! named in `LOWLAT_BACKEND` (default the open stack), and reads what the
+//! seat receives for the duration. Prints the stage report the loop
+//! publishes.
+
+use lowlat_host::stream::{Backend, Codec, Config, Stream};
+use lowlat_host::timing::Report;
+
+fn main() {
+    let seconds: u64 = std::env::args()
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(15);
+    let output = std::env::var("LOWLAT_OUTPUT").ok();
+    // Nothing follows the display and lets LOWLAT_VULKAN_ENCODE prefer the
+    // third encoder; a name pins the backend exactly as the daemon's flag
+    // does. The old default of always naming one silently blocked the
+    // preference, and every ring "verification" through this probe was
+    // measuring the open backend.
+    let backend = match std::env::var("LOWLAT_BACKEND").as_deref() {
+        Ok("vendor") => Some(Backend::Vendor),
+        Ok("open") => Some(Backend::Open),
+        _ => None,
+    };
+
+    // **A watchdog, because a wedged display stack can hold a fence wait.**
+    // A run that has not finished in twice its budget plus setup is not going
+    // to; dying at a point of our choosing beats being killed mid-teardown
+    // minutes later, while holding imported scanout buffers and an armed
+    // vblank event. The alarm's default action ends the process.
+    // SAFETY: nothing else in this process arms an alarm.
+    unsafe { libc::alarm(u32::try_from(seconds).unwrap_or(30) * 2 + 30) };
+
+    let stream = Stream::start(Config {
+        // A live-run knob: the depth is otherwise the guests' to settle, and
+        // this probe drives the loop without any.
+        ten_bit: std::env::var("LOWLAT_TEN_BIT").is_ok_and(|v| v != "0"),
+        chroma_444: std::env::var("LOWLAT_CHROMA").is_ok_and(|v| v == "444"),
+        audio: None,
+        convert: None,
+        prefer_vulkan: false,
+        audio_on: false,
+        accept_microphone: false,
+        audio_kbps: 128,
+        allow_raw_audio: false,
+        output: output.clone(),
+        // `LOWLAT_SYNTH=1` runs the generator instead, which needs no display
+        // and no privilege, and is how the generator itself is checked.
+        display: std::env::var("LOWLAT_SYNTH").is_err(),
+        virtual_fallback: false,
+        wake_display: false,
+        hold_memory_clock: false,
+        own_display: lowlat_host::stream::OwnDisplay::default(),
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        cg_level: 1,
+        // A static desktop suppresses almost every frame, which leaves the
+        // stage percentiles measured over a handful of samples. Asking for
+        // every picture is what makes a timing run comparable.
+        full_fps: std::env::var("LOWLAT_FULL_FPS").is_ok_and(|v| v != "0"),
+        quality: lowlat_host::stream::Quality::default(),
+        codec: match std::env::var("LOWLAT_CODEC").as_deref() {
+            Ok("h265" | "hevc") => Codec::H265,
+            _ => Codec::H264,
+        },
+        backend,
+        configured_mbps: 10.0,
+        min_mbps: 1.0,
+        detail_rows: 0,
+    });
+
+    let wake = lowlat_net::Wake::new().expect("wake");
+    let seat = stream
+        .seats()
+        .take(
+            wake.handle().expect("handle"),
+            wake.handle().expect("a second handle"),
+            lowlat_host::stream::Declared::default(),
+        )
+        .expect("a free seat");
+
+    let began = std::time::Instant::now();
+    let mut received = 0usize;
+    // What the seat hands out is what the wire carries; written out so a
+    // decoder outside the project can say whether a client could start.
+    let mut bitstream = Vec::new();
+    while began.elapsed().as_secs() < seconds {
+        while let Some(frame) = seat.next_frame() {
+            bitstream.extend_from_slice(frame.bytes());
+            received += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let out = std::env::temp_dir().join("lowlat-stream.h264");
+    match std::fs::write(&out, &bitstream) {
+        Ok(()) => println!("wrote {} ({} bytes)", out.display(), bitstream.len()),
+        Err(error) => println!("write {}: {error}", out.display()),
+    }
+
+    let report: Report = stream.timings();
+    println!(
+        "received {received} frames in {seconds}s on {}",
+        output.as_deref().unwrap_or("the default output")
+    );
+    let line = |name: &str, p50: f64, p95: f64, p99: f64| {
+        println!("  {name:<9} p50 {p50:.3} ms  p95 {p95:.3} ms  p99 {p99:.3} ms");
+    };
+    line(
+        "acquire",
+        report.acquire.p50,
+        report.acquire.p95,
+        report.acquire.p99,
+    );
+    line(
+        "convert",
+        report.convert.p50,
+        report.convert.p95,
+        report.convert.p99,
+    );
+    line(
+        "pointer",
+        report.pointer.p50,
+        report.pointer.p95,
+        report.pointer.p99,
+    );
+    line(
+        "encode",
+        report.encode.p50,
+        report.encode.p95,
+        report.encode.p99,
+    );
+    line(
+        "publish",
+        report.publish.p50,
+        report.publish.p95,
+        report.publish.p99,
+    );
+    line(
+        "interval",
+        report.interval.p50,
+        report.interval.p95,
+        report.interval.p99,
+    );
+    println!(
+        "host stages sum p50 {:.3} ms  p99 {:.3} ms",
+        report.host_p50(),
+        report.host_p99()
+    );
+}

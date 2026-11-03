@@ -1,0 +1,700 @@
+//! Phase 3 gates 1, 2 and 4: the loop under a sustained stream.
+//!
+//! Two shells punch over loopback and then one pushes messages at a target
+//! packet rate while the other drains them, each on its own thread, which is
+//! the threading model the shell is actually built for.
+//!
+//! Three things are measured rather than asserted loosely:
+//!
+//! 1. **Nothing is lost.** Message bodies carry their own sequence, so a gap is
+//!    a gap and not an inference from a count. The kernel's own drop counter for
+//!    the receiving socket is read from the same place `ss` reads it, which is
+//!    what "the granted receive buffer is never overrun" means concretely.
+//! 2. **Steady state allocates nothing.** The counter is per thread, so each
+//!    loop is sampled on its own thread after the warm-up, and setup is free to
+//!    allocate because it is outside the window.
+//! 3. **The loop waits rather than ticks.** Timeout wakes are compared against
+//!    the deadlines actually armed, so the claim is a ratio and not a profile.
+//!
+//! Duration comes from `LOWLAT_SOAK_MS` so the same harness serves the quick
+//! per-run check and the ten- and sixty-minute soaks.
+
+// The loop is built where a platform's system calls are written.
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+
+use lowlat_common::alloc_counter::{self, Counting};
+use lowlat_common::clock::{Time, elapsed_ms};
+use lowlat_core::channel::{RecvRing, SlotMeta};
+use lowlat_core::conn::{Conn, Credentials, Kind};
+use lowlat_core::endpoint::Endpoint;
+use lowlat_core::envelope::Envelope;
+use lowlat_core::send::{SendRing, SendSlot};
+use lowlat_core::session::Session;
+use lowlat_net::{Shell, Socket, Wake};
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// Datagrams per second the stream aims for.
+///
+/// Above what a 1080p60 stream produces, so the loop is measured with headroom
+/// rather than at the edge of what it will actually carry.
+const TARGET_PPS: u64 = 10_000;
+
+/// One message per datagram at this size, so the packet rate and the message
+/// rate are the same number and a loss shows up in both.
+const BODY: usize = 1100;
+
+/// Long enough for the rate controller and the acknowledgement cadence to reach
+/// steady state before anything is sampled.
+const WARMUP_MS: f64 = 500.0;
+
+/// How long the receiver keeps running after the sender stops, so the messages
+/// still in flight arrive before the counts are compared.
+const SETTLE_MS: u64 = 1_000;
+
+const SLOT: usize = 1400;
+const SLOTS: usize = 256;
+
+/// **One test of this file at a time**, each taking this for its run. What
+/// they count is the process's -- its threads, descriptors, resident memory,
+/// timeout wakes against the processor -- so a neighbour's threads coming and
+/// going are counted too: CI's x86_64 macOS runner read the churn's threads as
+/// 8 before and 6 after, the two that left being the staging test's loops,
+/// finished between the two counts.
+static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// This test's turn at the process; a neighbour that panicked holding it
+/// leaves nothing to protect.
+fn alone() -> std::sync::MutexGuard<'static, ()> {
+    ALONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+const CHANNEL: u8 = 1;
+const KEY: [u8; 32] = [0x31u8; 32];
+const LEFT: (&str, &str) = ("aaaa", "passwordforaaaa");
+const RIGHT: (&str, &str) = ("bbbb", "passwordforbbbb");
+
+struct Arena {
+    recv_bodies: Vec<u8>,
+    recv_meta: Vec<SlotMeta>,
+    send_bodies: Vec<u8>,
+    send_meta: Vec<SendSlot>,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Self {
+            recv_bodies: vec![0u8; SLOT * SLOTS],
+            recv_meta: vec![SlotMeta::default(); SLOTS],
+            send_bodies: vec![0u8; SLOT * SLOTS],
+            send_meta: vec![SendSlot::default(); SLOTS],
+        }
+    }
+}
+
+fn shell<'a>(
+    arena: &'a mut Arena,
+    ours: (&'a str, &'a str),
+    theirs: (&'a str, &'a str),
+    seed: u8,
+) -> Shell<'a> {
+    let conn = Conn::new(
+        Credentials {
+            local_ufrag: ours.0,
+            local_pwd: ours.1,
+            remote_ufrag: theirs.0,
+            remote_pwd: theirs.1,
+        },
+        [seed; 16],
+        0.0,
+    );
+    let mut session = Session::new(Envelope::from_key(&KEY).unwrap(), 1, 0.0);
+    session
+        .attach_recv(
+            CHANNEL,
+            RecvRing::new(&mut arena.recv_bodies, &mut arena.recv_meta, SLOT).unwrap(),
+        )
+        .unwrap();
+    session
+        .attach_send(
+            CHANNEL,
+            SendRing::new(&mut arena.send_bodies, &mut arena.send_meta, SLOT, CHANNEL).unwrap(),
+        )
+        .unwrap();
+    Shell::new(
+        Socket::open(0).expect("socket"),
+        Wake::new().expect("wake"),
+        Endpoint::new(conn, session),
+    )
+}
+
+fn loopback_of(shell: &Shell<'_>) -> core::net::SocketAddr {
+    let mut addr = shell
+        .socket()
+        .expect("a datagram shell")
+        .local_addr()
+        .expect("addr");
+    addr.set_ip(core::net::IpAddr::V6(core::net::Ipv6Addr::LOCALHOST));
+    addr
+}
+
+/// Datagrams the kernel dropped on the socket bound to `port`, straight from
+/// the counter `ss -u -m` reports.
+///
+/// This is the only direct measure of the receive buffer being overrun. Counting
+/// what arrived cannot distinguish a datagram the kernel discarded from one that
+/// was never sent.
+#[cfg(target_os = "linux")]
+fn kernel_drops(port: u16) -> Option<u64> {
+    let table = std::fs::read_to_string("/proc/net/udp6").ok()?;
+    for line in table.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let Some(local) = fields.nth(1) else { continue };
+        let Some((_, hex_port)) = local.rsplit_once(':') else {
+            continue;
+        };
+        if u16::from_str_radix(hex_port, 16) != Ok(port) {
+            continue;
+        }
+        return line.split_whitespace().next_back()?.parse().ok();
+    }
+    Some(0)
+}
+
+/// Windows and macOS keep no drop count per socket that a test can read; the
+/// per-message sequence below is the loss check there.
+#[cfg(any(windows, target_os = "macos"))]
+fn kernel_drops(_port: u16) -> Option<u64> {
+    None
+}
+
+/// A pass that produces more datagrams than the staging batch holds must still
+/// finish. *Named regression test.*
+///
+/// Staging hands back the room left in the batch. Once that is shorter than the
+/// next datagram the core cannot encode into it, and a drain that asks again
+/// unchanged gets the same failure forever: the loop wedges at full CPU with
+/// the stream stopped. Reaching it needs more queued at once than the batch
+/// holds, so every test that sends a datagram or two passes straight over it.
+///
+/// Run on its own thread, because the failure is a hang rather than a wrong
+/// answer, and a hang inside the test would take the suite with it.
+#[test]
+fn a_pass_larger_than_the_staging_batch_still_completes() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let _alone = alone();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+
+    thread::spawn(move || {
+        // Two shells and a real punch, because media waits until a path exists.
+        // A single shell with a candidate and no path emits nothing, the batch
+        // never fills, and the test passes just as happily against the drain
+        // that spins.
+        let mut left_arena = Arena::new();
+        let mut right_arena = Arena::new();
+        let mut left = shell(&mut left_arena, LEFT, RIGHT, 0xC3);
+        let mut right = shell(&mut right_arena, RIGHT, LEFT, 0xD4);
+        let left_addr = loopback_of(&left);
+        let right_addr = loopback_of(&right);
+        left.endpoint()
+            .conn()
+            .add_candidate(right_addr, Kind::Reflexive)
+            .unwrap();
+        right
+            .endpoint()
+            .conn()
+            .add_candidate(left_addr, Kind::Reflexive)
+            .unwrap();
+        left.endpoint().conn().set_peer_ready();
+        right.endpoint().conn().set_peer_ready();
+
+        let started = Time::now();
+        while elapsed_ms(started) < 4_000.0 && left.endpoint().path().is_none() {
+            left.turn(|_| {}).expect("left turn");
+            right.turn(|_| {}).expect("right turn");
+        }
+        assert!(left.endpoint().path().is_some(), "no path to send over");
+
+        // The ring holds far more than the staging buffer, so the batch fills
+        // partway through the first pass that has somewhere to send.
+        let body = [0x5Au8; BODY];
+        for _ in 0..SLOTS {
+            if left
+                .endpoint()
+                .session()
+                .send_message(CHANNEL, &[], &body)
+                .is_err()
+            {
+                break;
+            }
+        }
+        for _ in 0..64 {
+            left.turn(|_| {}).expect("turn");
+        }
+        flag.store(true, Ordering::SeqCst);
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if done.load(Ordering::SeqCst) {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the drain never returned: a full staging batch spins instead of flushing");
+}
+
+#[test]
+fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
+    let _alone = alone();
+    let duration_ms: f64 = std::env::var("LOWLAT_SOAK_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000.0);
+    // Held for the run, as a library handle holds it for its life: without it
+    // a Windows wait lasts the system tick, not the deadline it was armed for.
+    let _resolution = lowlat_common::clock::TimerResolution::raise();
+
+    let mut left_arena = Arena::new();
+    let mut right_arena = Arena::new();
+    let mut left = shell(&mut left_arena, LEFT, RIGHT, 0xA1);
+    let mut right = shell(&mut right_arena, RIGHT, LEFT, 0xB2);
+
+    let left_addr = loopback_of(&left);
+    let right_addr = loopback_of(&right);
+    let right_port = right_addr.port();
+    left.endpoint()
+        .conn()
+        .add_candidate(right_addr, Kind::Reflexive)
+        .unwrap();
+    right
+        .endpoint()
+        .conn()
+        .add_candidate(left_addr, Kind::Reflexive)
+        .unwrap();
+    left.endpoint().conn().set_peer_ready();
+    right.endpoint().conn().set_peer_ready();
+
+    // Punch first, on one thread, because there is nowhere to send until both
+    // sides have a path and the stream would otherwise be measuring the punch.
+    //
+    // Each shell runs on its own clock from construction, so the punch and the
+    // stream share a timeline per side by construction; the clock below paces
+    // the sender and bounds the phases, nothing else.
+    let started = Time::now();
+    while elapsed_ms(started) < 4_000.0
+        && (left.endpoint().path().is_none() || right.endpoint().path().is_none())
+    {
+        left.turn(|_| {}).expect("left turn");
+        right.turn(|_| {}).expect("right turn");
+    }
+    assert!(left.endpoint().path().is_some(), "left found no path");
+    assert!(right.endpoint().path().is_some(), "right found no path");
+
+    // Everything below is measured from here, not from process start.
+    let punched = elapsed_ms(started);
+    let drops_before = kernel_drops(right_port);
+    // Two flags, because the last message handed to the session is still in
+    // flight when the sender stops. Comparing counts across a stream that has
+    // not quiesced measures the shutdown, not the transport.
+    let stop = AtomicBool::new(false);
+    let stop_receiver = AtomicBool::new(false);
+    let sent = AtomicU64::new(0);
+    let received = AtomicU64::new(0);
+    let gaps = AtomicU64::new(0);
+    let sender_allocs = AtomicU64::new(u64::MAX);
+    let receiver_allocs = AtomicU64::new(u64::MAX);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut body = [0u8; BODY];
+            let mut next: u64 = 0;
+            let mut baseline = None;
+            loop {
+                let now = elapsed_ms(started);
+                if now >= punched + WARMUP_MS && baseline.is_none() {
+                    baseline = Some(alloc_counter::count());
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Owed by the clock rather than by a per-pass count, so a slow
+                // pass is made up rather than silently lowering the rate. Capped
+                // per pass so one long pass cannot turn the loop into a burst
+                // that never returns to check whether it should stop.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped non-negative, and a soak long enough to                               overflow u64 at this rate cannot be run"
+                )]
+                let owed = ((now - punched).max(0.0) / 1000.0 * TARGET_PPS as f64) as u64;
+                let ceiling = next + SLOTS as u64;
+                left.turn(|endpoint| {
+                    while next < owed.min(ceiling) {
+                        body[..8].copy_from_slice(&next.to_be_bytes());
+                        // The window is bounded by the peer's ring depth, so a
+                        // refusal is back pressure and not an error.
+                        if endpoint.session().send_message(CHANNEL, &[], &body).is_err() {
+                            break;
+                        }
+                        next += 1;
+                    }
+                })
+                .expect("left turn");
+            }
+            sent.store(next, Ordering::Relaxed);
+            if let Some(before) = baseline {
+                sender_allocs.store(alloc_counter::count() - before, Ordering::Relaxed);
+            }
+            // **Queuing stops here; turning does not.** What the session accepted
+            // but has not paced out yet, and anything to send again, leaves only
+            // on a turn, so the sender keeps turning until the receiver stops. A
+            // sender that stopped with the queue left the tail unsent, which a
+            // slow machine showed as messages that never arrived.
+            while !stop_receiver.load(Ordering::Relaxed) {
+                left.turn(|_| {}).expect("left turn");
+            }
+        });
+
+        scope.spawn(|| {
+            let mut out = [0u8; SLOT];
+            let mut expect: u64 = 0;
+            let mut count: u64 = 0;
+            let mut seen_gaps: u64 = 0;
+            let mut baseline = None;
+            loop {
+                let now = elapsed_ms(started);
+                if now >= punched + WARMUP_MS && baseline.is_none() {
+                    baseline = Some(alloc_counter::count());
+                }
+                if stop_receiver.load(Ordering::Relaxed) {
+                    break;
+                }
+                right.turn(|_| {}).expect("right turn");
+                // Bounded per pass for the same reason as the sender: a drain
+                // that never yields cannot notice the run has ended.
+                let mut drained = 0;
+                while drained < SLOTS
+                    && let Some(Ok(len)) =
+                        right.endpoint().session().take_message(CHANNEL, &mut out)
+                {
+                    drained += 1;
+                    if len >= 8 {
+                        let seq = u64::from_be_bytes(out[..8].try_into().expect("eight bytes"));
+                        if seq != expect {
+                            seen_gaps += 1;
+                        }
+                        expect = seq + 1;
+                    }
+                    count += 1;
+                }
+            }
+            received.store(count, Ordering::Relaxed);
+            gaps.store(seen_gaps, Ordering::Relaxed);
+            if let Some(before) = baseline {
+                receiver_allocs.store(alloc_counter::count() - before, Ordering::Relaxed);
+            }
+        });
+
+        while elapsed_ms(started) < punched + WARMUP_MS + duration_ms {
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::Relaxed);
+        // Let the tail land and be acknowledged before the receiver stops.
+        thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
+        stop_receiver.store(true, Ordering::Relaxed);
+    });
+
+    let drops = kernel_drops(right_port)
+        .zip(drops_before)
+        .map(|(after, before)| after.saturating_sub(before));
+    let sent = sent.load(Ordering::Relaxed);
+    let received = received.load(Ordering::Relaxed);
+    let gaps = gaps.load(Ordering::Relaxed);
+    let sender_allocs = sender_allocs.load(Ordering::Relaxed);
+    let receiver_allocs = receiver_allocs.load(Ordering::Relaxed);
+    let left_stats = left.stats();
+    let right_stats = right.stats();
+    let seconds = duration_ms / 1000.0;
+
+    println!("soak:   {seconds:.1} s at a {TARGET_PPS} datagram/s target");
+    let drops_read = drops.map_or_else(|| "no".to_string(), |d| d.to_string());
+    println!(
+        "stream: {sent} messages sent, {received} received, {gaps} gaps, {drops_read} kernel drops"
+    );
+    println!(
+        "rate:   {:.0} messages/s, {} datagrams out, {} datagrams in",
+        received as f64 / seconds,
+        left_stats.datagrams_out,
+        right_stats.datagrams_in
+    );
+    println!("alloc:  {sender_allocs} sender, {receiver_allocs} receiver, in steady state");
+    println!(
+        "wakes:  sender {} timeout / {} datagram / {} send; receiver {} / {} / {}",
+        left_stats.timeout_wakes,
+        left_stats.datagram_wakes,
+        left_stats.send_wakes,
+        right_stats.timeout_wakes,
+        right_stats.datagram_wakes,
+        right_stats.send_wakes
+    );
+
+    assert_eq!(gaps, 0, "the stream lost or reordered messages");
+    assert_eq!(received, sent, "{} messages never arrived", sent - received);
+    if let Some(drops) = drops {
+        assert_eq!(
+            drops, 0,
+            "the kernel dropped {drops} datagrams on the receiver"
+        );
+    }
+    assert_eq!(sender_allocs, 0, "the sender allocated in steady state");
+    assert_eq!(receiver_allocs, 0, "the receiver allocated in steady state");
+
+    // Gate 4, in the terms the gate justifies itself with. A loop that polls
+    // instead of waiting wakes on a timeout every minimum wait, so its ceiling
+    // is 1000 / MIN_WAIT_MS per second. One that arms from the endpoint's own
+    // deadline wakes on a timeout only when a deadline genuinely came due, and
+    // an order of magnitude is what separates the two.
+    let ticking_per_sec = 1000.0 / lowlat_net::shell::MIN_WAIT_MS;
+    let ceiling = ticking_per_sec / 10.0;
+    for (who, stats) in [("sender", left_stats), ("receiver", right_stats)] {
+        let per_sec = stats.timeout_wakes as f64 / seconds;
+        assert!(
+            per_sec <= ceiling,
+            "{who} woke on a timeout {per_sec:.0}/s against a {ticking_per_sec:.0}/s tick, \
+             which is not far enough from polling"
+        );
+    }
+    println!(
+        "gate4:  sender {:.0}/s, receiver {:.0}/s timeout wakes, ceiling {ceiling:.0}/s, \
+         a polling loop would be {ticking_per_sec:.0}/s",
+        left_stats.timeout_wakes as f64 / seconds,
+        right_stats.timeout_wakes as f64 / seconds
+    );
+}
+
+/// Phase 3 gate 8: ten thousand connect and teardown cycles leak nothing.
+///
+/// Each cycle opens a socket, spawns the guest thread, lets it reach its loop,
+/// and tears it down. Descriptors and threads are counted exactly, because
+/// those are exact; resident memory is given a tolerance, because an allocator
+/// holds arenas back and a small plateau is not a leak.
+///
+/// **Flat is the pass condition.** The failure this exists for is a slow slope
+/// that never crashes: a few kilobytes a cycle is invisible below thousands of
+/// iterations and fatal over a day of streaming.
+///
+/// Cycles come from `LOWLAT_CHURN_CYCLES` so the default stays cheap and the
+/// nightly run is the real one.
+#[test]
+fn many_connect_and_teardown_cycles_leak_nothing() {
+    let _alone = alone();
+    let cycles: u64 = std::env::var("LOWLAT_CHURN_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+
+    /// Enough cycles for the allocator and the thread pool to reach a plateau,
+    /// so the baseline is steady state rather than start-up.
+    const WARM_CYCLES: u64 = 50;
+
+    // Descriptors on Linux and macOS and handles on Windows: what a cycle
+    // opens and must close, counted exactly on each.
+    #[cfg(target_os = "linux")]
+    fn descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+    #[cfg(target_os = "linux")]
+    fn field(name: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with(name))
+                    .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(target_os = "linux")]
+    fn threads() -> u64 {
+        field("Threads:")
+    }
+    #[cfg(target_os = "linux")]
+    fn resident_kb() -> u64 {
+        field("VmRSS:")
+    }
+    #[cfg(windows)]
+    fn descriptors() -> usize {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let mut count: u32 = 0;
+        // SAFETY: this process's pseudo handle and a writable count.
+        unsafe { GetProcessHandleCount(GetCurrentProcess(), &raw mut count) };
+        count as usize
+    }
+    #[cfg(windows)]
+    fn threads() -> u64 {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+        // SAFETY: a snapshot of the system's threads, walked with an entry of
+        // the size it declares and closed here.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return 0;
+            }
+            let me = GetCurrentProcessId();
+            let mut entry = THREADENTRY32 {
+                dwSize: u32::try_from(size_of::<THREADENTRY32>()).expect("a small struct"),
+                ..Default::default()
+            };
+            let mut count = 0;
+            let mut more = Thread32First(snapshot, &raw mut entry) != 0;
+            while more {
+                if entry.th32OwnerProcessID == me {
+                    count += 1;
+                }
+                more = Thread32Next(snapshot, &raw mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+            count
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn descriptors() -> usize {
+        std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0)
+    }
+    #[cfg(target_os = "macos")]
+    fn task() -> libc::proc_taskinfo {
+        // SAFETY: plain data; all zeroes is a valid value.
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(size_of::<libc::proc_taskinfo>()).expect("a small struct");
+        // SAFETY: this process's own task information, written into a
+        // structure of the size given.
+        unsafe {
+            libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        info
+    }
+    #[cfg(target_os = "macos")]
+    fn threads() -> u64 {
+        u64::try_from(task().pti_threadnum).unwrap_or(0)
+    }
+    #[cfg(target_os = "macos")]
+    fn resident_kb() -> u64 {
+        task().pti_resident_size / 1024
+    }
+    #[cfg(windows)]
+    fn resident_kb() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).expect("a small struct"),
+            ..Default::default()
+        };
+        // SAFETY: this process's pseudo handle and counters of the size given.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &raw mut counters, counters.cb) };
+        (counters.WorkingSetSize / 1024) as u64
+    }
+
+    // **Read once it has stopped moving.** A joined thread is gone from the
+    // process before join returns, but the kernel's count of the thread group
+    // drops a moment later, when the task is released; on a small machine
+    // under load the moment is long enough to be read, and a count taken then
+    // is one too high, so a thread that left reads as a thread that leaked.
+    fn threads_settled() -> u64 {
+        let began = std::time::Instant::now();
+        let mut last = threads();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let now = threads();
+            if now == last || began.elapsed() > std::time::Duration::from_secs(1) {
+                return now;
+            }
+            last = now;
+        }
+    }
+
+    let one_cycle = || {
+        let socket = Socket::open(0).expect("socket");
+        let wake = Wake::new().expect("wake");
+        let (ready, ack) = std::sync::mpsc::channel();
+        let mut guest = lowlat_net::Guest::spawn(wake, move |wake, running| {
+            let _ = ready.send(());
+            while !running.stopping() {
+                // Park on the wake exactly as the real loop does, so teardown
+                // has a parked thread to release rather than a spinning one.
+                let _ = wake.take();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+        .expect("spawn");
+        ack.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("guest never reached its loop");
+        guest.stop();
+        drop(socket);
+    };
+
+    for _ in 0..WARM_CYCLES {
+        one_cycle();
+    }
+    let fds_before = descriptors();
+    let threads_before = threads_settled();
+    let rss_before = resident_kb();
+
+    for _ in 0..cycles {
+        one_cycle();
+    }
+
+    let fds_after = descriptors();
+    let threads_after = threads_settled();
+    let rss_after = resident_kb();
+    let rss_growth = rss_after.saturating_sub(rss_before);
+
+    println!("churn:  {cycles} cycles after {WARM_CYCLES} warm-up");
+    println!("fds:    {fds_before} -> {fds_after}");
+    println!("threads:{threads_before} -> {threads_after}");
+    println!(
+        "rss:    {rss_before} -> {rss_after} kB, growth {rss_growth} kB \
+         ({:.2} kB/cycle)",
+        rss_growth as f64 / cycles as f64
+    );
+
+    assert_eq!(fds_after, fds_before, "a descriptor leaked per cycle");
+    assert_eq!(threads_after, threads_before, "a thread leaked per cycle");
+    // The lesson behind this gate is a few kilobytes per cycle. A tenth of a
+    // kilobyte per cycle is far below that and far above allocator noise.
+    //
+    // **Not under a sanitizer.** Its allocator keeps freed memory in a
+    // quarantine so a use after free can be caught, so the resident set grows
+    // with allocations that were correctly freed: a slope there is the
+    // quarantine filling, measured at 25 kB a cycle with the leak checker
+    // reporting nothing, and leaks under a sanitizer are that checker's to
+    // find. The descriptor and thread counts above mean the same either way.
+    let sanitized = std::env::var("RUSTFLAGS").is_ok_and(|flags| flags.contains("sanitizer="));
+    assert!(
+        sanitized || rss_growth < cycles / 10 + 4096,
+        "resident memory grew {rss_growth} kB over {cycles} cycles, which is a slope"
+    );
+}

@@ -1,0 +1,234 @@
+# 00 - Overview
+
+**Status:** design locked, interview 2026-08-15; the client added by interview 2026-09-15 (D14).
+
+lowlat is an ultra-low-latency remote desktop host that speaks the Parsec protocol. Unmodified
+Parsec clients connect to it on every platform they already run on. The host targets Linux
+first, with Windows following.
+
+It is the third system this team has built on this problem. The first two established the
+protocol ground truth and the architecture; this one merges them and moves the host to Linux
+and to Rust.
+
+## Goals
+
+1. **Ultra low latency, before everything else.** Every design choice yields to end-to-end
+   latency. Capture to present is budgeted per stage and measured, not estimated.
+2. **Never display corruption.** Loss shows as a bounded micro-freeze of roughly one round
+   trip, never as gray, torn, or smeared frames. A reference chain is never broken silently.
+3. **Compatibility with unmodified clients.** No forked client, no plugin, no patched binary
+   on the other end. If a stock client cannot connect and stream, the feature is not done.
+4. **Linux as a first-class host.** Not a port of a Windows product. Unattended operation,
+   headless operation, and running as a system service are design inputs, not afterthoughts.
+
+## Non-goals
+
+- **Protocol redesign.** The wire is fixed by compatibility. Where the protocol constrains a
+  choice, the protocol wins.
+- **ABI compatibility.** The API shape is familiar and the wire is compatible, but struct
+  layouts are ours and binary drop-in is not offered. See D6.
+- **FEC.** Recovery is retransmit based. Forward error correction cannot cover the burst loss
+  patterns that actually occur here, and it costs bandwidth on every frame to insure against
+  a minority of them.
+- **Client-feedback congestion control.** See D8. The wire has no such message and the
+  feedback loop is an anti-pattern independently.
+- **Windows host at v1.** Planned, not first. The capture and inject layers are the only
+  platform-specific stages.
+
+## System shape
+
+```
++------------------- host (lowlatd) --------------------+       +-------- client --------+
+|  capture -> CSC -> encode -> packetize (per guest)    |       |  stock Parsec client,  |
+|  audio   -> Opus -> fan out                           |  UDP  |  any platform,         |
+|  inject  <- CH0                                       |<----->|  unmodified            |
+|                    IO shell (poll + recvmmsg, GSO)    |       |                        |
++---------------------------+---------------------------+       +------------------------+
+                            |
+                     NAT engine (punch, TURN)
+                            |
+                   signaling (application owned)
+```
+
+## Crate map
+
+```
+lowlat-common    clock, futex wait, SPSC rings, byteorder, RFC 1982 seq, log,
+                 runtime library loading
+lowlat-core      no_std sans-IO: wire, channels, rings, crypto, recovery, NAT, ICE, STUN, TURN
+lowlat-crypto    credentials, key material, the process certificate, and the only
+                 source of randomness
+lowlat-net       IO shell: sockets, threads, timers, wakeups; the browser transport's
+                 record layer and association, driven by the same loop, behind the
+                 crate's `web` feature, which the host turns on and a client build
+                 leaves off
+lowlat-portmap   gateway port mapping for the client and the host: PCP, NAT-PMP and
+                 UPnP's gateway device; the one crate that speaks HTTP, and only to
+                 the gateway
+lowlat-sim       deterministic simulator and network namespace fixtures (dev-dependency)
+lowlat-drivers   the device interfaces reached at runtime: the generated bindings,
+                 the loaders, the display and the device context; shared by
+                 encode and decode, nothing above the seam
+lowlat-vdd-proto what the display driver and its controller share: the control
+                 interface's requests and replies, each monitor's identity, the
+                 modes, the frame page and its sequence lock; no platform code,
+                 no allocation
+lowlat-vdd-ctl   the display driver's controller: plug, unplug, modes, the
+                 settings file, a monitor's frame page taken from the driver;
+                 under the host's own display, the SDK's third half and
+                 lowlatd display; its commands are also a program of their
+                 own, lowlat-vdd
+lowlat-capture   frame trait plus synthetic source; real backends at Gate B
+lowlat-encode    NVENC, then FFmpeg software, then VAAPI
+lowlat-audio     sound capture, encode, and decode; no display stack, no vendor runtime
+lowlat-inject    uinput
+lowlat-host      host orchestration: capture, encode, delivery, input
+lowlat-decode    the H.264 and HEVC readers and the picture buffer, and the
+                 hardware decode beneath them, reached through the drivers'
+                 interfaces at runtime; planes or device handles out
+lowlat-client    client orchestration: the receive path, the frame queue, the
+                 keyframe policy, sound, input encoding
+lowlat-sdk       the C ABI cdylib and its header; the host and the client are
+                 its two halves, each a feature, and on Windows the virtual
+                 displays a third
+lowlat-kessel    signaling client; async permitted; the SDK does not link it
+lowlat-vdd       the host's own display driver on Windows: a library the
+                 system's driver host loads, lowlat_idd.dll; nothing in the
+                 workspace links it
+lowlatd          system service; the session helper and the tray are the same
+                 binary in its second and third roles, over a Unix socket
+```
+
+Dependency direction is strictly downward. `core` depends only on `common`. Nothing depends
+on `kessel`.
+
+## Decision register
+
+| # | Decision |
+|---|---|
+| D1 | **Compatibility target is the protocol family, not a pinned application version.** Framing and control opcodes are stable and additive; the `versions` block in signaling negotiates subprotocol paths, so old and new peers interoperate in both directions. The host implements the current opcode generation and advertises only what it has actually implemented on each of the six axes. |
+| D2 | **Crypto mode is credential driven.** When the offer carries an `aes256` credential the session uses AES-256-GCM; when it does not, the session uses the legacy AES-128-GCM path with the fingerprint. The host implements both and the credential decides. This is the only version-variant layer. |
+| D3 | **The SDK owns all threads; signaling is application owned.** `host_start` spawns capture, encode, audio, network, and inject. The application drives admission through a four-call seam (new attempt, add candidate, begin p2p returning host credentials, end connection) plus a poll-based event queue. No async runtime, no TLS, no JSON, and no HTTP inside the FFI boundary, because a shared library loaded into another process must not start a reactor. **Amended 2026-09-12: "no TLS" means no TLS *stack*.** The browser transport (D13) needs a DTLS record layer, and one that is a sans-IO state machine -- fed bytes by the shell, told the time by the shell, owning no socket and no thread -- is transport, not a stack; it starts nothing, which is the whole of what this decision protects. It lives in `lowlat-net`, never in `lowlat-core`, because it allocates ([02 §7](02-io-shell.md)). **Amended 2026-10-05: "no HTTP" means no HTTP *client stack*.** Gateway port mapping (Phase 15) speaks a fixed subset of plaintext HTTP/1.1 to the gateway's own on-link address and to nothing else: GET and POST only; no name resolution, proxy, TLS, compression or redirects; bounded sizes and a deadline per exchange; on a thread of the library's own that starts nothing else. It lives in `lowlat-portmap` alone. |
+| D4 | **The sans-IO boundary covers the protocol core and the NAT engine.** Wire, channels, rings, ACK and NACK, PMTU, crypto, and the ICE, STUN, and TURN state machines all live behind it. The core reads no clock, owns no socket, spawns no thread, and needs no RNG, because nonces are derived and keys arrive from signaling. `no_std` makes each of these a compile error rather than a review finding. **Amended 2026-09-25:** the envelope stays in the core, and the cipher that seals a live session's records is lent to it by the thread running the session, from a vetted library ([01 §4.1](01-protocol.md)): that library always brings a random source, so the core borrows it rather than depending on it, and keeps its own portable cipher as the reference. |
+| D5 | **Three test tiers.** A deterministic simulator with injected time and scripted loss, reorder, duplication, and jitter is the primary surface. Network namespace fixtures with real sockets and real kernel NAT are the integration tier, synthesizing cone, restricted, port-restricted, symmetric, CGNAT, and hairpin topologies. A real wide-area path is the final gate. The simulator is not optional: a developer network cannot produce the topologies the NAT engine must handle. |
+| D6 | **API shape is familiar; layout and ABI are ours.** Same call surface and sequence as the established host SDK, so porting an integration is mechanical. Structs are `repr(C)`, versioned, and free of inherited warts. Exported symbols carry the `lowlat_` prefix so a layout mismatch is a link error rather than silent memory corruption. |
+| D7 | **v1 codecs are H.264 and HEVC. 8-bit 4:2:0 is the default; 10-bit is v1 on HEVC and 4:4:4 is in, gated.** Encoder backends are **VAAPI and NVENC together at v1**, plus Vulkan Video as an explicit third choice; amended 2026-08-15 after the platform probe measured working hardware encode on the open stack, and again 2026-08-30 once colour was measured rather than assumed. **10-bit is in** because the compositor scans out a 10-bit framebuffer for the ordinary desktop, so the loss is ours at the write and nowhere else; every part that can host here encodes and decodes HEVC Main10, and the depth is settled per session by what the guests declare rather than by a host setting. **4:4:4 is in the same way, and gated harder** (Phase 11.6, green 2026-08-30): it costs about ten percent of the live host path and 1.39x the bytes at eight bits and 1.86x the bytes at ten on identical content, and one of the three encoders cannot produce it at any bit depth, so the offer is granted only when a census says every encoder the host could select codes it -- a machine with one such part refuses the offer rather than risk ending a session when the captured output moves onto that part (D11). The open stack wants one packed surface where the vendor interface wants three planar ones, so the conversion is one body per layout rather than a depth uniform. Both wire flag bits already exist; the depth one is set per declaration, and the chroma one only past the census. **Amended 2026-10-19: the census asks the encoder of the output being captured** ([impl-plan-windows.md](impl-plan-windows.md) W2.7). Since a preference the host cannot meet degrades (D11, amended 2026-09-01), a move onto a part that cannot code full chroma drops it at that rebuild and keeps the screen, so the reason for asking every part is gone -- and asking every part refused full chroma on any machine with one such part lit, whichever output a guest watched. **Amended 2026-10-19: on Windows the vendor encoders are NVIDIA's and AMD's own runtimes**, the encoder following the captured output's GPU ([impl-plan-windows.md](impl-plan-windows.md) W2.7); AMD's converts the captured picture in its own hardware, at eight bits ([05 §3](05-host.md)). **Amended 2026-10-25: and Intel's** ([impl-plan-windows.md](impl-plan-windows.md) W2.8), its current runtime alone, taking the host's conversion -- drawn rather than computed on Intel's GPUs ([05 §3](05-host.md)) -- and coding ten-bit HEVC and full chroma at both depths where the part does. |
+| D8 | **Congestion control is host local.** It is computed from local transport state, window occupancy and stale counts, and actuates the encoder bitrate through a live reconfigure that never reinitializes and never forces a keyframe. There is no congestion feedback message in either direction. Client influence is limited to one-shot preferences, which the host is free to overrule. |
+| D9 | **Capture and audio are Gate B, on bare metal.** Everything before Gate A runs against a synthetic frame source in a virtual machine, which still exercises the wire, both crypto modes, the NAT ladder, signaling, the encoder, and input. Capture is a trait from day one with a synthetic implementation; real backends land when the hardware does. |
+| D10 | **The core is multi-guest from day one; v1 policy is single-guest simple.** Per-guest sequence spaces, rings, and crypto state are in the data model immediately, because retrofitting them is a rewrite. Pressure gating, the skip-until-keyframe cascade, and consensus actuators land at Gate B. `max_guests` defaults to 4 with a compile-time cap of 16, and advertised capacity is read from that field rather than hardcoded. |
+| D11 | **One encode serves every seat, so a session has one video configuration and it is never adapted to a later seat.** Codec, colour and resolution are settled once and every seat receives that stream; there is no per-seat fallback because there is no per-seat encode. Downgrading instead would let one arriving seat degrade every stream already running -- unlike the bitrate minimum, which physics forces, that would be a choice made on the existing seats' behalf. A seated guest may still **ask** for a different configuration, and that request is answered against what every seat can decode ([05 §6.1](05-host.md)). **Amended 2026-09-01: what a guest declares is a preference, and a preference the host cannot meet degrades rather than refusing or ending anything.** A client offers the codec and both colour axes as "prefer this if the host has it" and follows what the stream turns out to be, so none of them decides whether a guest can be served. A configuration that will not build has its axes taken off one at a time -- ten-bit colour, then full chroma, then the second codec -- on whatever output is current, and only a device refusing the baseline reaches past that. Two behaviours went with the amendment: the guest that asked was ended when its request failed, and a screen it asked to move to was silently given back when the new device could not carry the colour. The screen is what was asked for; the colour is what was preferred. **Amended 2026-08-18:** this decision previously also said a seat that cannot decode the session's codec is disconnected by the host. That is not the host's call to make. A peer is the only party that can tell whether its decoder failed, it raises a decode error of its own when it does, and it reports that through its own API; a host cannot detect the condition and inventing a refusal for it would mean disconnecting peers over a guess. What a host owes a peer is the truth about what the **host** could not do, which is [05 §6.2](05-host.md). |
+| D12 | **v1 emulates one virtual controller, the Xbox 360 pad, on the kernel input layer.** Linux offers two layers and the controller being emulated picks one rather than preference deciding: the 360 pad speaks a vendor protocol on a vendor-class interface and its driver binds on the USB bus, so the HID layer cannot present it at all, while a DualShock 4 or DualSense is worth emulating only through the HID layer, because the point of choosing one is that applications recognise it as one and that recognition comes from the kernel's own driver claiming the report descriptor ([07 §4.2](07-platforms.md)). A peer sends the same button layout whichever controller it is holding, so a second emulation buys identity and not capability, and that identity costs a device-setup handshake the kernel driver will refuse to complete against a device that cannot answer it. Deferred, not dropped. The host-side mode-versus-type distinction the established SDK exposes has no meaning here and is not offered. **Amended 2026-09-20: the HID layer is Phase 14, and the peer chooses.** The premise -- one layout whatever the pad -- was half the wire: a peer may also send a DualShock 4's or a DualSense's own report ([01 §11.1](01-protocol.md)), and then identity and capability come together, so the second layer is built. Nothing host-wide selects it: the first message a pad sends fixes its family ([05 §7.2](05-host.md)), which is also where the established SDK's session-wide type is deliberately not copied. *Amended 2026-10-22, planned as W4 ([impl-plan-windows.md](impl-plan-windows.md)): on Windows the owner chooses, and off is the default.* There a HID pad never reaches a game that reads only the Xbox pad's interface, and an established client holding a DualSense always sends its reports, so with the peer deciding every such guest would lose every such game: a pad sent as its reports is presented as its product only where the owner sets it (`virtual_pads`, [06 §3](06-api.md)), and is otherwise played as the Xbox pad from its whole states. On Linux, where the kernel's own driver makes the pad readable by everything, the peer still decides. |
+| D14 | **The client is the other half of the same library, and it is built from the receiving side of what the host already is.** *Added 2026-09-15.* One shared object and one header carry both halves as features, each with its own handle type, so a platform that can only be a client builds a library with no host in it and a host call on a client handle does not compile ([06 §2](06-api.md)). Below the media the client is the same core in its other role -- the session is symmetric, the connectivity engine makes the offer instead of answering it -- and above it the client does what every client generation compared here does: decodes as pictures arrive, keeps two, shows the newest when asked, and asks for a keyframe in exactly two cases and never on a timer ([10](10-client.md)). Pictures leave by acquire and release with a fence, never by callback, because the library must learn when a shared surface is free. The library decodes sound and encodes input; the application owns the audio device, the window, and its signaling (D3 unchanged). v1 is one stream over the native transport on Linux, VA-API then NVDEC, hardware or nothing; software decode is a deferred decision with a licence question attached, not a phase. *Decided 2026-09-21 ([10 §5.1](10-client.md)): the machine's own libavcodec, loaded at runtime and only when it answers that it is an LGPL build, nothing shipped; last in the automatic order; and the application may move a session to another decoder, which costs one keyframe. A build that opts in with the `gpl-libavcodec` feature takes a GPL build as well, as its maker's own combination; the default never does.* The host on this machine is the client's first test peer, which makes a whole session hermetic under the simulator for the first time; an established host is the gate that counts, passed again at every phase so that what ships is always a client that connects. *Amended 2026-09-26, planned as W1 ([10 §4.2, §5.2](10-client.md)): on Windows the client decodes on the GPU the application renders on, named by its adapter identity -- D3D11 video decoding driven by the library's own readers first, then NVDEC, then the LGPL pair on the terms above, then the system's own software decoder -- and a picture of the handle kind is one shared texture per plane, finished on the device before it can be acquired, so the application's device waits on nothing of the library's.* *Amended 2026-10-15: a third half, the controller of the host's own Windows display driver, is planned (D16).* *Amended 2026-10-29, planned as M1 ([impl-plan-macos.md](impl-plan-macos.md), [10 §4.3, §5.3](10-client.md)): macOS is such a platform -- the client half alone, never a host, on arm64 and x86_64 from macOS 11 -- and decodes through VideoToolbox, the system's hardware decoder or its software one where the Mac has none, then the LGPL pair on the terms above, found in the package managers' library directories; a picture of the handle kind is one IOSurface, which the application imports by plane.* |
+| D13 | **The browser transport is the same protocol on a second pipe, and the pipe follows the browser client that already exists.** *Added 2026-09-12.* A browser is a guest over SCTP on DTLS 1.2 on the same per-attempt socket, chosen by one field in the offer and never by bytes on the wire, because the native record magic *is* a DTLS application-data header ([01 §14](01-protocol.md)). The contract is fixed by the client, so it is not ours to improve: the host is the DTLS **client** and fires the first handshake flight; every stream is reliable and ordered, as every native channel is (*corrected 2026-09-13: this entry first claimed the native audio channel does not wait for a lost packet; [01 §6](01-protocol.md) says otherwise, and the drop that keeps sound punctual happens before queueing on both pipes, [05 §9.2](05-host.md)*); the stream number is the channel number; one message is one protocol message with no length prefix; the control channel keeps its 13-byte header and the video and audio channels carry the payload alone, so a browser learns nothing per frame and takes dimensions from the bitstream; only the binary payload identifier is accepted; the streams are agreed in advance and never opened in band; port 5000 on both sides. The certificate a process presents is one per process, self-signed with no extensions, trusted by its SHA-256 digest carried in the credential exchange with its hash name, so a browser's own fingerprint check is the only trust there is. The C SDK serves both pipes through the same seam ([06 §4](06-api.md)). Both state machines are sans-IO crates driven by the shell -- the alternative, a stack with timer threads of its own that cannot be clock-faked, would have put the one attacker-reachable parser in the host outside every hermetic test -- and the second pipe **allocates per message and per packet, measured and accepted** ([02 §7](02-io-shell.md)); the first pipe still does not. The encode-latency report goes out on a two-second cadence on every pipe, because a page reads five seconds of silence on the control channel as a dead link and a still desktop sends one frame a second. |
+| D15 | **A relay is the client's, and a relay attempt is relay-only.** *Added 2026-09-23; replaces the host-side relay client that Phase 2b planned, which is dropped.* When no direct path exists the connecting side allocates a relay and offers its relayed address as its one candidate. The host takes no part -- it checks the address like any other and sends plain datagrams to it -- so a relay works against every established host and asks nothing of any of them. The deployment relaying exists for puts the relay on the host's own machine behind one forwarded port, advertising that machine's own address, which the host reaches by local delivery; a relay allocated by the host there would hand the remote peer a private address, so the arrangement works from the client's side only ([03 §7](03-connectivity.md)). A relay attempt advertises the relayed address and the readiness marker and nothing else, sends every check through the relay, and permits the host's machine before it advertises, so the host's first check already passes. Moving from a failed direct attempt to a relay attempt stays the application's ([03 §8](03-connectivity.md); D3 unchanged). The protocol's own relay offering is neither used nor imitated, and the relay's state machines live in the core (D4). *Amended 2026-10-17, planned and built as C11:* the client may reach its relay over TCP where UDP to it is blocked; the allocation and the host's leg stay datagrams, so the host still cannot tell. TLS is not offered: the media is encrypted end to end and every relay request carries its own integrity, so it would protect nothing the session needs, and a TLS stack inside the boundary is what D3 keeps out. The carrier is the attempt's, set by the application; the library never moves from one to the other by itself ([03 §7.4](03-connectivity.md)). |
+| D16 | **On Windows the host has a display driver of its own, and the library a third half that controls it.** *Added 2026-10-15, planned as W3 ([impl-plan-windows.md](impl-plan-windows.md)).* A user-mode indirect display driver, written in Rust in this workspace, gives a machine with no monitor a display and hands the host each composed picture by sharing the system's own buffer, which the host converts straight into the encoder's input: one pass after composition, where desktop duplication behind a virtual display takes two. The frames never cross the library's boundary ([06 §13](06-api.md)): the host's display module reads the driver as it reads a scanout buffer on Linux, and the channel's shared layout and handshake are one piece of code compiled into both sides and model-checked. The control side of the channel is the library's third half, beside the host and the client and under their conventions, so any application may plug, re-mode and unplug virtual monitors; **a monitor is bound to the handle that plugged it, and unplugged by that handle's end, or kept until removed and restored at start**, and nothing keeps one alive by traffic ([11](11-drivers.md)). The host's own display is bound to the host and sized through the configuration ([06 §14](06-api.md)). |
+| D17 | **On Windows the host has an input driver of its own, and its keyboard and mouse are the application's to switch on.** *Added 2026-10-22, planned as W4 ([impl-plan-windows.md](impl-plan-windows.md)).* A user-mode filter above the system's virtual HID framework, written in Rust in this workspace as the display's driver is (D16), presents a keyboard, a mouse, a DualShock 4 and a DualSense whose input the system takes as a device's rather than a program's: a low-level hook sees no injected flag on it and raw input names the device, so a game that ignores injected input takes it, and it reaches the secure desktop with no thread attached. The application switches the guests' keyboards and mice onto it while they are seated (`virtual_input`), the batch input call staying the default and the fallback; a pad sent as its reports is presented as its product where the owner sets it (D12, amended); the Xbox 360 pad stays on a virtual bus, a HID pad never reaching the Xbox pad's interface. A device is bound to the handle that made it and leaves nothing held at that handle's end, and nothing keeps one alive by traffic. **Its control interface admits the system account and administrators alone**, since its devices' input reaches the secure desktop and the console's session, and it has no C interface: the host is its one user ([11 §2](11-drivers.md)). Its keyboard never types the attention chord ([05 §7.3](05-host.md)). |
+
+## Lessons registry
+
+Every entry is a real production failure from an earlier implementation of this system. Each
+one maps to a MUST-level rule in the linked document. A design that re-opens an entry is wrong
+by definition. This table is the reason the project has the shape it does.
+
+### Timing and scheduling
+
+| Lesson | Rule lives in |
+|---|---|
+| The default timer quantum starves millisecond-scale loops and waits. The resolution request is mandatory and is per-process, so another application making it does not help us | [02](02-io-shell.md) |
+| A sleep of 200 us or less degrades into a busy spin. Sub-millisecond polling as loop cadence cost 14.7 percent idle CPU against a 1.4 percent reference | [02](02-io-shell.md) |
+| A next-timer function that is implemented but never consumed leaves a fixed over-poll in place | [02](02-io-shell.md) |
+| Elevating worker thread priority inside a library is a priority inversion within the host process. Four elevated threads starved a UI message pump on a two-core machine and the window was marked not responding. Raise the process class instead, and let the application decide | [02](02-io-shell.md) |
+| Hardcoded worker counts oversubscribe small machines. Scale every thread-count knob by available parallelism | [02](02-io-shell.md) |
+| Rate control math depends on fractional-millisecond intervals. Quantizing them to integer milliseconds silently skips updates whenever the interval rounds to zero | [02](02-io-shell.md) |
+
+### Wakeups and concurrency
+
+| Lesson | Rule lives in |
+|---|---|
+| A standard-library atomic notify keeps its own waiter registry and skips the kernel wake for a raw futex sleeper. Every waiter ran to full timeout and frames arrived in 104 ms bursts. Pair raw waits with raw wakes, always | [02](02-io-shell.md) |
+| Teardown that does not wake every waiter strands blocked readers until their full deadline | [02](02-io-shell.md) |
+| Blocking a publish into a frame ring stalls the transport drain and cascades into corruption. Drop oldest, never block | [05](05-host.md) |
+
+### Sockets and buffers
+
+| Lesson | Rule lives in |
+|---|---|
+| A 2 MB receive buffer drops keyframe bursts. Request 64 MB, log what was granted, and never downgrade a socket option after open. One initialization path shrank the buffer to 5 MB and it stayed that way through the whole stream | [02](02-io-shell.md) |
+| A receive scratch buffer sized from the negotiated MTU silently discards whole datagrams. It presents as "control works, video does not". Size every receive buffer from the maximum payload plus envelope plus relay margin | [01](01-protocol.md), [02](02-io-shell.md) |
+| Wire MTU and internal slot size are different constants. Conflating them truncates packets and every keyframe fails to decrypt | [01](01-protocol.md) |
+| One outstanding receive plus a poll loses keyframe bursts entirely. Batch receives | [02](02-io-shell.md) |
+| On Windows, an ICMP unreachable wedges subsequent receives unless the connection-reset behavior is disabled | [02](02-io-shell.md) |
+| A v4-mapped address contains a colon. Classifying address family by searching for a colon kills v4 punch | [03](03-connectivity.md) |
+
+### Protocol and recovery
+
+| Lesson | Rule lives in |
+|---|---|
+| Naive 32-bit sequence comparison inverts at wrap, which arrives in about 15 days at 2K120. Use RFC 1982 comparisons everywhere, and put an epoch in the nonce so a wrap cannot reuse one | [01](01-protocol.md) |
+| Transport acknowledgements stored in the reliable ring deadlock it. Acknowledgements are fire and forget | [01](01-protocol.md) |
+| A shared receive ring with per-channel sequence numbers collides. Rings are fully per channel | [01](01-protocol.md) |
+| Catching up to the nearest occupied slot crawls the flow-control window and cost a 20x regression. Jump to the furthest | [01](01-protocol.md) |
+| An anti-replay window applied to a reliable channel rejects legitimate retransmits | [01](01-protocol.md) |
+| Gray frames are decoder reference-buffer corruption from missing references. Never feed a post-gap dependent frame. No amount of forward error correction covers burst loss here | [01](01-protocol.md) |
+| A relay framing layer adds bytes the receive path must account for. Sizing for the inner packet silently dropped every full-size video packet, independent of network | [03](03-connectivity.md) |
+
+### Host pipeline
+
+| Lesson | Rule lives in |
+|---|---|
+| A serialized acquire, convert, encode loop caps at 70 to 80 fps against a 120 fps target. Encode must overlap the next acquire | [05](05-host.md) |
+| Letting the encoder convert BGRA internally cost about 3 ms per frame. Feed it the native format from a compute shader | [05](05-host.md) |
+| Copying an NV12 plane with a subresource copy drops chroma on two vendors' drivers. Write planes from a shader through plane-slice views | [05](05-host.md) |
+| In-flight frames must not share a conversion target. Use a per-slot ring | [05](05-host.md) |
+| Dropping a single dependent frame for one guest breaks the reference chain silently. Skipping must cascade until the next keyframe, per guest | [05](05-host.md) |
+| A client-feedback-driven bitrate loop oscillated between 10 and 19 Mbps and cascaded gray frames. Infer host side, move slowly, reconfigure live | [05](05-host.md) |
+| Detecting relative pointer mode from cursor clip geometry misses the entire hide-without-clip class. Use the cursor visibility signal | [05](05-host.md) |
+| Adapter LUIDs change across reboots and driver reloads. Discover at runtime, never persist | [07](07-platforms.md) |
+
+### Client pipeline
+
+| Lesson | Rule lives in |
+|---|---|
+| A decoder that reported every picture in the video range handed a host's full-range pictures to a renderer that crushed their blacks and raised their contrast, on every backend at once. Hosts differ; the range is read from each stream's parameter set and travels with every picture | [10](10-client.md) |
+| Relative motion scaled by the size the picture was drawn at moved the host's pointer slower than the hand whenever the picture was stretched. A mouse's counts are not window pixels: they go as reported, and only motion made up from a device that reports positions is scaled | [10](10-client.md) |
+| A renderer that presented the picture on screen again and looked for a new one only afterwards showed every picture a refresh late, because the present waits for the refresh. Wait for the picture, then present it | [10](10-client.md) |
+
+### Connectivity
+
+| Lesson | Rule lives in |
+|---|---|
+| A port mapping created per attempt leaks. Use a persistent, connection-lifetime runner on a stable port | [03](03-connectivity.md) |
+| A relay client that does not answer relayed consent checks gets media withheld | [03](03-connectivity.md) |
+| A relay permission lasts 300 seconds and traffic does not extend it. Left unrenewed, the relay dropped both directions without a word and the session froze at five minutes. A channel binding renews its address's permission too, which hides a permission renewed late for as long as a channel is bound | [03](03-connectivity.md) |
+| A relayed address advertised before the relay's own machine was permitted had the host's first checks dropped at the relay. The host finished its punch after ours and read the first media as malformed connectivity messages | [03](03-connectivity.md) |
+| A path taken on our own check's answer alone sent the session's first records while the host was still reading checks, and every connect, direct or relayed, left a burst of malformed connectivity messages on its log. A path is both directions: our check answered, and the host's check answered by us, that answer on the wire before any record | [03](03-connectivity.md) |
+| A request to the relay awaited on the media socket discarded every datagram that arrived during the wait, and a stale-nonce answer among them was never seen. Every exchange with the relay is a deadline among the session's timers | [03](03-connectivity.md) |
+| A relayed send toward loopback destroyed the allocation that sent it, on a deployed relay. A loopback candidate, hostile or mistaken, ends the session if anything is relayed toward it | [03](03-connectivity.md) |
+| A response's class is two bits that are not adjacent, and an error response sets both, success bit included. Reading one bit took every error for a success -- the stale-nonce answer among them, which the parser also failed to read as a challenge -- and the session died when the relay rotated its nonce | [03](03-connectivity.md) |
+| A relay on the host's machine configured with its external address hairpins both legs through the router into an allocation range nobody forwarded. Allocation and permission succeed and no media ever arrives | [03](03-connectivity.md) |
+| Over a reliable leg to the relay, every stall of the stream made the host resend what was already queued in it and the receiver ask again for what was on its way: an earlier implementation counted duplicates, late arrivals and loss bursts near 1 percent through a relay that lost nothing over datagrams. The stream is the last rung, and its cost is stated per relay | [03](03-connectivity.md) |
+| Channel data on a stream is padded to four bytes. Unpadded, a deployed relay lost the stream's framing and closed the connection | [03](03-connectivity.md) |
+| A deployed relay's refusal on its stream listener carried integrity and no error code. Read as malformed and dropped, the refused address was never seen refused | [03](03-connectivity.md) |
+| A host firewall drops symmetric-NAT replies as unsolicited. Document the inbound rule | [03](03-connectivity.md) |
+| Per-thread crypto library state leaks for every thread that runs crypto unless it is released at thread exit. Invisible without a churn soak; roughly 11 KB per connect cycle | [02](02-io-shell.md) |
+
+## Document map
+
+| Document | Contents |
+|---|---|
+| [01-protocol.md](01-protocol.md) | wire format, crypto modes, channels, rings, acknowledgement and recovery, PMTU, opcode catalog |
+| [02-io-shell.md](02-io-shell.md) | threads, timing, wakeups, socket hygiene, per-platform receive |
+| [03-connectivity.md](03-connectivity.md) | NAT engine, ICE, STUN, TURN, the connection ladder |
+| [04-signaling.md](04-signaling.md) | signaling protocol, host advertisement, the application-owned seam |
+| [05-host.md](05-host.md) | capture, conversion, encode, congestion, multi-guest delivery, input, cursor, audio |
+| [06-api.md](06-api.md) | the C ABI, events, configuration, integration paths |
+| [07-platforms.md](07-platforms.md) | Linux display stacks, privileges, service topology, Windows notes |
+| [08-testing.md](08-testing.md) | test tiers, gates, fuzzing, simulation, benchmarks |
+| [09-compatibility.md](09-compatibility.md) | which hardware hosts, what sets each floor, and how each answer was established |
+| [10-client.md](10-client.md) | the client: the receive path, the frame queue, the keyframe policy, decode, sound, input |
+| [11-drivers.md](11-drivers.md) | the host's own Windows drivers: the display -- its interfaces, monitors and their lifetimes, modes, the frame contract -- and the input device, deferred |
+| [impl-plan.md](impl-plan.md) | phases 0 to 13 with verification gates |
+| [impl-plan-client.md](impl-plan-client.md) | the client's phases C0 to C9 and its gate |
+| [impl-plan-windows.md](impl-plan-windows.md) | the platform seams (W0), then the client and the host on Windows |
+| [impl-plan-macos.md](impl-plan-macos.md) | the platform seams (M0), then the client on macOS; no host |
+| [changelog.md](changelog.md) | working log, newest first |

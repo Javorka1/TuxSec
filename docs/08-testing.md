@@ -1,0 +1,427 @@
+# 08 - Testing
+
+**Status:** locked 2026-08-15.
+
+The premise of this document is that **the development network can produce exactly one
+connectivity topology, one machine's timing, and one vendor's driver**, while the software must
+handle six topologies, adversarial timing, and hardware nobody here owns. Testing that only
+runs against reality tests one point of a large space.
+
+So the primary surface is deterministic and synthetic, reality is the final gate rather than
+the first, and the two are not confused.
+
+## §1 Tiers
+
+| Tier | Runs | Covers | Speed |
+|---|---|---|---|
+| unit and property | every commit | pure functions, wire codecs, mappings | milliseconds |
+| simulation | every commit | protocol and connectivity state machines under adversarial conditions | seconds |
+| namespace fixtures | every commit | real sockets, real kernel address translation | seconds |
+| model checking | every commit | concurrency primitives | seconds |
+| fuzzing | continuous | every byte parsed from the network | continuous |
+| hardware | manual and nightly | capture, encode, inject | minutes |
+| soak | nightly | leaks, drift, exhaustion | hours |
+| live peer | phase gates | the actual product working | manual |
+
+Only the last two tiers require anything we cannot run in a virtual machine, which is what
+makes phases 0 to 8 orderable the way [impl-plan.md](impl-plan.md) orders them.
+
+## §2 Determinism
+
+Determinism is not a testing preference; it is what makes the first four tiers possible at all.
+
+- **The protocol core reads no clock, owns no socket, spawns no thread, and needs no random
+  number generator** ([00-overview.md](00-overview.md) D4). Time is a parameter and nonces are
+  derived.
+- Therefore a test can drive a full session with injected time, replay a byte stream exactly,
+  and get the same output every run.
+- **`no_std` enforces this mechanically.** A test that needs to assert the absence of clock
+  reads is a test that can be forgotten; a crate that cannot link `std::time` cannot regress.
+- **A failing simulation is reproducible from its seed alone.** A failure that cannot be
+  replayed from a seed is a bug in the harness, not a flaky test.
+
+## §3 Unit and property tests
+
+- Wire codecs get **round-trip property tests**: encode then decode is the identity for every
+  message type, across the full range of every field.
+- **Sequence arithmetic is tested across the wrap boundary**, explicitly, including the pair of
+  values that a naive comparison inverts.
+- **Input mapping is a pure function** and is tested exhaustively without any device present.
+  This is why expansion is separated from injection in [05 §7](05-host.md).
+- Validation is tested from the rejection side: every malformed input the wire permits is
+  constructed deliberately and must be rejected without side effects.
+
+## §4 The simulator
+
+`lowlat-sim` drives the core with injected time and a scriptable network.
+
+Controls: loss (uniform and bursty), reordering, duplication, jitter, bandwidth, and one-way
+delay, each independently per direction.
+
+What it is for:
+
+- **Recovery behavior.** Retransmission timing, negative acknowledgement, the stall escape
+  jumping to the furthest occupied slot, and keyframe resynchronization, all as reproducible
+  tests rather than as a soak run that might reproduce the condition.
+- **Connectivity topologies.** The six address-translation behaviors, as data.
+- **Long-horizon conditions.** Sequence wrap arrives after roughly fifteen days of real
+  streaming and in under a second of simulated time.
+- **Adversarial conditions that a real network will not produce on demand**, such as a
+  reordering window wide enough to expose an anti-replay bug on a reliable channel.
+- **The relay** ([03 §7](03-connectivity.md), C10): a relay server written from its
+  specification rather than from the client's codec, with a deployed relay's behaviours --
+  permissions that lapse at 300 seconds, a nonce that rotates, an allocation destroyed by a
+  send toward loopback -- so five minutes and a rotation run in milliseconds, and the relay on
+  the host's machine behind one forwarded port is a topology like the other six. The network
+  gains what that needs: a router's forwarded port, and delivery between hosts behind one
+  translator. **The long run is made twice, through a relay that binds channels and one that
+  refuses them**, because a binding renews its address's permission too: a permission renewed
+  late passed with a channel bound and stalled the media at 305 s without one.
+- **The relay over TCP** ([03 §7.4](03-connectivity.md), C11, built 2026-10-17): a stream leg --
+  ordered, lossless, with scripted stops and a sender's bounded queue that drops past its depth
+  while the stream is stopped -- and the relay's stream listener written from the specification
+  as its datagram side was. **What a moving stream holds in flight is its send buffer's, not a
+  queue**: the first version counted it as one, and a session over it lost a keyframe's burst on
+  a clean link. The datagram runs are made over the stream too -- full-size datagrams in both
+  framings, each typed outcome -- and over the stream alone: eleven minutes across two permission
+  lifetimes and a nonce rotation with nothing re-sent, a half-second stop with a run dropped and the
+  session alive, a header that is neither, and the client's close freeing its allocation. **The
+  storm a stopping stream sets off is counted, not asserted**: a minute of the host's media with
+  stops as a deployed relay's, against the same minute without them, cost 666 more datagrams from
+  the host, 63 requests for missing fragments, 339 duplicates and 356 drops at the relay, and
+  doubled the host's round trip; every message still arrived. **The same relay stands behind a
+  real listener on loopback for the client's real loop**, so the stream's endings are judged where
+  they are decided: a refused connect and an end before the allocation end the attempt with the
+  relay unreachable, an end once it is ready with the relay lost, and a clean leave's release
+  reaches the relay before the stream closes.
+
+What it is not for: performance. The simulator has no realistic timing and any latency number
+from it is meaningless.
+
+## §5 Namespace fixtures
+
+Network namespaces with kernel address translation give real sockets and real kernel behavior
+under topologies the developer's network cannot produce.
+
+Fixtures: full cone, restricted cone, port restricted, symmetric, carrier-grade double
+translation, hairpin, and multihome -- a host carrying two addresses, probed at the
+secondary, where the peer's own port restricted translator is the assertion that the
+answer came back from the address that was asked (2026-08-29). And, with C10, a real relay
+server and a host endpoint in one namespace behind one forwarded port, the client behind
+symmetric translation: the one fixture in which the relay's bytes come from somebody else's
+implementation. It is judged on both ends -- the client's path is the host's own address, the
+host's the relayed one -- and it runs beside the same topology without the relay, which must
+time out. It needs the relay server on the machine and is skipped where there is none. With C11
+(planned) the same relay over TCP, the client's datagrams dropped at its own namespace's
+firewall, so nothing reaches the relay but the stream.
+And, with Phase 15, a real mapping daemon in one gateway of the symmetric pair, which no punch
+crosses: the endpoint behind it maps its port through the client's own mapper and offers the
+mapped address once the reflexive server confirms it, and the far side's path must be that
+address. It runs beside the same gateways with no mapping asked for, which must time out, and
+is skipped where the daemon is not on the machine.
+And, with 15.7, a second reflexive server at a second address, so every topology is also a
+known answer for the translation the client numbers ([03 §6.1](03-connectivity.md)): the
+endpoint behind the left gateway probes from its own port before it punches, and its number is
+judged -- 2 behind every cone, the carrier-grade pair and the hairpin, 3 behind the symmetric
+translator, 1 for the multihomed host with nothing in front of it, and behind the mapping
+daemon's gateway 2 with the mapping confirmed and 3 with none asked for.
+
+- Each fixture is a script that builds the topology, runs the case, and tears it down, leaving
+  no state behind.
+
+**Two properties of the fixtures are load bearing, and both were found by a fixture reporting
+the wrong answer confidently.**
+
+**A default masquerade rule is not a cone translator.** It reallocates the source port per
+destination, which is address-and-port-dependent mapping, so the stock configuration is a
+symmetric translator. A fixture built on it looks like a port-restricted cone, fails to punch,
+and confirms the exact opposite of what it was written to check. The external port must be
+pinned for every cone topology, and only the symmetric case may be left at the default.
+
+**The path between the endpoints must be longer than a mapping probe can travel.** A probe is
+emitted at a reduced TTL precisely so it opens the local mapping without the peer's translator
+seeing it. On a short path it crosses the whole fabric, arrives at the far translator before
+that side has sent anything, and creates an entry in the inbound direction; the far side's own
+outbound then matches that entry as a reply, so no inward path is ever established and both
+sides time out. The same length makes the fixtures the real form of the TTL regression, since
+media crosses more hops than a probe can and a socket left at the probe value carries nothing.
+- They require elevated privilege to create, which is the one place the test suite needs it.
+  The suite skips them with a clear message rather than failing when it is unavailable.
+- **This tier exists because the development network produces one topology, not six.** The two
+  machines available to it sit behind different consumer routers, so a live run between them
+  exercises exactly one pair of translation behaviours -- whichever those two routers happen to
+  implement -- and says nothing about the other five. Nor can it be made to produce them on
+  demand, because the behaviour belongs to the routers rather than to us. A live run is
+  therefore the strongest possible evidence for one point of the space and no evidence at all
+  for the rest, which is precisely the division of labour between this tier and the simulator.
+
+## §6 Fuzzing
+
+Every byte that arrives from the network is parsed by a fuzz target:
+
+- record envelope, before and after decryption
+- cleartext packets and the group acknowledgement
+- control messages and their bodies
+- connectivity check messages
+- relay framing, and every answer, indication and channel message a relay can send (C10); the
+  stream's framing, split anywhere (C11)
+- **the pointer's picture** ([10 §7](10-client.md)): the PNG a host sends, taken apart,
+  inflated and unfiltered by the client's own reader, seeded with six pictures an
+  established host sent in a recorded session. Those six are also fixtures: each decodes
+  byte for byte to the pixels an independent decoder read out of it
+  (`scripts/decode-cursor.py`), the rule every clip follows.
+- signaling payloads, at the application layer
+- the browser pipe's record layer, fed datagrams in every state it passes through with a
+  real peer advanced between them, and its association, fed bytes carried as real
+  application data by the far side's record layer, so the parser sees them as it would from
+  a hostile browser. Both run seeded so the same bytes walk the same path twice, and both
+  are slow by the standards of the parsers above -- a handshake is a few signatures -- so
+  their bounded runs are counted in tens of seconds rather than millions of executions.
+- **the client's two bitstream readers** ([10 §5.1](10-client.md)), each fed an access unit
+  of its codec and run through the parameter sets, the slice headers and the picture
+  buffer with no device behind them, seeded from the committed clips' units. Both found a
+  crash in their first minutes -- a signed delta overflowing a scaling list, a reference
+  index underflowing a list -- and both inputs are regression tests.
+- **a gateway's replies** (Phase 15), which anything on the local network can send: the
+  answer to a search, a response read in pieces cut anywhere -- read whole and read in pieces
+  must be one outcome --, the URLs a gateway hands out and the references resolved against
+  them, its description, its control answers, and the binary answers on its mapping port. All
+  are seeded with replies captured from three gateways.
+
+Rules:
+
+- **Crash reproducers are committed**, as named regression tests. A crash found once is
+  covered forever. This is the part of the policy that matters.
+- **Coverage corpora are committed only after minimizing.** Raw output keeps every input that
+  reached a new branch, including redundant and needlessly long ones; minimizing replaces each
+  with the shortest input reaching the same branches. On this project that was a 95 percent
+  size reduction at identical coverage, and the gap widens with every run. A corpus committed
+  raw only ever grows, and binary blobs never leave git history.
+- A coverage corpus is a **speed optimization for bounded runs**, not a correctness artifact.
+  It earns its keep on stateful targets, where reaching a path takes many mutations; on a
+  small stateless parser the fuzzer rediscovers full coverage in milliseconds and the corpus
+  is close to dead weight.
+- Targets run in continuous integration for a bounded time per commit, and unbounded nightly.
+- **A bound is fuzzed only if inputs reach it** (*2026-10-06*). The fuzzer makes nothing longer
+  than its longest seed unless told to, so a limit past every seed is never exercised, however
+  long the run: the gateway's response reader kept its head cap kilobytes beyond every
+  captured reply, and its own property -- read whole and read in pieces, one outcome -- did
+  not hold there, which a review found and the fuzzer never could. A longer bound is not
+  enough: the fuzzer keeps an input only for the coverage it adds, and nothing between the
+  longest reply and the cap adds any, so runs of two and five minutes allowed 16 KB never
+  reached the 8 KB cap. A target whose limits lie past its seeds is given seeds at them: with
+  four at the reader's caps, the fault, put back, was found in under twelve thousand runs.
+- **A crash is a release blocker.** These parse hostile input from the network by definition.
+
+## §7 Model checking and unsafe
+
+- **Every concurrency primitive is model checked** under `loom`: every ring, every atomic
+  handoff, every wait and notify pairing. The predecessors validated these by soak testing,
+  which finds the failures that happen often and misses the ones that matter.
+- **Every module containing `unsafe` runs under `miri`.** In practice that is the wire codecs'
+  uninitialized scratch buffers, the frame handle types, and the C ABI layer.
+- Unsafe blocks carry a safety comment stating the invariant that makes them sound
+  ([AGENTS.md](../AGENTS.md) §7). A block without one fails review, not the test suite.
+
+## §8 Allocation assertions
+
+Hot-path tests run under a counting global allocator and assert the count is exactly zero.
+
+**The harness is itself verified**: a deliberately allocating test must fail the assertion.
+This is a real gate at [Phase 0](impl-plan.md), because a harness that cannot fail proves
+nothing and will silently stop covering anything the day someone changes it. The same
+principle applies to every check in this document, and it has already caught one live example
+in this repository: a formatting check that reported success while examining zero files.
+
+Covered paths: receive, decrypt, dispatch, reassemble, packetize, encrypt, send, the input
+path end to end, and the relayed path both ways, as indications and as channel data -- with the
+count of what crossed asserted too, because the first version of that test passed with no
+channel data crossing at all. With C11, the relayed path over the stream as well: the core's
+round in both carriers, its channel data checked padded on the way out, and the shell's stream
+both ways, messages staged, written, echoed, read and handed out.
+
+**The browser pipe is exempt and measured instead** ([02 §7](02-io-shell.md)). Its record
+layer and association allocate by design, so the assertion would only ever fail there; the
+benchmark that replaces it records allocations per datagram in each direction and the
+per-datagram time at p50, p95 and p99, and a change to those figures is reviewed as a
+regression. The native pipe's assertion runs on the same build and still reads zero, which is
+what keeps the exemption from spreading.
+
+## §9 Benchmarks and latency
+
+- **Performance claims cite measurements**, as p50, p95, and p99. **Never an average.** The
+  distribution is the product; a mean latency figure hides exactly the stalls users notice.
+- Per-stage instrumentation is built in from the start ([05 §10](05-host.md)), not added when
+  something feels slow.
+- Microbenchmarks cover the per-packet paths: authenticated encryption, wire encode and decode,
+  ring insert and drain.
+- **Regressions gate merges.** A benchmark that moves adversely without an explanation in the
+  commit is a failure, not a note.
+- The synthetic frame source is the input for pipeline benchmarks, because a real desktop is
+  not reproducible and therefore not comparable across runs.
+
+## §10 Hardware and live tests
+
+- **Tests requiring hardware are labeled and excluded by default.**
+- **The default suite never moves the developer's pointer or presses a key.** Injection tests
+  are opt-in, and the mapping layer they would otherwise cover is tested purely instead.
+- Capture and encode tests skip cleanly with a stated reason when the device is absent, rather
+  than failing. A skip that reads as a failure trains people to ignore failures.
+- **Continuous integration has no GPU**, so it runs the software encoder path end to end. That
+  is the second reason the software backend exists ([05 §4](05-host.md)).
+- **The decoder is checked against an independent decoder, never against itself.** The
+  committed clips under `crates/decode/tests/data` -- three from this host's synthetic source
+  and fifteen from two other encoders, small pictures covering B pyramids, field coding,
+  entropy coders, slices, scaling lists and ten bit -- each carry a list of per-picture plane
+  checksums produced by a separate decoder run as a separate process, so the readers and the
+  device are held to what another implementation made of the same bytes. The hardware-labelled
+  tests decode every clip on the render node and compare picture for picture; the hermetic
+  session of [10](10-client.md) runs the same clip through this host's framing to the real
+  decoder, with the keyframes announced and with them not; and a labelled probe times the
+  read-back copy three ways so that choice is a number from the device rather than a guess.
+- **The client's input is checked as the host would inject it.** The hermetic session runs
+  this host's own input expansion over what the client sends, so the far window pixel is
+  held to land at the end of the host's absolute axis, a press outside the picture to arrive
+  nowhere and its release to arrive, a repeated pad state to arrive once, and the census to
+  agree message for message; the pointer message moves the client in and out of relative mode
+  and the warp position comes back through the same rectangle ([10 §8](10-client.md)).
+- **Sound crosses the hermetic session as sound, in both codecs.** The harness host encodes
+  a real stereo tone at its own 20 ms cadence, or sends it uncompressed, and the client's own
+  consumer decodes what arrives after every pass; every packet is handed over and none dropped
+  or refused under the three network scripts. Uncompressed sound is compared sample for sample
+  across the run; compressed sound is held to each channel's level once the codec has
+  settled, because a lossy codec's output is not its input and a swapped or mixed channel
+  reads wrong on level alone. The decoder's containment is proved by a test that makes a panic
+  inside the contained call -- the codec in use has not been seen to panic, so the panic is made
+  to order -- and then decodes a real packet through the rebuilt codec, and the fuzz target
+  feeds one input to a mono and a stereo decoder as a sequence of packets with the harness's
+  abort-on-panic hook silenced, so a contained panic is not reported as a crash and an
+  escaping one still is.
+- **The browser pipe has two live rows and neither can be replaced by a hermetic one.** A
+  stock browser client, unmodified, streaming from the service; and `examples/web-client` on
+  two browser families, driven through their developer-tools protocols so a run is scripted
+  rather than clicked. The hermetic pair proves the state machines against each other; only a
+  real browser proves the handshake against a second implementation of the record layer, the
+  description against a second parser, and the picture against a second decoder. Each run
+  also captures the browser's connectivity checks off the attempt socket and folds the
+  distinct ones into the check parser's corpus (§6).
+
+## §11 Soak
+
+Nightly, because these find what short runs cannot:
+
+| Soak | Finds |
+|---|---|
+| ten thousand connect and teardown cycles | per-connection leaks, including per-thread library state that leaks a few kilobytes per cycle and is invisible below thousands of iterations |
+| multi-hour continuous stream | drift, sequence growth, ring wrap, encoder state degradation |
+| repeated loss bursts | recovery paths that work once and leak state each time |
+| repeated display mode changes | capture reinitialization paths |
+
+Each records memory, handle counts, and thread counts over time. **Flat is the pass
+condition.** A slow upward slope is a failure even when nothing crashes.
+
+## §12 Continuous integration
+
+Every commit: formatting, lints as errors, the ASCII check, dependency and license audit, unit
+and property tests, simulation, namespace fixtures where privilege allows, model checking,
+sanitizers on the Linux debug build, bounded fuzzing, and benchmarks with regression
+comparison. Each half of the library is linted alone as well as together, because a
+reference from one half into the other's crates compiles whenever both are present and
+fails only in the build a platform that can only be a client makes; and the client demo is
+linked against the client-only library, which is the one check that every client symbol an
+application links is there. The hand-started build workflow produces the library in both
+forms as tarballs, the client one with the demo inside, and a `FEATURES` line in each is
+read from the tarball's own copy of the library rather than from the build directory,
+where the two builds land on the same file. The workspace is also checked on the minimum
+toolchain its manifest declares, read from the manifest: the resolver holds back any release
+that asks for a newer compiler, so the number must be one a build has passed.
+
+**Windows builds and tests on every commit too**, the lints as errors, for every crate with
+a Windows side; the crates without one yet build empty there, so the whole workspace builds
+([impl-plan-windows.md](impl-plan-windows.md)). Per-platform code is a module of the same
+name on each platform, never a trait, so this build is the only thing holding the two sides
+to one shape. The examples are left out of it: the ones there probe Linux hardware.
+*Since W1.0* it also runs the client's tests and its hermetic session, with the C runtime
+linked statically as it ships. *Since W1.2* the library's own gates run there as well: the
+header compared with its definitions and compiled alone by the platform's compiler, as C and
+as C++, with either half hidden; the shipped DLL's exports, every one prefixed; and each half
+it carries -- the client half alone, and both *since W2.0* -- panicking on purpose through the
+DLL and coming back with a status. *Planned for W1*, it decodes the reference clips through an
+LGPL codec library it downloads, since the runner has no GPU, and builds the demo with the
+platform's own compiler. *Since W1.3* the system decoder's own tests -- every reference clip bit
+for bit on every GPU offered, full chroma refused as fatal where the device has no profile
+for it, the per-unit path allocating nothing, the read-back's wait sleeping rather than
+spinning, and a paced probe of that wait -- are hardware tests, run on a machine with GPUs
+and not on the runner.
+
+**macOS builds and tests on every commit too** (*since 2026-10-29*,
+[impl-plan-macos.md](impl-plan-macos.md) M0.4), for every crate with a macOS side, in the
+Windows form: the lints as errors and the tests, each architecture on a runner of its own, arm64
+natively and x86_64 under the system's translation layer; the crates without one build empty.
+The loopback holds 127.0.0.1 alone there, so a test that reaches a wildcard-bound socket through
+another 127/8 address, as Linux allows, takes a macOS arm. It also delivers after the send has
+returned (*found 2026-10-29*, M1.1): a test that takes a burst in one call counts it queued
+first, by the system's own count of queued datagrams, and one that only needs the burst whole
+gathers it across waits, as on Windows. *Since M1.2* the system's decoder decodes every
+reference clip bit for bit and in order, through whichever decoder the system chooses for it
+and again through its software decoder alone -- the multi-slice H.264 clip skipped there and
+said, since that decoder gets it wrong -- each clip saying which served it, and the status where
+the hardware refused its first picture and the software decoder took the stream, so the runner
+decodes as far as its own system does; the move to the software decoder is checked by making a
+first picture fail, the per-unit path allocates nothing, and the hand-over from the framework's
+thread is model-checked. *Since M1.3* a picture by handle is checked to be its surface -- the
+identifier and size the surface's, the planes at its pitches with no offsets, no address handed
+out -- to keep its surface while it is held as the decoder goes on, and to follow the kind at the
+next picture, and the boundary to carry the surface whole. The held-picture checks run where the
+hardware decodes the clip and say so where it does not, and a software session is checked to lend
+and export nothing, since the system's software decoder writes into a buffer it has handed out --
+which the planes kind's check, comparing what is in the held picture, found on CI's virtual Mac.
+A second reflexive server listens at an address the machine holds beyond the loopback and reports
+the one the first sees, as a translator would. *Since M1.4* a wireless DualSense's lights are
+checked to be reset once a connection, a report of its own, at the first input report past the
+pad's light animation, with the host's earlier light write behind it and nothing again after, a
+pad on USB never and one back on another transport anew; the hermetic session sees that reset
+ahead of the host's writes. The desk is checked by hand at the development Mac, and the demo's
+line counts the keys the host was last told are down, a number and never which, so a release
+that never came stays on it: up for minutes under Command chords before the toolkit's fix,
+never past one second after.
+The library's gates run there in their macOS arms: the header compiled by the system's compiler
+as C and as C++, alone and with the host hidden, declaring no host either way; the shared
+library's exports, every one prefixed once the underscore the system's linker adds is taken
+off; its install name, `@rpath/liblowlat.dylib`, which an application's link records; the
+client half panicking on purpose through it and coming back with a status; and the static
+library linked into a C program with nothing named beside it.
+
+Nightly: unbounded fuzzing, the soak matrix, and the hardware suite on a machine with a GPU.
+
+**A red build is not merged.** There is no category of test in this repository that is
+advisory.
+
+## §13 Regression tests from the registry
+
+**Every entry in the lessons registry has a named test**, and the name references the
+behavior, not the incident.
+
+The registry in [00-overview.md](00-overview.md) is a list of failures that already happened.
+A design that re-opens one is wrong by definition, and a test is how that is enforced rather
+than remembered. Where a lesson cannot be expressed as a test, the rule lives in
+[AGENTS.md](../AGENTS.md) and the reason it is not testable is written down.
+
+Tests land in the phase that would otherwise re-open the lesson, not in a testing pass at the
+end. By then the code that needed the constraint is already written.
+
+## §14 What counts as a gate
+
+A phase gate is **a command that passes or a peer that streams**. If it can only be stated as
+a judgment, it is not a gate and the phase does not have one yet.
+
+Three gate shapes appear in [impl-plan.md](impl-plan.md):
+
+1. **Mechanical.** A test suite, a benchmark threshold, a symbol table check, a link-graph
+   check.
+2. **Byte exact.** Replay of a recorded session produces identical output. This is the only
+   ground truth for wire compatibility, and it is why the corpus is a prerequisite rather than
+   a task.
+3. **Observable behavior against a peer we do not control.** A stock client renders our
+   frames. No amount of tier one and two substitutes for this, and it is why Gate A sits where
+   it does rather than at the end.

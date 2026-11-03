@@ -1,0 +1,2987 @@
+# Implementation plan: Windows
+
+**Status:** planned 2026-09-26. Phase W0, the platform seams, is closed; the client's phase
+(W1) was planned at its interview the same day, and the host's (W2) at its own on 2026-10-14,
+the day the host's own virtual display (W3) was added with its frame hand-off decided; W3 was
+planned at its own interview on 2026-10-15, and its first step, the driver and its package,
+built the same day. *Amended 2026-10-17:* W3.0 to W3.5 are built and checked, W3.6 -- the
+controller as a program of its own -- and W3.7 -- the review's fixes -- are built, and W3's gate
+waits for W2.5, reviewed the same day. *Amended 2026-10-18:* W2.5, the service, is built,
+checked on the development machine and closed; W3's gate is next. *Amended 2026-10-19:* W2.7,
+AMD's encoder, is added and planned at its interview; it waits on no other step. Built the same
+day; its live checks are next. *Amended 2026-10-20:* W2.7's live checks run on two AMD GPUs,
+two faults found and fixed, and W2.7 closed; what the gate asked and was not run is named in its
+entry. *Amended 2026-10-20:* W3.8 -- every monitor of the driver read straight from it, and the
+desk's own settings of the host's display left to it -- added after a review of the driver,
+built and checked the same day; and W3.9, the turn of the host's own display, added, probed and
+built and checked live after it; W3's gate follows them. *Amended 2026-10-20:* W3.10 -- a
+guest's mode on any display put by `lowlatd`, an owner's alone -- added after a review of the gate,
+built and checked live; W3's gate is next. *Amended 2026-10-21:* W3.11 -- a program's own mode on
+the host's display -- added after a probe at the gate's second review, decided, built and checked
+live; W3's gate is next, its legs amended at it. *Amended 2026-10-21:* W3.12 -- a display read
+from its driver paced on the period it is handed pictures at -- added after W3.11's live check
+showed each picture a composition old, decided, built and checked live; W3's gate is next.
+*Amended 2026-10-22:* W4 -- the host's own input device -- added and planned at its interview; it
+is built once W2's and W3's gates are through. *Amended 2026-10-22, at W4's review:* the service
+installs no driver -- each of the host's drivers is installed by a script of its own -- and what
+needs a driver needs it installed. *Amended 2026-10-24:* W3's gate passed on the development
+machine and W3 closed; W4's steps are next. *Amended 2026-10-25:* W2.8, Intel's encoder, is added
+and planned at its interview; it waits on no other step. *Amended 2026-10-25:* W2.8 built and
+checked on the development machine, and closed; what the gate asked and was not run is named in
+its entry.
+*Amended 2026-10-25:* W3.13 -- the
+virtual displays' GPU named by its maker, or as the power-saving one -- added after W3 closed; it
+is built after W2.8. *Amended 2026-10-25:* W3.13 built, checked and closed; two findings beside it
+are named in its entry. *Amended 2026-10-26:* W4.1, the keyboard and the switch, built; its live
+checks are next. *Amended 2026-10-26:* W4.1's live checks moved to W4's gate, which runs them for
+the keyboard and the mouse together; W4.2, the pointer, built. *Amended 2026-10-26:* W4.3 reviewed:
+what a program writes to a pad's features stays on the host, on both platforms, and `virtual_pads`
+without the driver is refused as `virtual_input` is; the pads checked against their consumers on
+the installed driver before the host's side is built, and the step amended. *Amended
+2026-10-26:* W4.3, the report pads, built and checked on the machine and live; a device's
+readiness fixed beside it for all three kinds; its other checks owed at W4's gate. *Amended
+2026-10-27:* W4's gate passed on the development machine and W4 closed; what the gate asked and
+was not run is named in its entry. *Amended 2026-10-27:* W1.9, the demo, built and closed with no
+menu, the maintainer's decision, its decoder created on the GPU it draws on; W1.10 and W1's gate
+are next. *Amended 2026-10-27:* W1.10, the client's Windows zip, built and closed; W1's gate is
+next. *Amended 2026-10-28:* W1's gate passed on the development machine and W1 closed, its run on
+Linux left at the maintainer's word. *Amended 2026-10-28:* the run on Linux made the same day,
+both Sony pads through SDL's HID layer; W1's gate is passed in full.
+
+Conventions as [impl-plan.md](impl-plan.md): a gate is a command that passes or a peer that
+streams, one phase per commit, changelog entry before the checkbox.
+
+## Why the seams come first
+
+Everything so far was built for Linux with no platform scaffolding. The IO shell compiled
+only there; the shared primitives' Windows side was a stand-in (a wait on a mutex-and-condvar
+table, no timer resolution, a clock that read zero); the Linux-only dependencies were
+unconditional; the generated driver bindings carried Linux type sizes; and the host's frame
+loop polled a display descriptor itself. A Windows backend written on top of that would land
+as conditional compilation inside the longest functions in the tree.
+
+So W0 moves code rather than adding behaviour. Each step keeps Linux exactly as it was and
+gives the Windows side a named place. Per-platform code is a module of the same name on each
+platform, never a trait with one implementation per build, which leaves a compile on each
+platform as the only contract keeping the two in step: CI builds both.
+
+## Phase W0 - The platform seams
+
+- [x] **W0.1 common**: the address wait on the system's own primitive; the timer resolution
+  raised by each library handle for its life ([02 §2](02-io-shell.md)); the arrival clock on
+  the performance counter; libraries loaded from the application's and the system's
+  directories, never the current one or the search path. *Built 2026-09-26; the common tests
+  pass on Windows, run here under a compatibility layer, and the wake test fails with the
+  wake removed.*
+- [x] **W0.2 net**: the system calls apart from the loop, so the loop, the attempt thread,
+  the browser transport and the address filters compile everywhere and the completion-port
+  receive has one module to fill ([02 §6](02-io-shell.md)). *Built 2026-09-26: the platform
+  module owns the socket, the wake and the receive storage together; the receive tests now
+  run through the loop's own receive path, so they are the contract the next platform's
+  module meets. The browser transport and the address filters build for Windows; the loop
+  waits for that platform's module.*
+- [x] **W0.3 drivers and decode**: bindings generated per target; the open-stack interface
+  on Linux only; the vendor runtimes by their Windows names; descriptors confined to Linux.
+  *Built 2026-09-26: the vendor interfaces generated for Windows beside Linux, their layout
+  assertions compiling for both; the compute runtime's descriptor interop in a module of its
+  own, which is where a Windows half goes. Both crates build and lint for Windows, and their
+  tests and the core's pass there, run under a compatibility layer.*
+- [x] **W0.4 client**: decoder selection and the device-backed picture slots as a module per
+  platform. *Built 2026-09-26: the automatic order and the devices it walks, the decoders the
+  decode thread opens, and the decoder table are each a platform module; what a client
+  opened says which backend it is through an accessor, which the library's status reads. The
+  device-backed picture slots stay where they are: their Windows form -- shared textures and
+  a fence, the handle kind the boundary appends -- is designed with the client's phase.*
+- [x] **W0.5 host**: the frame loop waits for a present through the display rather than on a
+  descriptor; the encoder builders move out of the frame loop's module, one module per
+  platform; types every platform shares move out of the Linux modules; the guest loop takes
+  its input devices from a module per platform. *Built 2026-09-26: the loop and the guest
+  loop make no system call of their own; the encoder built on the display's device, the
+  choice of it and the full-chroma census are the platform's; the display's shared types
+  -- the outputs listed, a pre-flight's answer, what a capture produced -- sit apart from the
+  Linux display, as does where an output sits in the desktop.*
+- [x] **W0.6 build**: Linux-only dependencies scoped to Linux, and a Windows job in CI.
+  *Built 2026-09-26, ahead of W0.4 and W0.5 because both halves' work starts from a
+  workspace that builds: the crates with no Windows side yet -- capture, encode, inject,
+  host, client and the library itself -- build empty there, and the service and the shell's
+  fixture endpoint say they are not built for the platform and exit. `cargo build`,
+  `cargo clippy` and `cargo test` over the whole workspace (`--lib --bins --tests`) pass for
+  Windows, the tests run here under a compatibility layer.*
+
+**Gate:** the Linux tests and every lint as before, nothing on Linux behaving differently,
+and the Windows target building every crate that has a Windows side.
+
+## Phase W1 - The client
+
+**Planned 2026-09-26, interview of the same day.** What [impl-plan-client.md](impl-plan-client.md)
+left for later, built on a machine that carries every vendor's device: an NVIDIA card driving
+the display, an Intel card beside it and AMD's integrated graphics. The decisions are recorded
+once, here; the design is [10 §4.2 and §5.2](10-client.md), the boundary
+[06 §3b](06-api.md), and D14's amendment [00](00-overview.md).
+
+### Decisions taken at the interview
+
+- **The client decodes on the GPU the application names, which is the one it renders on.**
+  On Windows a device is named by its adapter identity, where a render node names one on
+  Linux. A renderer on another GPU than the display pays a copy of every presented picture
+  across the bus and loses the direct flip, so the application keeps its renderer on the
+  display's GPU and the library follows it; the demo names the GPU the toolkit makes its
+  device on, and says so when that is not the display's. (*Amended 2026-10-27, at W1.9*: the
+  demo names it and looks no further -- it draws on the GPU its decoder is named on, else on the
+  system's first adapter, and with nothing named creates its decoder there, by handle always and
+  by planes where a hardware decoder is listed there, so a picture of textures opens where it is
+  drawn and switching to handles moves nothing. Which GPU drives the window's monitor is not
+  read: the demo is a command-line tool with chords, and offering a choice of GPU is an
+  application's own interface's, the maintainer's decision.)
+- **A picture of the handle kind is one shared texture per plane**, in the legacy form a
+  renderer in the same process opens by its handle: a luma and a two-channel chroma texture
+  at eight and ten bits, three single-channel textures for full chroma. Every frame says
+  which GPU its textures are on. No other graphics interface is served.
+- **A picture of the handle kind is finished on the device before it can be acquired, and
+  the decode thread never waits for it** (*scoped to the handle kind at W1.3*: a picture read
+  back to planes is waited for in its read-back, as on Linux, the wait sleeping on the
+  device's progress). The decode thread queues the decode, the split into the plane
+  textures and a signal of the library's own fence, and takes the next unit; a picture
+  becomes acquirable when the fence has passed it, so the newest picture is the newest
+  finished one, and only an acquire, on the application's thread and within its timeout,
+  ever sleeps on the fence. An earlier implementation tried both of the other ways: waiting on
+  its decode thread, it fell behind the stream past 60 ms under contention on an integrated
+  GPU; handing a picture out before its device work was known to be done, it showed pictures
+  out of order on one vendor's driver. The release fence keeps its one kind, none: the
+  application's device waits on nothing of the library's.
+- **Each slot carries its own backing**, made again when it comes back free after the
+  session's backing has moved on. One mechanism serves three changes: the session moved to
+  another GPU by `lowlat_client_set_decoder`, which a session of the handle kind now accepts,
+  a picture still held staying valid on the old GPU until it is released; planes and handles
+  switched mid-session; and the device lost to a driver update or a reset, after which the
+  GPU may come back under a new identity and is named again the same way.
+- **`lowlat_client_set_frame_kind` switches planes and handles at the next picture**, with no
+  keyframe: the decoder keeps running and keeps its references, and only how its pictures
+  leave changes. A decoder that cannot hand out the kind refuses it.
+- **The automatic order**: D3D11 video decoding driven by the library's own readers, NVDEC,
+  AMD's AMF, Intel's VPL (with Intel's older MFX for parts the newer runtime cannot reach),
+  an LGPL libavcodec pair, and the system's own software decoder. W1 builds D3D11, NVDEC, the
+  pair and the system's decoder. The two vendors' own decoders wait until D3D11 has run on
+  each GPU, because what they would add -- a missing profile, a driver fault, speed -- is
+  known only then. (*Amended 2026-09-28, after W1.3*: on the AMD GPU D3D11 proved short on
+  speed, so W1 builds AMF as well, now W1.6, and on an AMD GPU it comes first. *Amended again
+  after W1.4*: W1 builds Intel's VPL too, as W1.7, though D3D11 did not prove short on the
+  Intel card, so that every Intel part has its vendor's runtime, the older ones through MFX;
+  on an Intel GPU it comes first only if it measures faster than D3D11. NVDEC moves ahead of
+  AMF, as W1.5.)
+- **The software decoders**: the pair keeps D14's rule, loaded at runtime only when it is an
+  LGPL build and never shipped, and is found in the directory the application names or beside
+  the application, by the platform's versioned names. The system's decoder is software only
+  and eight-bit 4:2:0 only, H.264 on every edition and HEVC where the system's HEVC extension
+  is installed, and it comes after the pair. (*Amended 2026-10-01, at W1.8*: HEVC at ten bits
+  as well, which the extension decodes in software exactly; H.264 stays at eight bits, the
+  decoder hanging on its deeper profiles.)
+- **The hermetic session runs on Windows**, CI included: the host's session and packetiser
+  and the injection crate's event, pad and usage modules build there, and every platform
+  module stays Linux-only until W2.
+- **The library and the demo link the C runtime statically**, so neither needs a
+  redistributable, and the demo's makefile for the platform's compiler sits beside the GNU
+  one. The client ships as a zip: the library, its import library, the header and the demo.
+  (*Amended 2026-10-13*: the demo's Windows build is CMake, with the presets an application
+  that links the library into itself uses, clang-cl's needing no developer environment; it
+  links the library from its static build, and a release build optimises the demo's own
+  code at the link. The GNU makefile stays for Linux.)
+- **The demo's toolkit gains two things**: a choice of the GPU its device is made on, for a
+  menu (*amended 2026-10-27, at W1.9*: no menu, the choice being the knob's and the decoder
+  chord's, as above), and a pad's feature reports read and written by the toolkit's own
+  controller id. A
+  Sony pad's input reports come from the toolkit's events and its output reports go out
+  through the toolkit, so the demo never opens a pad beside it. (*Amended 2026-10-13, at
+  W1.9*: the demo's pads and sound are SDL 3's instead, on both platforms -- its gamepads for
+  the states, its HID layer for a pad sent as reports, which is never opened as a gamepad --
+  and the toolkit's second gain is a flag that leaves controllers alone, since on Windows it
+  reads every pad whatever the application asks and writes a lightbar of its own on a
+  PlayStation pad's first report. SDL comes from vcpkg on Windows, static; on Linux from the
+  system, or where the system has none from a static build of the same release, which is what
+  the build workflows link.)
+
+### Steps
+
+- [x] **W1.0 build**: the client and the modules the hermetic session uses build for
+  Windows, and the C runtime is linked statically. Checked by the hermetic session passing
+  on Windows, here and in CI. *Built 2026-09-26.* What the seam says -- its events, outcomes
+  and errors, and what reaches the session loop -- moved into a module of its own, so the
+  driver, the feed, the sound and the input build everywhere, and the seam, which opens the
+  socket and runs the shell, is built with the shell in W1.1. The library's client half sits
+  on the seam and moved there with it (*corrected at the build*: this step had it). On
+  Windows the client's 40 tests, the hermetic session's 16, the negotiation and packetiser's
+  23 and the injection crate's 63 pass, and a test binary imports no C runtime library. The
+  environment's compiler flags replace the configuration's rather than adding to them, so
+  CI's Windows job names the static runtime again.
+- [x] **W1.1 net**: the completion-port platform module ([02 §5, §6](02-io-shell.md)): the
+  socket and its options, never address reuse, since a second bind succeeds there; the
+  source address taken through the message receive; a wake posted once until it is taken;
+  receive slots pinned for the socket's life and drained up to 256 a call; cancel and drain
+  before a slot is freed; the established path marked per destination. Checked by the
+  shell's tests, which are the platform module's contract, and by the soak. *Built
+  2026-09-26.* Decided at its interview: the system's own declarations for the socket, the
+  port and the interface walk, since the system writes several of those structures after a
+  call has returned; the plain completion port, with registered I/O taken only if it
+  measures better, since its socket refuses the ordinary calls and would be a second module;
+  and the mark, through the system's QoS service loaded at run time, since a per-socket type
+  of service reaches the wire as zero there. *Corrected at the build*: the seam and the
+  library's client half move to W1.2 -- the seam chooses and opens the decoders, which that
+  step writes for this platform -- and the QoS service marks the wildcard-bound socket only
+  connected, so the flow is asked for connected and the socket disconnected again
+  ([02 §5](02-io-shell.md)). On Windows natively the net crate's 65 tests, the soak and the
+  browser-shell pair pass; the churn soak holds handles, threads and the working set flat;
+  the port's wait asked for 1 ms lasts 2.0 ms with the resolution raised and 16.0 without;
+  the plain port hands over a queued keyframe-sized burst in 1.8 ms, 695 ns a datagram.
+- [x] **W1.2 the seam, software, and the demo on Windows**: the seam and the library's
+  client half on the shell, with the platform's decoder choice (*moved here from W1.1 at its
+  build*); the libavcodec pair loaded there, and the demo built with the platform's compiler,
+  drawing planes through the toolkit's D3D11 renderer. Checked by the first picture: ten
+  minutes from an established host. *Built 2026-09-27.* Decided at its interview: the host
+  slots reserve their range and commit as a picture reaches, since that system charges a
+  zeroed reserve whole ([10 §4](10-client.md)); the library's gates run on Windows through
+  the platform's compiler, found in its installation, and the client half gets its own
+  deliberate panic, minor 18, which moves W1.4's to 19; the demo keeps a makefile per make;
+  the toolkit's shader compiler comes from the path. Until the hardware backends exist the
+  pair is the table's one slot ([10 §5.2](10-client.md)). On Windows the workspace's 792
+  tests pass; on Linux nothing moved. Ten minutes of each codec from an established host
+  over the internet at 2560x1440: H.264 decoded in 4.4 ms at the median and HEVC in 7.0,
+  arrival to present 6.6 and 9.4 ms. *Found at the gate*: the demo called the library
+  through a destroyed handle while its window was destroyed, which the window's own focus
+  change does synchronously there (fixed: the window goes first); and three HEVC runs lost
+  the path's upward direction mid-session, past this machine's network card, as an
+  established client over the same path did too.
+- [x] **W1.3 D3D11 planes**: the backend fed from the readers' jobs, read back to planes.
+  Checked by every clip decoding bit for bit on each of the three GPUs. *Built 2026-09-27,
+  closed 2026-09-28*: the Intel card was out of the machine, so the step was checked on the
+  NVIDIA and AMD GPUs first and on the Intel card once refitted. Decided at its interview:
+  the system's own declarations, generated from its headers and committed with their layout
+  checks, the libraries loaded at run time; the backend wired into the client for planes
+  (the open kind on Windows, first in the automatic order), which needs a GPU named by its
+  identity, so that moved here from W1.4; a picture read back to planes is waited for in its
+  read-back, the never-waits rule being the handle kind's; and, after the live runs, a
+  decoder nobody placed settles on the high-performance GPU. As built: the slices go in the
+  short form and the scaling lists in the coded order; a virtual display's adapter, which
+  enumerates under its GPU's name, is not offered. Every committed clip decodes bit for bit
+  on all three GPUs, full chroma on the NVIDIA and the Intel card and refused as fatal on
+  the AMD. Ten minutes of each codec on each GPU from an established host at 2560x1440, and
+  ten-bit and full chroma with the full range from a second one ([10 §5.2](10-client.md)).
+  *Found at the gate*: the AMD's video engine runs at a low clock under one decode that
+  leaves it idle between pictures, twice as slow as when it is kept busy -- recorded, not
+  pursued there (*taken up by W1.6*).
+- [x] **W1.4 the handle**: the plane split, reading the decoder's output directly where a
+  driver lets a shader read it and copying it first where one does not; the shared textures;
+  the library's fence and the newest finished picture; the GPU on every frame; per-slot
+  backing; `lowlat_client_set_frame_kind`. Minor 19 (*corrected at W1.2*, which took 18).
+  Checked by handles on all three GPUs and by each mid-session change. (*Corrected at
+  W1.3*: a GPU named by its identity moved to W1.3, which needed it for its table.) *Built
+  and closed 2026-09-28.* Decided at its interview: the handle kind needs Windows 10 1703,
+  asked of the device; the example client's device made on the pictures' GPU, and made again
+  when they move, moved here from W1.9; a lost device is found again by the library; the kind
+  is a preference at `lowlat_client_set_decoder`; Linux's vendor decoder takes the same
+  calls. As built: every GPU here lets a shader read the decoder's output, so the copy is the
+  fallback, checked by forcing it; a move between GPUs waits for nothing, a picture of a
+  backing the session has left never handed out; eight-bit full chroma read back is unpacked
+  on the device. Every committed clip decodes bit for bit through the textures on all three
+  GPUs by both routes, and no picture is handed out unfinished, on the integrated GPU beside a
+  full engine load too. Ten minutes of each codec by handle on each GPU from an established
+  host, and ten-bit and full chroma with the full range by handle on the NVIDIA and the Intel
+  card; mid-session, planes to handles and back with no keyframe, a GPU move, and the device
+  lost by restarting each GPU's driver, streaming again within one to three seconds. *Found
+  live*: a removed device can go on accepting decodes and refuse only the hand-over, and a
+  restart of one GPU can remove a renderer's device on another; both fixed
+  ([10 §4.2](10-client.md)). *Measured*: where the renderer is on the GPU that drives the
+  display, handles are the faster route, 2.2 to 2.7 ms from arrival to the screen against
+  3.5 to 3.6 by planes in one session; a renderer moved to another GPU to open its textures
+  pays for every frame's crossing to the display, 9.7 ms against 5.4 for planes drawn on the
+  display's GPU on the Intel card -- the placement is W1.9's.
+- [x] **W1.5 NVDEC** (*moved ahead of AMF 2026-09-28*): planes, then handles through the
+  vendor's interop with D3D11, the copy's completion signalled on the library's fence rather
+  than waited for. Checked by the clips and ten minutes. *Built 2026-09-29.* Decided at its
+  interview: NVDEC's place on an NVIDIA GPU by measuring it against the system's interface in
+  one session, both codecs and both kinds -- first, since it proved faster in all four; a
+  device lost under it, which the vendor's runtime cannot come back from in the process, ends
+  the session by the library's own departure and `LOWLAT_OUTCOME_DECODER_FAILED`, and so now
+  does every decoder that fails past recovery, on both platforms; the driver's newer decode
+  into the backend's own surfaces where it has it (the 610 series on; *corrected 2026-10-18*:
+  596.49 has it too), on Linux too, the map
+  below it, textures handed out either way; W1.4's search for a lost GPU amended (below). As
+  built: the textures are the queue's own, made on a device of the library's own on the GPU
+  and registered with the vendor's runtime once per slot, written by copies between a map and
+  its release queued on the runtime's stream, the library's fence signalled on that device
+  behind them; the surfaces padded, which a small picture needs; full chroma always mapped.
+  Every committed clip decodes bit for bit both ways and through the textures read back on a
+  second device, and fails with the fence signalled ahead of the copies or two planes swapped;
+  the queue end to end, back to back and at 120 pictures a second; nothing allocated per unit;
+  the Linux clips and slots under the vendor's runtime in a Linux environment on the same
+  machine. Ten minutes of each codec by handle and by planes from an established host, ten-bit
+  and full chroma at both depths by handle from a second, the kind switched, the decoders
+  alternating in one session, and the device lost by restarting the GPU's driver, the session
+  ending as the decoder's failure. A second client beside the first on the same machine, each
+  on the vendor's decoder, ran clean ([10 §5.2](10-client.md)). *Found at the gate*: one of
+  eleven restarts by handle ended the process rather than the session -- the only run whose
+  loss surfaced at a texture copy before any decode -- and was not reproduced in nine runs
+  after it; open. *Added at the gate, from W1.4's review*: a picture of textures is timed on
+  its device, one in eight, rather than where the application's acquire saw it finished,
+  which carried an application's own cadence into the figure ([10 §4.2](10-client.md)).
+- [x] **W1.6 AMF on AMD** (*added 2026-09-28*): AMD's own decoder, loaded at run time, in
+  its low-latency mode; planes, then handles; first in the automatic order on an AMD GPU.
+  Checked by the clips it decodes and ten minutes of each codec on the AMD GPU. On that GPU
+  the system's interface proved short on speed: the device's power policy stretches a decode
+  paced in real time to fill its interval, 9 to 10 ms of the video engine a picture for HEVC
+  at 1440p, and the vendor's decoder in its default mode fares the same; its low-latency mode
+  takes 3.2 ms, decoding alone at 30 and at 60 pictures a second. The mode is the asking session's
+  own -- a decoder beside it is not lifted -- so only this decoder can have it
+  ([10 §5.2](10-client.md)). (*Noted at W1.4*: the system's interface by handle took 13 to 15 %
+  of a core on the AMD GPU against 4 to 6 by planes, unexplained; looked at here.) *Built
+  2026-09-30.* Decided at its interview: AMD's decoder first on an AMD GPU only where its
+  runtime has the low-latency mode for every decoder it builds, and only if it measures faster
+  than the system's interface in one session, both codecs and both kinds -- it did, in all
+  four. As built: the runtime hands a picture out as soon as it has read the unit, its decode
+  still running, and in decode order in that mode, so the library's readers read every unit
+  too, for the stream's shape and for the order pictures leave in; the split and the read-back
+  are queued behind the decode on the library's own device, which the runtime is given, so
+  nothing waits for it, and no more than two split pictures are left unfinished when the next
+  unit goes in, since the runtime left to itself queues some thirty and then spins; ten bits
+  decode into the runtime's ten-bit layout, its eight-bit one decoding every such picture
+  wrongly without an error; the table's row reports the device's size limits as the system's
+  interface finds them, since the runtime initialises a decoder at sizes its engine cannot
+  decode; a device lost under it is found again on the same GPU and the runtime made again
+  there. Every committed 4:2:0 clip decodes bit for bit by planes and through the textures read
+  back on a second device, in the order the system's interface lets the same clip out in, and
+  fails with the fence signalled ahead of the split, the readers' order bypassed, or the bound
+  lifted; full chroma is refused, the GPU having no such profile, and the declaration masked
+  by it; nothing is allocated per unit; the queue end to end, back to back and at 120 pictures
+  a second. Ten minutes of each codec by handle and by planes from an established host,
+  ten-bit by both kinds and full chroma asked from a second, the kind switched, the decoders
+  alternating in one session, and the device lost by restarting the GPU's driver, the session
+  going on at the next keyframe ([10 §5.2](10-client.md)). *Open*: a stream larger than the
+  engine decodes would fail at each keyframe, where the system's interface refuses it once.
+  *Settled 2026-10-27*: the system's interface on the same device is asked first, by a decoder
+  built at the stream's coded size, and such a stream is refused at its first picture; checked
+  by a test that builds the decoder for H.264 a macroblock wider than the engine decodes, here
+  and on the laptop, failing with the question left out.
+  *Found at the gate*: the processor time noted at W1.4 is the example client's. By handle,
+  drawing on a GPU other than the display's, its memory grows with every picture and its
+  processor time with it, from about 3 % of a core to 30 in ten minutes, through either
+  decoder; the library's route alone does not. Left to W1.9. *Amended 2026-10-26* (found with
+  the library's demo on a laptop for W4's gate): the decoder is initialised at the size the
+  stream shows, since an older runtime decoded nothing of a cropped stream initialised at its
+  coded size ([10 §5.2](10-client.md)); checked by a cropped clip of each codec, failing there
+  before and passing after, and by a 1920x1080 stream from this project's host live. *Amended
+  again the same day*: ten-bit HEVC on the runtime's ten-bit component, the other corrupting
+  the process's memory on that runtime; every ten-bit clip there bit for bit after, and a
+  ten-bit stream live.
+- [x] **W1.7 Intel VPL** (*added 2026-09-28*): Intel's own decoder through its current
+  runtime, loaded at run time from where the display driver installs it, and through its
+  older runtime (MFX) for the Intel parts the current one does not reach; planes, then
+  handles by W1.4's split. Checked by the clips it decodes and ten minutes of each codec on
+  the Intel card; the older runtime's check is owed until an Intel part that needs it is at
+  hand. Unlike AMD's, it is built without the system's interface having proved short: every
+  clip decoded bit for bit on the Intel card (W1.3). It is built so that every Intel part has
+  its vendor's runtime, the older ones included, where the system's interface may lack a
+  profile; its place in the automatic order on an Intel GPU is decided by measuring it against
+  the system's interface there -- first only if it is faster, as AMD's is on the AMD GPU.
+  *Built 2026-09-30.* Decided at its interview: **the older runtime hands out planes alone**,
+  through its own memory output on the GPU named, H.264 and 4:2:0 HEVC at both depths -- no
+  textures, which would need an allocator of the library's that no part here could check; its
+  check stays owed. And a fault met handing a decoded picture out is judged as one met
+  decoding, on every decoder ([10 §5](10-client.md)). As built: the runtime is found by the
+  GPU itself, in the folder its own display device names among the devices present -- never
+  the display class's keys in order, which keep entries for removed drivers; the current
+  runtime is given the library's own device with its lock on, first of all, since a device
+  without it, or one handed over once the session has touched the hardware, is refused and the
+  runtime decodes on a device of its own; it makes its decode calls on that device's context
+  inside its decode call, so the split and the read-back queued after are ordered behind the
+  decode and nothing waits; asked for decode order, it hands each unit's picture out of that
+  unit's own call, the library's readers restoring the stream's order; a unit it will not take
+  while its own completion lags the device is offered again a millisecond later; parameter
+  sets sent in a unit of their own are kept for the next build; one runtime thread is asked for
+  where it would start one a core. Every committed clip decodes bit for bit by planes and
+  through the textures read back on a second device, in the order the system's interface lets
+  the same clip out in, full chroma at both depths included, and fails with the fence
+  signalled ahead of the split or the kept sets ignored; every 4:2:0 clip through the older
+  runtime's calls, which the current runtime answers here; nothing is allocated per unit; the
+  queue end to end, back to back and at 120 pictures a second. **It measured no faster than the
+  system's interface on the Intel card**, within 0.1 ms in one session per codec and kind, so
+  the system's interface stays first there and Intel's second ([10 §5.2](10-client.md)). Ten
+  minutes of each codec by handle and by planes from an established host, ten-bit and full
+  chroma at both depths by both kinds from a second, the kind switched, and the device lost by
+  restarting the GPU's driver under each kind, the session going on after about a second.
+  (*Checked 2026-10-01* on a laptop whose integrated GPU only the older runtime reaches, a
+  2015 part on its last driver: the runtime found through its own registry list, H.264 alone
+  without the plugin HEVC needs there, every H.264 clip bit for bit by planes in the readers'
+  order, five minutes from an established host -- no slower than the system's interface on
+  the same GPU, 15.5 ms from arrival to acquired against 15.8 at 1440p -- and the GPU's
+  driver restarted mid-session, the session going on.)
+- [x] **W1.8 the system's decoder**, software only. Checked by the clips it decodes. *Built
+  2026-10-01.* Decided at its interview: a decoder kind of its own,
+  `LOWLAT_DECODER_SYSTEM`, with its own slot, the table's last, minor 20 -- the software kind
+  stays the codec library's, whose device string is its directory; and HEVC at ten bits too,
+  the extension decoding it into the ten-bit planar layout bit for bit. As built: the
+  framework is loaded from the system's directory alone and started once for the process,
+  never shut down, with the process's multithreaded apartment kept alive, so any thread can
+  drive a decoder and none of the application's is put into an apartment; H.264 is the
+  system's own decoder, HEVC the extension where installed and licensed, made only through
+  the framework's enumeration; no device manager is given, so both decode on the processor.
+  Every sequence parameter set is read before the decoder sees its unit, and a stream the
+  decoder would hang on or write wrongly is refused as fatal: H.264 other than eight-bit 4:2:0
+  or cropped from the left or top, HEVC other than 4:2:0 at eight or ten bits; the depth picks
+  the output's layout, since a ten-bit stream into an eight-bit output decodes wrongly without
+  an error. Every unit ends with an access unit delimiter, without which the HEVC decoder hands
+  each picture out a unit late, and a picture of several slices not at all; one input and one
+  output buffer are reused, the output's length cleared before each call; rows are copied by
+  the decoder's own stride, the chroma after its coded height. HEVC is given two worker
+  threads, faster than the default of one a processor, and H.264 half the processors.
+  Every committed eight-bit 4:2:0 clip and every ten-bit HEVC clip decodes bit for bit in the
+  stream's order; a size change mid-stream is followed; each unit's picture comes out of its own
+  call; the refused streams are refused at once; nothing is allocated per unit; each guard
+  shown failing. Ten minutes of each codec from an established host at 2560x1440: a picture
+  acquired 5.1 ms after its arrival for H.264 and 6.0 for HEVC, the whole process at 30 % of a
+  core; in one session with every decoder alternating, against the LGPL pair 0.4 ms slower on
+  H.264 and 1.1 ms faster on HEVC, so it stays after the pair; ten-bit with the full range from
+  a second host in 3.6 ms. On a 2015 dual-core laptop without the HEVC extension, H.264 alone,
+  every H.264 clip bit for bit and a 1440p stream kept up with at 21 ms a picture, HEVC asked
+  for masked to H.264 ([10 §5.2](10-client.md)).
+- [x] **W1.9 the demo**: the GPU choice's menu, the feature reports, the Sony pads, the check
+  of the display's GPU, and from it the renderer's placement: handles when the decoding GPU
+  drives the display, planes drawn on the display's GPU when it does not. Checked by both Sony
+  pads against an established host. (*Corrected at W1.4*: the toolkit's device made on the
+  pictures' GPU, and made again when they move, moved to W1.4, whose handles on every GPU
+  needed it; the placement added, W1.4 having measured a frame's crossing to the display at
+  4 ms on the Intel card.) (*Added at W1.6*: by handle, drawing on a GPU other than the
+  display's, the demo's memory grows with every picture and its processor time with it -- the
+  library's route alone does not -- so its renderer is fixed here and checked by ten minutes
+  flat. The crossing measured again in separate sessions came to 1 to 2 ms over planes drawn
+  on the display's GPU, which took longer than at W1.3; the placement is measured within one
+  session here.) (*2026-10-13, the pads and the sound*: on SDL 3, as W1's amended decision
+  says, the Sony pads sent as reports on Windows too, their feature reports read again for
+  every session. Shown against an established host with both pads on USB, as states and as
+  reports; through Windows' HID stack every report comes at its own length -- the input at
+  64 bytes, the feature reports at 37 and 49 for a DualShock 4 and 41 and 64 for a DualSense --
+  and a 100 ms stall in the loop loses none. Checked by both pads against the established host
+  in each of its pad modes: in its DualSense mode the DualSense whole, both ways -- the sixteen
+  buttons, the touchpad, the motion sensors, rumble and the lights, 295 output reports put on
+  the pad and none refused; in its DualShock mode the DualShock 4 but for the motion sensors,
+  which that mode never reads, its 350 rumble messages each written as a motor-only report;
+  and both as the sixteen-button pad with rumble.) (*2026-10-27, the leak*: the toolkit opened
+  every plane's shared handle again, with a new view, at every draw, and drawing on a GPU
+  other than the display's that grew the process by 14 KB a draw; it keeps one import per
+  allocation now, as its GL renderer does, and the demo passes the allocation on Windows too.
+  Shown without the library or a host, the toolkit's renderer on the AMD GPU drawing textures
+  another device there writes at sixty draws a second: 0.84 MB a second before, 0.03 after,
+  both flat with the window's monitor on the same GPU. The 0.5 KB a draw left comes of drawing
+  from shared textures while presenting to another GPU's monitor -- none by planes there, none
+  on one GPU -- so the placement above leaves it, and the ten minutes flat are owed by that.)
+  *Built and closed 2026-10-27.* Decided at its interview (the maintainer): **no GPU menu, no
+  check of the display's GPU and no placement taken from it** -- the demo is a command-line tool
+  with chords, and offering a choice of GPU is an application's own interface's -- and the
+  zero-copy route follows the renderer's GPU; W1's decision and gate amended. As built: the
+  renderer is on the GPU the decoder is named on, else on the system's first adapter, named to
+  the toolkit; with nothing named the decoder is created there, by handle always and by planes
+  where a hardware decoder is listed there, so switching kinds moves nothing; pictures moved to
+  another GPU by the decoder chord or a row, or found again after a lost device, bring the
+  renderer after them, as W1.4 built it. A repeated picture is drawn from the textures it is in,
+  and loaded again at least once a second; handles through Direct3D 12 or Vulkan are refused, at
+  start and at the kind chord. Checked against an established host: both kinds with nothing
+  named on the first adapter, the kind chord with no remake; each GPU named; the decoder chord's
+  walk by handle following every move; the AMD GPU's driver restarted under handles, drawn at
+  full rate two seconds after; a repeat captured from the screen whole; by planes the 3D
+  engine's share halved at forty repeats a second; ten minutes flat by planes and by handle on
+  the GPU that drives the window's monitor. A per-user GPU preference reorders the high-performance query
+  too, so it cannot stand in for a laptop whose two orders differ. Recorded rather than passed:
+  by handle on one GPU presenting to another's monitor, 0.5 KB a draw and the processor time
+  climbing, to a full core in ten minutes at 120 draws a second -- open, below the toolkit. Not
+  run, left to W1's gate: wireless Sony pads on Windows and the Linux pads through SDL.
+- [x] **W1.10 packaging**: the zip from the build workflow; CI decodes the clips through a
+  downloaded LGPL pair, since its runner has no GPU, and builds the demo. Checked by the
+  artifact, built and unpacked. *Built 2026-10-27, and closed the same day on the build
+  workflow's own zip.* Decided at its interview (the maintainer): **CI's Windows binaries
+  come from vcpkg** at the demo's baseline, kept by its binary cache -- the codec library 9.0.2
+  with its decoders alone, LGPL, and glslang's tools for the toolkit's shaders -- rather than
+  pinned downloads, since the LGPL builds published for Windows are rolling and pruned; **the zip
+  carries the static library** beside the DLL and its import library, the symbols a second
+  zip; **the unpacked zip is checked on a clean machine**, the AMD laptop, with a live run; and
+  **the client's zip alone**, the full SDK and the host's folder waiting for the host's
+  packaging. As built: one script makes the zip, here and in the workflow, and every check reads
+  the zip's own copies -- the describe program, on Windows now too, finds the DLL the client half
+  with no host entry point, and the demo started with no peer names the library linked into it
+  ([06 §3b](06-api.md)); CI's Windows job builds the pair, runs the clip tests that wait for one
+  and the library's own with it named, and builds and starts the demo against the client-only
+  static library. Checked here: each check shown failing once (a full library's bits, a probe
+  turned onto a client entry point, the demo of the full library, the pair's directory empty);
+  the clips, the software backend's allocations and a whole session through it on vcpkg's pair,
+  and the whole suite with it named; the toolkit built from a fresh checkout with vcpkg's
+  glslang 16.4; the unpacked zip linked from C both ways; and the zip as built here, unpacked on
+  the laptop, streaming from an established host by its own GPU and by the software decoder
+  with an LGPL pair beside it. Then the build workflow's own zip the same way, on that laptop and
+  on an older AMD one whose long-term-servicing Windows has no store, by each one's GPU and by
+  the software decoder, the demo's window naming the decoder each session ran on.
+- [x] **W1.11 the static library** (*2026-10-09*, ahead of W1.9, for an application that
+  links the client library into its own): `lowlat.lib` from the release build, asked for by
+  name, its system libraries named inside it ([06 §3b](06-api.md)). Checked by an ABI gate
+  that links a C program against it and nothing else under the static release and debug
+  runtimes, warnings as errors, and has its deliberate panic contained; shown failing with a
+  system library left out and with the debug runtime's set-aside removed.
+
+**Gate:** Gate C ([impl-plan-client.md](impl-plan-client.md)) on this machine, against two
+established hosts:
+
+- ten minutes each through D3D11 on each of the three GPUs, NVDEC, AMF on the AMD GPU, VPL
+  on the Intel card, the pair and the system's decoder, each on its default kind and with
+  both codecs, against a host that sends neither ten-bit nor full chroma;
+- ten-bit and full chroma, both kinds, on every decoder that decodes them, against a host
+  that sends both, and the full range;
+- once each, mid-session: a GPU change from the demo's menu (*amended 2026-10-27, at W1.9*: by
+  the decoder chord, the demo having no menu), planes to handles and back, a decoder change, and
+  the device lost by restarting it;
+- recorded rather than passed or failed: how long a released slot stays unread on the
+  integrated GPU, both GPU placements' presentation mode and time to the screen, the
+  toolkit's open of a texture on every draw, whether each driver lets a shader read the
+  decoder's output, and full chroma on each GPU (*amended 2026-10-27, at W1.9*: the demo
+  chooses no placement, so the presentation is recorded by handle on the decoding GPU's own
+  monitor and by handle presented to another GPU's; the toolkit opens a picture's textures once
+  per allocation since W1.9);
+- both CI jobs, and one Gate C run on Linux before the phase closes, since the slots and the
+  queue are shared with it (*amended 2026-10-27, at W1.9*: with both Sony pads through SDL's HID
+  layer there, and a wireless Sony pad on Windows where one is paired, which W1.9 left to the
+  gate).
+
+*Passed 2026-10-28* on the development machine, every leg as written but one, the figures in the
+[changelog](changelog.md)'s entry of the day: the Gate C run on Linux, with both Sony pads, was
+left at the maintainer's word. The attended half was the maintainer's own run the day before.
+*Amended 2026-10-28:* the run on Linux made the same day, on the development machine: ten
+minutes at the desk against an established host, both Sony pads through SDL's HID layer, every
+leg as written; the DualSense's triggers and face buttons not exercised, its sticks faulty
+([changelog](changelog.md), the entry of the day).
+Recorded rather than fixed: D3D11 on the AMD GPU falls behind a demanding stream, its engine's
+low clock under one decode (W1.3), where the automatic order takes AMD's own decoder.
+
+## Phase W2 - The host
+
+**Planned 2026-10-14, interview of the same day.** The host on a Windows machine with a
+monitor: desktop duplication, a D3D11 conversion, NVENC on the capture's device, input through
+the system's batch input call and a virtual pad, loopback sound, and a service. A host with no
+monitor gets a display of its own in W3, measured against this one. The decisions are recorded
+once, here.
+
+### Decisions taken at the interview
+
+- **One process, in the console session.** The whole host -- capture, the conversion and the
+  encoder on one device, input, sound and the network -- is one process of the system account
+  in the active console session; the service only starts it there and starts it again when the
+  console's session changes. Desktop duplication and the batch input call both need the
+  session's input desktop, and a process of the system account follows it onto the lock screen
+  and an elevation prompt, which switch desktops rather than sessions; the frames, the encoder
+  and congestion control never cross a process, as on Linux; and W3's channel to its driver
+  needs the system account anyway. A logoff or a user switch restarts the host and its guests
+  reconnect once it is back; the first logon after boot stays in the boot's session. An
+  application that embeds the host half runs it the same way; the library starts no process.
+  This replaces the split [07 §10](07-platforms.md) implied.
+- **No application supplies frames** (*settled before the interview*). Desktop duplication is
+  this phase's source, for a physical monitor and for a display another driver provides; W3's
+  display is read by the same display module, so nothing crosses the library's boundary.
+  *Corrected 2026-10-15, at W3's review:* as built, a display another driver provides is not
+  duplicated. Its output sits on an adapter of its own, which renders nothing and is refused as
+  an encoder's device, and the GPU that renders it is another adapter; so the stream refuses
+  every such output, another vendor's virtual display and the host's own alike. W3.2 delivers
+  it. *Corrected again 2026-10-15, at W3.0's build:* the system lists a virtual display's
+  output under the GPU that renders it, as that GPU's own -- seen with the host's own display --
+  not on an adapter of its own, so the premise above does not hold for it. Whether the stream
+  as built takes such an output is W3.2's first check.
+  *Answered 2026-10-16, at W3.2's review:* it does. The host's own display and an established
+  host's own virtual display were each streamed by the stream as built: both outputs listed
+  under the GPU that renders them, the device made there, its encoder opened, and 120 pictures
+  a second delivered.
+- **NVENC alone, on the capture's D3D11 device.** The encoder keeps its register-once submit and
+  poll and binds its device through D3D11 rather than CUDA. AMD's and Intel's encoders are
+  deferred: on the development machine only the NVIDIA card drives a display, so either would
+  pay a copy of every frame between GPUs and measure the copy rather than the encoder. They are
+  measured on W3's display, which renders on any GPU, or on outputs given a display. No Vulkan
+  encoder and no system encoder on Windows: the vendor runtimes take D3D11 textures directly,
+  and the Vulkan encoder's tails were the longest on Linux.
+  *Amended 2026-10-19, at W2.7's plan:* **AMD's encoder joins it** (W2.7). The development
+  machine now has a monitor on the AMD's integrated GPU, and the host's own display renders there
+  when its driver is told to, so that encoder is given pictures on its own device and measured as
+  itself. The encoder follows the captured output's GPU: NVIDIA's on an NVIDIA GPU, AMD's on an
+  AMD one. Intel's stays deferred.
+  *Amended 2026-10-25, at W2.8's plan:* **Intel's encoder joins them** (W2.8). The development
+  machine's Intel card now drives a monitor, and the host's own display renders there when its
+  driver is told to, so that encoder too is given pictures on its own device and measured as
+  itself. The encoder follows the captured output's GPU: NVIDIA's, AMD's or Intel's own.
+- **Desktop duplication, converted straight from the acquired image.** The conversion reads the
+  duplicated image into the encoder's registered input and the frame is released as soon as the
+  conversion is queued: no copy, so two passes after composition, the system's duplication copy
+  and the conversion. A still desktop's refresh frames re-encode the last converted input. The
+  duplication asks for eight-bit BGRA alone, and on a desktop in a wider format the system
+  converts. A duplication lost to a desktop switch is made again on the current input desktop,
+  the secure one included. The pointer's shape, hotspot and visibility are taken as reported,
+  and the shared pointer type carries them where Linux goes on learning the hotspot. Rotation
+  is declared in the video header, as on Linux. The device is made on the output's adapter and
+  the encoder on it.
+  *Amended 2026-10-14, at W2.2's review:* the duplication answers only when the image or the
+  pointer changed, so a frame that carries only the pointer, and a wait that runs past the
+  frame's deadline, are each a present of an unchanged picture -- a still desktop keeps the
+  frame rate's refine frames and the pointer's cadence -- and whether the image changed is the
+  duplication's own report, not a summary written by the conversion. The conversion's targets
+  are the encoder's inputs, bound for unordered access and registered once (the encoder takes
+  them, and one submitted again while it is in flight, measured). Full chroma is the packed
+  layout: eight bits as AYUV, ten bits as Y410 once a decoder's round trip agrees, refused by
+  the census until then (no planar layout is taken on this device). The display is kept awake
+  while a capture exists. The pointer's bits each have their own source
+  ([05 §8.1](05-host.md)): `hidden` the duplication's own visibility of the pointer, false
+  while the system draws it into the picture; `relative` the system's show state, or a pointer
+  whose picture is one value throughout; `suppressed` the show state's touch flag. The
+  position is where the pointer points, from the show state; the shape and hotspot are the
+  duplication's, and the pixels that invert the screen beneath them, which a picture cannot
+  carry, are drawn dark grey (a masked colour pointer) or black with a light halo (a monochrome
+  one); and a message goes out once the whole state has held for more than 18 ms.
+  *Amended 2026-10-14, at the build:* a frame that carries only the pointer ends no wait. The
+  pointer moves a thousand times a second, so ending the wait on it would tick at once on the
+  deadline whenever the pointer moved, and a composition that followed a millisecond later
+  would wait a whole frame interval; the frame's pointer is taken and the wait goes on. A wait
+  past the deadline that sees no composition for a refresh is the present of an unchanged
+  picture, so a still desktop ticks once a refresh, as a display's vblank would. Ten-bit full
+  chroma is granted: its round trip through the library's decoder agreed.
+  *Amended 2026-10-16, at W3.2's review:* **the rate a display presents at is the rate its
+  desktop is composed at**, which on Windows 10 is one clock for every output -- the primary
+  display's -- whatever an output's mode says. A virtual display at 144 or 240 was handed 120
+  compositions a second under a 120 Hz primary, and the stream, which said it paced at 144,
+  sent 120 while sizing each frame's budget for 144 and telling its guest 144. So the pace is
+  the lowest of the ceiling, the output's mode and the clock the compositor reports, settled
+  again at every change of the captured output's mode -- its refresh included, which re-made
+  the duplication and settled nothing before -- and the refresh the deadlines take their phase
+  from is that clock too. A ceiling below it is honoured, as `fps` always was: with the mode's
+  period under the deadlines, a ceiling of 60 or 90 on that display took each picture 4.6 to
+  6.2 ms after its composition at the median, against under a millisecond on a panel whose
+  mode is its clock.
+  *Amended 2026-10-21, at W3.12 (the maintainer's decision):* **read from the display's driver,
+  the deadlines take their phase from the slower of that clock and the mode**: the driver is
+  handed at most the mode's rate, the first composition after each refresh of its own, and
+  deadlines on the compositor's clock locked a composition late once the two drifted a
+  composition apart. The duplication sees every composition and stays on the clock.
+  *Amended 2026-10-22 (the maintainer's decision):* **a panel slower than the primary, duplicated,
+  is left with its late pictures.** It is handed 100 to 112 compositions a second at 60 under 120,
+  their timing moved by the beat of the two refreshes, and the deadlines on the clock take its
+  pictures a composition old for seconds at a time ([05 §2](05-host.md)) -- W2.7's late
+  compositions at 60, which were not the GPU's. The host streams the primary display, its own
+  display or a headless machine, each composed on the clock. The rules modelled for such a panel --
+  the grid moved a refresh later, or the deadline aimed at the refresh before, after five late
+  pictures in a row -- each fixed it, and each made some content near the stream's rate up to 8 ms
+  later at the median.
+  *Amended 2026-10-16, at W3.4's review:* **a masked colour pointer made only of black, white,
+  clear and inverting pixels is drawn as the monochrome one it is**, its inverting pixels black
+  in a light halo: the system hands a display driver every monochrome pointer in that form, so
+  without it the host's own display read from its driver would draw the text cursor dark grey
+  where the duplication draws it with a halo. The duplication, which reports such a pointer
+  monochrome, is unchanged.
+  *Amended 2026-10-16, at W3.5's review:* **keeping the display awake holds it on but does not
+  wake it.** A display that slept on its timeout before a guest arrived stays asleep under the
+  stream's request, measured, and gives no pictures -- the system takes a virtual display's
+  away while it sleeps -- until input wakes it: one injected pointer move of no distance woke it
+  in 170 ms. So **a setting wakes the display as a stream starts, with that move, off by
+  default**: a connection lights nothing at the desk by itself, and a guest's first input wakes
+  the display otherwise.
+  *Amended 2026-10-19, at W2.7:* **on an AMD GPU the encoder reads the duplicated image itself**
+  and converts it in its own hardware ([05 §3](05-host.md)): one pass after composition, the
+  system's duplication copy, and the frame held until the next acquire, since the encoder reads it
+  while it encodes and a still desktop's refresh picture encodes the same image again.
+  *Amended 2026-10-19, at W2.7's build:* **held until the encoder is done with it.** The loop takes
+  the next picture before it collects the last, so the frame goes back -- and the next is taken --
+  only once the encoder's engine has nothing in it, and it goes back as soon as the loop has
+  collected what the encoder made: held across the next composition, the system's copy of the next
+  picture waits a whole period of the compositor's clock -- composition to hand-over 8.15 ms at p50
+  against 0.88, measured at 1920x1080 and 60 a second under colour noise. The system writes the
+  desktop's changes into an image once it is given back, so a picture encoded after a look found
+  nothing new reads it as given back, which holds while the desktop stays still: the first change
+  after a still spell can show half written in that one picture, and the next corrects it. A copy
+  into a texture of the host's own would avoid that, and was measured on the integrated GPU: 0.47
+  and 0.83 ms of it at 1080p and 1440p, slower to the output than the conversion, so it is not
+  taken.
+- **The host is per-monitor DPI aware** (*added 2026-10-14, at W2.2's review*). On a thread
+  that is not, the duplication call the host uses is refused outright, and every coordinate
+  the system hands back is scaled at a display scale other than 100 percent (measured, at 125
+  and 150). `lowlatd` declares the mode in its manifest, and the library sets its own capture
+  and input threads to it, so an application embedding the host half is not refused for its
+  packaging ([05 §7](05-host.md)).
+- **An output is named `DISPLAY1`**, the system's own name for it, the `\\.\` prefix optional.
+  It is unique on the machine, so it needs no adapter half -- an adapter's identity changes
+  across reboots -- and its number can move as monitors come and go, as a Linux device's can.
+  Asked for nothing, the host takes the output at the desktop's corner, which on Windows is the
+  primary display; the adapter, and the encoder with it, follows the output; a switch is the
+  rebuild a resolution change is.
+  *Amended 2026-10-14, at W2.2's build:* a restart of the GPU's driver renumbers every output
+  while the monitors stay where they are -- the development machine's two came back as
+  `DISPLAY27` and `DISPLAY28` -- so a stream asked for a name that has gone follows the monitor
+  it named, by the monitor's own device path, to its new name, and says so once.
+- **The conversion's shaders** are HLSL compiled offline and committed as generated code, as
+  the client's plane split is: no build machine needs the compiler and nothing compiles one at
+  run time. The formats follow the Linux host's where NVENC's D3D11 input takes them; full
+  chroma's layout there is checked first.
+- **Input.** A peer's usage code maps to the scancode Windows produces for that key on a USB
+  keyboard -- the translation is the platform's, as the kernel's own table is on Linux, and the
+  expander that turns messages into events is shared and unchanged -- and goes out through the
+  batch input call by scancode. Relative motion stays relative; an absolute position is
+  normalised over the virtual desktop from the captured output's rectangle, the captured
+  picture's pixels being the coordinate space as on Linux; wheels move in their standard steps.
+  A pad is an Xbox 360 device on the ViGEm bus, one per peer pad, the bus addressed through its
+  own control codes with declarations generated from its public header; rumble returns as the
+  guest's rumble message; with no bus there are no pads, said once in the log. A pad sent as
+  reports waits for a HID device of the host's own, which is deferred.
+  *Amended 2026-10-15, at W2.3's review:* the translation is generated from the system's own
+  translation of usage codes into scancodes, which any program can call, as the Linux table is
+  copied from the kernel's. On top of it, the codes peers send that no keyboard does -- the
+  context-menu key's second code, mute and volume on the keyboard page, the six media keys
+  above the usage range -- land where an established host puts them, and the keys a scancode
+  cannot carry go as the system's keyboard driver reports them: Pause as its virtual key,
+  Ctrl+Pause as Break, Alt+PrintScreen as SysRq. **The power key is not mapped**, so a guest
+  cannot put the host to sleep or turn it off. The host's own lock state is read, so a lock is
+  tapped when a peer's reported state changes and the host's differs. A wheel's units go out as
+  the peer counted them. Absolute motion turns into deltas while an application holds the
+  pointer (`relative`, [05 §8.1](05-host.md)), not while the pointer is hidden. **A pad sent as
+  reports is played from its whole states as the Xbox pad** unless the application takes the
+  reports ([05 §7.2](05-host.md)), as an established host in its Xbox mode does. **Opcode 5's
+  vertical axes point down on the wire** ([01 §11.1](01-protocol.md)), opposite to the whole
+  state's: the host reads them so on both platforms, and the client's per-axis call converts at
+  the wire so its interface keeps the state's direction. The attention chord is the system's
+  own call for it, made by the service, never typed keys ([05 §7.3](05-host.md)).
+  *Amended 2026-10-17, at W2.5's review:* **the machine's policy allows the service's call for
+  the length of each call** -- the service sets it, makes the call and puts back the value it
+  found -- rather than from install to uninstall, so the policy is never left changed, nothing is
+  kept between the two, and a program deleted without its uninstall leaves nothing set.
+  *Amended 2026-10-18, at W2.5's checks:* a value that already allows services is not written;
+  a write the system refuses is taken as policy, and the call is refused with a line naming it;
+  a value a policy set on a key the system account may write is raised for the length of the
+  call like any other, as established hosts do.
+  *Amended 2026-10-22, at W4's planning:* the HID device of the host's own is W4's driver. It
+  carries a guest's keyboard and mouse where the application switches them onto it, the batch
+  input call staying the default and the fallback, and a pad sent as its reports where the owner
+  sets it, off by default -- so the Xbox pad played from the whole states stays what such a pad
+  is unless the owner chooses otherwise. The Xbox 360 pad stays the bus's.
+- **Sound.** The loopback of the default render endpoint, event-driven, 48 kHz stereo asked and
+  the system's engine converting, 20 ms a packet. **A loopback delivers nothing while nothing
+  plays** -- measured on the development machine: no packet in three seconds, where a silent
+  render stream open on the same endpoint kept it delivering every 10 ms -- so a silent render
+  stream stays open on the captured endpoint while the loopback runs, and the source stays the
+  clock ([05 §9.1](05-host.md)). The default is followed as it changes and a device that went
+  away is taken again a couple of seconds later ([05 §9.3](05-host.md)); a guest's microphone
+  stays the application's, as on Linux.
+  *Amended 2026-10-15, at W2.4's review:* the silent stream is started once with a buffer of
+  silence and never fed -- that alone kept the loopback delivering, measured -- and the
+  loopback's packets then come flagged as silent, so a flagged packet counts as silence of its
+  length rather than being skipped, or the clock it buys is lost again. **The host asks for
+  floating point and rounds to sixteen bits itself.** A program playing digital silence reaches
+  the loopback as a floor far below hearing, which the system's own conversion to sixteen bits
+  dithers into the lowest bit -- a quarter of the samples, measured -- so silence, which a host
+  recognises only as exact zeros ([05 §9.1](05-host.md)), would never read as silent; and the
+  system limits the mix below full scale before the loopback, so the rounding never clips real
+  sound (measured with a mix driven past it). The default followed is the output the system's
+  sound settings name as the default device, through the system's own device notifications; a
+  named output that goes away is replaced by the default, as the Linux sound server moves a
+  stream; and a program that takes the output in exclusive mode wins -- both of the host's
+  streams are lost the moment it opens, measured -- which is a device that went away, taken
+  again once it lets go ([05 §9.3](05-host.md)). **The local mute is performed only where the
+  output mutes in hardware**: the loopback hears what the system's engine applies and nothing
+  the device applies, per control, and the system reports which -- measured both ways on the
+  development machine ([05 §9.4](05-host.md)). **Leaving one program out of the sound is
+  deferred** to W2.6: the system can capture everything but one program, and that is a feature
+  of its own ([05 §9.5](05-host.md)).
+- **The service.** Two roles of the daemon: the service, under the service manager as the
+  system account in session 0, which only starts and watches the host; and the host above. No
+  session role, since the host is in the session, and no tray in W2. The service starts the
+  host from its own token moved to the console session, in a job that ends the host with the
+  service; starts it again two seconds after a failed exit; and on a change of the console's
+  session asks the old host to end, then terminates it after a timeout. Its configuration is an
+  environment file in the program-data directory that only the system account and
+  administrators can read, since it holds the signaling secret, and the host's log is a file
+  beside it. `lowlatd install` and `lowlatd uninstall`, from an elevated shell, register and
+  remove the service; there is no installer package, and the ViGEm bus is a prerequisite.
+  *Amended 2026-10-17, at W2.5's review:* **the service decides on every pass** -- the console's
+  session, the session the host runs in and how it last exited -- rather than acting on each
+  notification, which only wakes the pass; a new host starts only once the old one has gone.
+  **A clean exit is not restarted**: a host that ends because it is not logged in stays down until
+  the console's session changes or the service is started again, as a failed one does not.
+  **The service and its host share two events and nothing named**: one the service sets to ask
+  the host to end, one the host sets to ask for the attention chord, both inherited by the host
+  alone, so no other process can find or signal either. **Install copies the programs into the
+  program-files directory** and the service runs them from there: a program the system account
+  runs must not be writable by anyone else, and a build tree writable by every user would hand
+  that account to whoever replaced the file. **The program-data folder is protected
+  explicitly** -- the system account and administrators alone, nothing inherited -- since by
+  default any user may create a file there, and one created before the install would become the
+  host's configuration; an existing configuration is kept, its owner and access reset. **The
+  display driver is installed and removed with the service** ([07 §10](07-platforms.md)), from
+  beside the program; with none there it is said and skipped, since a machine with a monitor
+  needs none. *Amended 2026-10-22, at W4's review (the maintainer's decision):* **the service
+  installs no driver.** Each of the host's drivers is installed, updated and removed by a script of
+  its own, which the machine's administrator runs, and `lowlatd install` and `uninstall` place and
+  remove the programs alone. Whatever needs a driver -- the host's own display and its fields,
+  W4's input devices -- needs it installed first, and without it is refused or waits, said once
+  ([07 §10](07-platforms.md)).
+  **One log**: the host's output and the service's own lines, each start stamped in
+  UTC, with one earlier file kept past 16 MB. **What a guest is told when its host ends at a
+  change of session is decided by measurement at the build**: a host ended with its session, as
+  at a logoff, can say nothing; where the old host lives on -- a user switch, a remote connection,
+  the service stopping -- each seated guest is told the host system is changing, or that the host
+  shut down, and that stays only if every established client handles it at least as well as
+  silence, recorded as what it shows, whether it reconnects by itself and how soon the new host's
+  picture arrives. *Measured 2026-10-18:* **the guests are told.** Three established clients
+  were each run both ways: told, each showed that the host closed for a login or logout event
+  and to reconnect, within a third of a second; left in silence, each stalled on a slow network
+  notice and then ended on its own timeout; none reconnected by itself either way, and the new
+  host's picture followed each manual reconnect alike. One end event carries the change of
+  session and the service stopping alike. **A Windows install takes its token from the login tool**, which learns the
+  program-data file and the service manager; Python is a prerequisite on Windows, as the ViGEm
+  bus is.
+- **The floor is Windows 10 1703**: the duplication call the host uses and the event-driven
+  loopback both need it, and the client set it already.
+
+### Steps
+
+- [x] **W2.0 build**: the host's crates and the library's host half build for Windows, each
+  platform module in its place and the Linux ones unchanged; the hermetic host session passes
+  there. Checked by both CI jobs and the Linux bar. The library on Windows stops being the
+  client half alone ([06 §3b](06-api.md)). *Built 2026-10-14.* There is no hermetic host
+  session (*corrected at the build*): the hermetic session is the client's, on Windows since
+  W1.0, and what passes here is the host's own tests, on the synthetic source and a fake
+  encoder. Each Windows module refuses until its step rather than pretending: the display
+  lists no outputs and finds nothing lit (W2.2), a stream finds no encoder (W2.1), and a guest
+  is admitted with its input off (W2.3). The daemon's session side -- the helper and the tray,
+  which only Linux has -- is a platform module as well, so the service builds everywhere and
+  refuses the two roles on Windows with a line. The Windows job's lints and tests pass here,
+  1214 tests where there were 977, the library's gates among them with both halves inside it;
+  on Linux the bar gives the results it gave and the list of tests is the one it was. Two port
+  tests raced on Windows, which hands out ephemeral ports nearly in order, and now take theirs
+  below both systems' ephemeral ranges.
+- [x] **W2.1 NVENC on D3D11**: the encoder's device and inputs bound through D3D11, fed by the
+  synthetic source. Checked by the library's own decoder taking the encoder's output in both
+  codecs, and an established client streaming the synthetic picture over the LAN. *Built
+  2026-10-14.* The encoder is one on both platforms and what it is bound to is a platform
+  module. On Windows the session is opened on a D3D11 device, its inputs are NV12 and P010
+  textures registered once, and it runs asynchronously, setting an event of its own as each
+  picture finishes, so the lock behind a set event waits for nothing (18 to 24 us); a frame from
+  ordinary memory goes in through a staging texture copied whole. Until the display exists the
+  stream opens a device of its own on the first of the vendor's adapters that renders, runs the
+  synthetic source alone, refuses a display as nothing to capture and refuses full chroma, whose
+  layout is the conversion's. The library's D3D11 decoder takes the pictures back at 73 dB or
+  better against the source in H.264, HEVC and ten-bit HEVC; two established clients, macOS
+  and Android, streamed it over the LAN in both codecs, switching between them with both
+  seated. **Found live and fixed**: the encode took 7.8 ms at the median where the established
+  host takes 3 on this machine. Three causes, each measured: the preset every setting started
+  from turned on a second
+  pass, its effort was the middle of the device's range, and the loop polled for a finished
+  picture on sleeps of about two milliseconds. The quality setting now picks the effort as
+  [05 §4.1](05-host.md) says -- the fastest preset in one pass, or for the highest setting the
+  most thorough with two -- on both platforms; the loop sleeps on the encoder's event where it
+  has one; and `lowlatd` raises its process class and the timer resolution on Windows. Live, the
+  encode is now 1.3 to 3.0 ms at the median and 6 to 10 at the p99; what the tail has left is
+  the card lowering its clocks under a load this light, to be compared with the established host
+  at its own load in W2.2.
+- [x] **W2.2 desktop duplication and the conversion**: the capture, the conversion and its
+  shaders, the pointer, rotation, and naming and switching outputs. Run as the system account in
+  the console session by a process launcher until W2.5. Checked by the desktop streaming to an
+  established client through the lock screen and an elevation prompt.
+  *Reviewed 2026-10-14, before its build* (the decisions above): also the per-monitor DPI mode
+  (`lowlatd`'s manifest, the library's threads), the display kept awake, a still desktop's
+  presents, and full chroma's packed layouts; and checked as well by a switch between the two
+  displays the development machine now has on the NVIDIA card, the second at 125 percent, with
+  the pointer's three bits seen on each. The encode at this machine's load was measured
+  against the encoder's own conversion first ([05 §3](05-host.md)): the same cost here, and
+  HEVC at 2560x1440 and 120 a second reaches the frame interval at its p99 (~8.5 ms) while the
+  card sits in a low power state.
+  *Built and checked live 2026-10-14.* The duplication and the conversion are capture's,
+  over the device seam the encoder uses; the display is the host's, on the output's own
+  adapter, the encoder built on that device at the output's size and the conversion's four
+  targets registered with it once. The conversion is one compute shader per layout, compiled
+  offline: on the development card it lands on the colour reference sample for sample in all
+  four (NV12, P010, AYUV, Y410), and a desktop-like picture converted, encoded and decoded by
+  the library's own decoder comes back at 57 dB of chroma or better in each, the packed
+  full-chroma words carrying colour that changes every pixel. On the real desktop the loop's
+  own sequence runs at the display's pace in all four layouts: the first present in 6 ms, no
+  wait past the deadline longer than 10.3 ms at 120 a second, a composition handed over in
+  0.05 ms at the median and its conversion queued by 0.26. A duplication lost to a switch of
+  desktop is made again on the input desktop, the encoder kept; one out of reach holds the last
+  picture and is asked for again every 50 ms. The pointer's message is settled by the display.
+  `lowlatd` declares per-monitor awareness in its manifest and lists both displays at their
+  physical sizes. **Live**, as the system account in the console session, an established
+  client on a remote Windows machine over the internet streamed the desktop through the lock
+  screen and the secure attention screen -- which stands in for an elevation prompt, since the
+  development machine raises none -- through a switch from one display to the other and back,
+  and through H.264 and HEVC, the encode about 3 ms at the median, no packet asked for again.
+  **Recorded at 120 a second**: composition to the conversion queued 0.35 to 1.5 ms at the
+  median, 4.6 to 7.2 at the p95 and 7.5 to 8.6 at the p99, and the conversion 0.07 ms on the
+  device; the tail is the frame clock, not the duplication -- a composition that lands while
+  the loop sleeps to its deadline waits for it, up to a refresh.
+  *Checked further the same day:* a restart of the GPU's driver under the stream -- the device
+  lost -- is a rebuild on the device as it comes back, the monitor followed through the
+  renumbering and the guest kept, about four seconds in all, most of it the restart; an
+  encoder that fails because its device went away is rebuilt, never read as refusing the
+  guests' preferences. A program taking the display in exclusive fullscreen at another mode,
+  in the legacy model and in the flip model, is followed both ways: the stream rebuilds at its
+  size and rate and back when it leaves.
+  *Followed up 2026-10-15:* **the frame clock's tail is gone.** The deadline takes its phase
+  from the compositions ([05 §2](05-host.md)) and a tick that found nothing waits again at once;
+  live at 120 a second, composition to handed over is p95 0.11-0.45 and p99 0.19-0.60 ms against
+  6.5-8.1 and 7.8-8.9 before, across sporadic updates and 60, 90 and 120 Hz content, the rate
+  exact and the processor time on a still desktop unchanged within what the system resolves.
+  A picture in flight is now polled for while the loop waits for the display, which the new
+  waiting needed: without it the encode a peer was shown on a still desktop read 9-10 ms.
+- [x] **W2.3 input**: the usage translation, both pointers, the wheels, and the ViGEm pad with
+  rumble. Checked by every key class on the host against what a USB keyboard gives, and a pad
+  with rumble, from an established client.
+  *Reviewed 2026-10-15, before its build* (the decisions above): also the lock keys from the
+  host's state, report pads played as the Xbox pad, opcode 5's direction on both platforms with
+  the client's per-axis call, and the attention chord refused until the service makes it.
+  Checked as well by a keyboard hook and a raw-input log on the host against the physical
+  keyboard -- Pause, Break, SysRq, both Shifts, the keypad either side of NumLock, media and
+  volume keys, the context-menu key by both codes -- by absolute positions swept across both
+  displays, the second at 125 percent, against where the pointer lands, and by typing on the
+  lock screen. **The attention chord is the service's** (W2.5): the system takes its call for
+  the secure screen from a service alone, so until the service exists the host refuses the
+  chord and logs it.
+  *Built and checked live 2026-10-15.* The translation is the system's, generated and
+  committed: 135 keys, with the two keys that do not answer as one code recorded in the form the
+  system gives them under a modifier -- PrintScreen without its fake Shift, Pause as Break --
+  and the generator checking the system's answer for every key under every modifier; with the
+  peers' ten extra codes and the power, sleep and wake keys refused, 141 codes map. Pause goes
+  as its virtual key, or as Break while the guest's own keyboard holds Ctrl, and PrintScreen as
+  SysRq while it holds Alt, each released as it went down. The two pointers are one mouse to
+  the batch input call: positions over the virtual desktop, deltas, the wheels in the units the
+  peer counted, the side buttons as the extra buttons. A guest's thread is made per-monitor
+  aware and attached to the input desktop with its devices, and attached again when the call
+  refuses -- a thread on another desktop is answered with access denied and nothing inserted,
+  measured -- after which the input goes again. The locks are read from the host's own state on
+  the guest's thread, whose view of a lock follows one changed anywhere on the desk (measured
+  on a thread with no window). A pad is the bus's, through its own requests from declarations
+  generated from its public header: plugged in by its first message, held until the bus
+  answers that it is ready, then reported whole; its rumble is a request kept outstanding for
+  it and polled by the guest's loop. Checked on the development machine through the system's
+  own pad interface, as a game reads it: a whole state read back exactly, up still up, the bus
+  ready 3 ms after the pad was plugged in, a rumble a game raised back as the guest's rumble
+  message, and the pad gone on its unplug message and with its guest's devices. The per-axis
+  message's vertical axes are read pointing down on both platforms, and the client's per-axis
+  call turns them over at the wire. The chord is refused on Windows with a log line.
+  **Found before the live run and fixed: every absolute position landed a pixel up and to the
+  left**, and an output's first column on its neighbour's last -- a sweep through a guest's own
+  devices over both displays, the second at 125 percent, read back where the system put the
+  pointer, three times a point. The system truncates `value * desktop / 65536` back to a pixel
+  and the value named a pixel's near edge; it now names the pixel's centre
+  ([05 §7](05-host.md)), and the sweep lands every position on its pixel on both displays. The
+  mapping is shared, so Linux moved with it; its measurement there is owed
+  ([impl-plan.md](impl-plan.md) Phase 9). **Found live and fixed: Caps Lock toggled the host
+  once every two presses from a macOS client**, whose platform reports the lock as a modifier --
+  the key down as the lock goes on and up as it goes off -- and an established host does the
+  same; a lock key is now the peer's lock state where the host reads its own, and the peer's
+  first message counts only for a lock it has on, since a keyboard with no such key reports it
+  off. **Live**, as the system account in the console session, from established clients on a
+  MacBook and a Windows laptop: every key class -- letters, digits, the F-row, navigation, the
+  keypad either side of Num Lock, both sides' modifiers, the Windows and context-menu keys,
+  Pause, PrintScreen, the media and volume keys, the locks -- landed as the scancode a keyboard
+  on the machine gives, read by a low-level hook and raw input; the buttons, both wheels in the
+  units the peer counted, motion either way; a pad's buttons and sticks and its rumble back,
+  the bus ready 5 to 19 ms after the pad was plugged in; typing on the lock screen, the guest's
+  input following the desktop there; and the attention chord refused and logged. Break and
+  SysRq never reached the host from either client, so their forms are the generator's check
+  alone.
+- [x] **W2.4 sound**: the loopback and its silent stream. Checked by sound through a quiet
+  spell with no gap at the guest.
+  *Reviewed 2026-10-15, before its build* (the decisions above): also the silent stream
+  started once, flagged packets as silence, the host's own rounding to sixteen bits, the
+  default followed through the system's notifications, exclusive use taken again, and the local
+  mute only where the output mutes in hardware. Checked as well on the development machine: a
+  quiet spell delivering a frame every 20 ms, the same check failing with the silent stream
+  left out; a program playing silence read back as exact silence, failing through the system's
+  own sixteen-bit conversion; the default switched between the machine's two outputs
+  mid-session; a program in exclusive mode mid-session, the sound back after it lets go; and
+  the local mute with a guest seated, put back when the last one leaves.
+  *Built and checked live 2026-10-15.* The capture is a platform module under the names
+  Linux's has, and the reassembly, the settings and the handle an owner holds are written once;
+  the system's sound interfaces are declared from the SDK's headers by a script and committed.
+  One thread waits on the loopback's own event, the system's word of a new default, and a stop:
+  the silent stream started once on the output, the loopback asked for floating point and
+  rounded to sixteen bits, a flagged packet taken as zeros of its length. A lost output is
+  opened again at once where it can be -- a named one that went away replaced by the default --
+  and otherwise the capture ends and is asked for again; the local mute is the output's own,
+  where it mutes in hardware; `lowlatd` refuses a sound server's socket on Windows with a line.
+  Checked on the development machine through the library's capture, nothing playing: three
+  seconds of quiet handed on 150 frames, and none with the silent stream left out or with
+  flagged packets skipped; a program playing zeros read back as exact silence, and every frame
+  of it loud through the system's own sixteen-bit conversion; a tone at -30 dBFS back at its
+  level in each channel; a program taking the output in exclusive mode ended the capture, which
+  opened again once it let go; the speakers silenced and put back; and the outputs listed by
+  the identity a capture publishes. **Live**, as the system account in the console session at
+  30 frames a second, from an established client on a Windows laptop: through quiet spells of
+  twenty seconds with nothing playing on the host, a packet every 20 ms and none dropped, and
+  a beep after each spell heard whole at the guest; the default switched between the machine's
+  two outputs and back six times while sound played, each followed within one or two packets,
+  the speakers' mute moved to the new output and put back on the old; and the speakers
+  silenced while a guest was seated and put back as it left, three times. A program in
+  exclusive mode was checked by the machine's own tests, not live.
+- [x] **W2.5 the service**: the two roles, install and uninstall, a change of console session.
+  Checked by a logoff mid-session and the guest reconnecting.
+  *Added 2026-10-15, at W2.3's review:* the attention chord. The host asks the service, which
+  makes the system's call for the secure screen, since the system takes it from a service alone;
+  `lowlatd install` lets services make it and `uninstall` puts back the setting it found.
+  *Added 2026-10-16, at W3.5's review:* also a remote desktop connection to the machine, which
+  moves the console to another session as a logoff does; and with each, the host's own display
+  back with the new host -- the display side of both, which W3.5 checks as the host's end and a
+  new host's start.
+  *Reviewed 2026-10-17, before its build* (the decisions above): the policy for the chord is set
+  around each call, not by install and uninstall (W2's input decision, amended). Read in the code:
+  the host ends only on an interrupt from a console, which a process the service starts never
+  receives, so the service's request to end needs a path of its own; an ending host told its
+  guests nothing, each learning of it from its own silence; and the host advertised itself on
+  Windows as a Linux machine named for nothing, its version and identifier read from files only
+  Linux has -- it advertises Windows, the computer's name, the system's version and the machine's
+  identifier, and its two lines worded for Linux are worded for Windows. The login tool knew only
+  Linux's file and service manager. Checked by: install, install again over a running install,
+  and uninstall, with the access of the configuration and the folders read by an ordinary user;
+  the host killed, back two seconds later with the guest reconnecting; the service's process
+  killed, the host going with it and the service started again; a host not logged in started
+  once; the request to end, and a host deaf to it ended at its bound; the service stopped and
+  started; **a remote connection** from another machine on the network, remote desktop turned on
+  for it and off after, the console's new session served and the user's session brought back
+  through a guest -- the same run measuring what each established client makes of being told the
+  host is changing against silence; the chord from a guest with the keyboard permission, refused
+  without it, and with the policy put back by hand raising nothing; the advertisement read by a
+  client and the signaling service's list; a guest on the network and one over the internet
+  connecting with no firewall rule for the installed program; **one reboot**, the logon screen
+  streamed before anyone signs in; and **the logoff**, last, from a guest's own menu while
+  streaming -- it ends the session the development tools run in; both bars. No user switch is run:
+  the machine has one person's account, and a switch is the same change of session.
+  *Built 2026-10-18:* the advertisement says Windows, the system's major version, the computer's
+  name and a random identifier kept beside the configuration; the configuration file's format,
+  its Windows template and the login tool's Windows branch are in; `scripts/stage-windows.ps1`
+  builds the folder install copies from; the service role starts and watches the host on every
+  pass, with the token moved to the console session, a kill-on-close job and the two inherited
+  events; the chord is the service's call with the policy set around it; `install` and
+  `uninstall` place the programs, protect the configuration and handle the display driver.
+  **The machine checks C5-C18 and the measurement D1 stay open**, so the step stays open.
+  *Checked 2026-10-18 on the development machine:* install and install over a running install;
+  the configuration's access refused to an ordinary user; the not-logged-in host started once
+  and left; the host killed and back in two seconds; the service killed, the host going with it
+  and the service started again; the service stopped and started, the host asked to end; the
+  secure attention call from the service's account, the policy absent around it and the secure
+  screen shown. A logoff, a remote connection, the guest-triggered chord, the advertisement
+  with a real session, guests, a reboot and D1's measurement remain.
+  *Reviewed 2026-10-18, after those checks:* the end request is cleared before every host, a
+  host that ended when asked is followed at once, one ended with its session is followed on the
+  same session number too, and the host waits for its kicked guests before it goes. The
+  uninstall and the end request with a guest seated remain beside the checks above.
+  *Checked and fixed 2026-10-18, on the fixed build:* the end request with a guest seated, the
+  guest told within a third of a second; the host killed with a guest seated; a remote
+  connection both ways, the console's new session served and the user's brought back through a
+  guest; the chord from a guest; the advertisement in the signaling service's list. Fixed: an
+  install on a machine with no display device (the device is made with a generated id, and a
+  driver that fails is a line, not a failed install), and the log's rotation. The attention
+  policy's key is opened for reading first and for writing only to write, since a locked key
+  refuses the opening: checked with the key locked against the system account, the chord refused
+  with the value absent and made with it allowing services. A user switch and a second
+  account's logoff were checked with a guest streaming, and a guest over the internet and one
+  on the network with the firewall on and no rule for the program. Fixed from them: each host
+  has a job of its own, since a job holds one session's processes, and a host waiting for a
+  display ends when asked rather than at the service's bound.
+  *Closed 2026-10-18:* a reboot with the service installed, the logon screen streamed before
+  anyone signed in and the sign-in kept in the boot's session; what a guest is told measured on
+  three established clients (the status stays); the ordinary user's refusals as an account
+  outside the administrators; a guest seated without the keyboard, whose keys are not typed and
+  whose client offers no chord, so the host's own refusal of it is read in the code and not
+  reached. **Known and deferred: a host ended with its session tells its guests nothing**, at a
+  logoff and at a shutdown, whose sessions end before any service hears of it -- the guests wait
+  for their own timeout, where the established host, a windowed program, hears its session
+  ending through its window and tells them the host shut down. The system's console notices of
+  either reach services alone (measured: none arrived at a logoff), and this host has no
+  window; the decision waits for a window of the host's own or the Windows tray.
+- [ ] **W2.6 a program left out of the sound** (*added 2026-10-15, at W2.4's review; not in the
+  gate*): the system's capture of everything but one program's process tree, for a voice
+  program whose sound would otherwise reach the guests it is talking to. Its setting through
+  the configuration and the library, the system version it needs, its asynchronous activation
+  and how it keeps a clock in a quiet room are its own review. Until then a person sends that
+  program to another output in the system's per-application settings, or mutes it
+  ([05 §9.5](05-host.md)).
+- [x] **W2.7 AMD's encoder** (*added and planned 2026-10-19, at its interview; not in the gate
+  below, it has its own*): AMD's own runtime, loaded at run time, encoding on the D3D11 device of
+  an output the AMD renders -- a monitor through desktop duplication, the host's own display read
+  straight from its driver -- in H.264 and HEVC, and HEVC at ten bits where the part codes it,
+  from the host's own conversion. The encoder follows the captured output's GPU.
+  *Decided at the interview:* **the full-chroma census asks the encoder of the output being
+  captured**, on both platforms ([00 D7](00-overview.md), amended). AMD's encoder codes no full
+  chroma, so asking every encoder the host could select would refuse it on any machine with a
+  monitor on its integrated GPU beside an NVIDIA card, whichever output a guest watched; and a
+  move onto an output whose encoder cannot code it drops it at that rebuild, the screen kept
+  ([05 §6.1](05-host.md)). **The checks that need an AMD GPU alone run on a second machine** that
+  has no other GPU: the host run there for each check with nothing installed, and an established
+  host measured beside it on the same machine.
+  *Planned with it:* the encoder's surfaces made once over the conversion's targets; the rate held
+  as on the NVIDIA encoder -- variable within a peak equal to the target, the same buffer of at
+  most 3.1 frames and 768 kbit, the quantiser floor and the effort of [05 §4.1](05-host.md) -- and
+  changed live; keyframes only when asked, each with its parameter sets; BT.709 in the video range;
+  a finished picture collected as it finishes rather than on a timer's tick; the library's
+  interface unchanged, its vendor encoder meaning the vendor of the output's GPU on Windows. **A
+  probe comes first**, before any of it is built: how the runtime says a picture is finished,
+  whether a surface made once is taken again, the encode's time paced against back to back, the
+  parameter sets it writes, live rate changes, the part's ceiling at 1920x1080 and 2560x1440, and
+  ten bits.
+  Checked by: on the development machine, from the monitor on the integrated GPU and from the
+  host's own display rendered there, ten minutes each of H.264 and HEVC to established clients on
+  macOS, Android and Windows, and ten-bit HEVC where the part codes it; once each mid-session, a
+  rate change under congestion with no keyframe, a keyframe after loss, a switch between the
+  NVIDIA's monitor and the AMD's with the guest kept, the AMD's driver restarted, the NVIDIA's
+  driver restarted with the host's display on the AMD, and the lock screen; full chroma granted on
+  the NVIDIA's monitor with the AMD's lit, and dropped on a move to the AMD's; the encode at p50,
+  p95 and p99 against an established host's on the same monitor, at or below it at p50 and p95;
+  on the machine with an AMD GPU alone, both codecs from its monitor, against an established host
+  there; both CI jobs and the Linux bar.
+  *Probed 2026-10-19, before any of it was built*, on the development machine's AMD GPU. The
+  runtime hands a finished picture to a call that waits for it, but reads how long to wait only
+  when the encoder is made, so a collect that never blocks and a wait on the picture cannot share
+  it: **the encoder's own thread waits** and hands each picture to the loop, which sleeps on that,
+  7 us behind the picture where a timer's tick costs up to a millisecond. The low-latency usage is a
+  preset of everything set after it, and its **latency-constrained variable rate** held the rate to
+  1.0-1.25 times the target where the peak-constrained kind let a scene change reach thirty times
+  the buffer and the rate two and a half times the target; with the largest picture bounded by the
+  buffer, every other picture stayed under it. An access-unit delimiter is written by default and a
+  forced picture type stays on a surface used again, so both are written with every picture. The
+  parameter sets state no reordering on both codecs and ride every keyframe and nothing else; ten
+  bits from P010 decode as their source; 1920x1080 encodes in 2.9 ms and 2560x1440 in 4.9, four in
+  flight sustain about 370, 215 and 100 pictures a second at 1080p, 1440p and 4K, and the highest
+  setting's most thorough effort takes 12 ms for H.264 at 1440p. **Decided after it: the encoder
+  takes the captured picture as it is and converts it in its own hardware** ([05 §3](05-host.md),
+  amended), at no cost to the encode, where the host's conversion took 0.55-0.97 ms of this
+  integrated GPU and 1.4-1.8 ms of latency: no conversion targets on such a stream, the
+  duplication's frame held until the next acquire, the direct frame's freshness check after the
+  collect ([05 §2](05-host.md)).
+  *Built 2026-10-19, its live checks still to run*: the encoder on its own thread as probed, the
+  census narrowed on both platforms, the encoder chosen by the captured output's GPU and the
+  synthetic source taking the first GPU with one. **Ten bits from the captured picture come out
+  wrong** -- the encoder takes BGRA into Main10 without an error and writes every level at the
+  eight-bit scale -- so **a ten-bit stream on an AMD GPU takes the host's conversion into P010**,
+  and eight bits keep the encoder's own ([05 §3](05-host.md), amended). That conversion's matrix
+  is BT.709 whatever profile the encoder is told, the range alone following the statement. **What
+  the encoder reads in place it is asked about first**: the duplication's frame goes back, and the
+  next is taken, only once the encoder's engine has nothing in it; the host's own display's buffer
+  goes over once the system's write of it has finished, waited for on the processor, and each read
+  is checked once the engine is done. Checked on the development machine's AMD GPU: each codec and
+  ten-bit HEVC through the library's decoder, worst luma 70-94 dB over 60 pictures, the captured
+  picture against BT.709 at 1280x720 and 960x540 (48 dB), the host's conversion through the
+  encoder 60-66 dB; no keyframe across 120 rate changes and none unasked through 400 pictures;
+  nothing allocated per picture on the loop's side; the encoder's wait 3.1 ms from submit to
+  collect at p50; the desktop at its pace through each path; the host's own display read in place
+  as the system account, no read caught on time under a load at 120 and 19 of 20 with each picture
+  handed over 30 ms late; each check broken once.
+  *Checked 2026-10-20* ([changelog](changelog.md)): on the development machine's AMD GPU, ten
+  minutes each of H.264 and HEVC from its monitor and from the host's own display rendered there,
+  read in place, and ten-bit HEVC through the host's conversion from both; mid-session the switch
+  between the two GPUs' monitors with the guest kept, full chroma granted and dropped, a
+  bottleneck's live rate cuts with no keyframe, loss recovered by resends and a keyframe after
+  each dropped frame, the AMD's driver restarted, the NVIDIA's driver restarted with the host's
+  display on the AMD, and the lock screen; the encode below an established host's at p50 and p95
+  on the same monitor; on a second machine with an AMD GPU alone, both codecs and ten-bit from its
+  panel, the encode below an established host's there, and the backend's hardware checks; both CI
+  jobs and the Linux bar. **The live checks found two faults, both fixed**: a duplication frame
+  held across the next composition delayed the system's copy by a whole refresh (8.15 ms against
+  0.88 at the median), so a frame read in place goes back as soon as the encoder is done with it;
+  and ending the encoder on a device the system had removed faulted the process inside AMD's
+  driver, so it is let go unended ([05 §2](05-host.md)). The clients: the library's demo, an
+  established client on Windows, established clients on macOS, native and in a browser -- each
+  sequence set states its reorder depth, and the browser's decode was the same on the NVIDIA's
+  stream as on the AMD's -- and on Android in both codecs, three guests at once. **Not run as the
+  gate words it**: the second machine's link could not be shaped from here, so its rate change
+  and loss stand on its hardware checks and on the development machine's live legs.
+  *Closed 2026-10-20.*
+- [x] **W2.8 Intel's encoder** (*added and planned 2026-10-25, at its interview; not in the gate
+  below, it has its own*): Intel's own runtime, found by the GPU and loaded at run time as the
+  client's decoder loads it (W1.7), encoding on the D3D11 device of an output an Intel GPU renders
+  -- a monitor through desktop duplication, the host's own display read straight from its driver --
+  in H.264 and HEVC, and HEVC at ten bits and in full chroma where the part codes them. The encoder
+  follows the captured output's GPU.
+  *Decided at the interview:* **the current runtime alone.** It reaches Tiger Lake's integrated
+  graphics and every part after it, the discrete ones included; Broadwell to Ice Lake, which only
+  the older runtime reaches, are a step of their own once such a part is at hand to check it --
+  that runtime is opened another way and takes the host's textures another way, and the one older
+  part to hand codes H.264 alone. Until then an output such a part renders is refused, as an
+  output on a GPU with no encoder here is ([05 §4](05-host.md)). **No integrated part of the
+  current runtime is at hand**, so the development machine's discrete part stands for the runtime
+  and the gate names the integrated parts as not run.
+  *Planned with it:* the low-power engine where the part has one; the rate held as on the NVIDIA
+  encoder -- variable within a peak equal to the target, the same buffer of at most 3.1 frames and
+  768 kbit, the quantiser floor and the effort of [05 §4.1](05-host.md) -- and changed live with no
+  keyframe; keyframes only when asked, each with its parameter sets; **HEVC's predicted pictures
+  coded as the runtime codes them by default, as bidirectional slices whose two lists name the one
+  picture before** -- nothing reordered and no delay added -- since some of Intel's integrated parts
+  code no other kind; BT.709 in the video range, stated to the encoder; a finished picture collected
+  as it finishes rather than on a timer's tick; the library's interface unchanged, its vendor
+  encoder meaning the vendor of the output's GPU on Windows. **A probe comes first**, before any of
+  it is built: how the runtime says a picture is finished; how a texture of the host's reaches it,
+  and whether it is copied; the encode's time paced against back to back, and whether the GPU's
+  clocks fall between pictures; the parameter sets and the slice kinds it writes; live rate
+  changes; the part's ceiling at 1920x1080 and 2560x1440; ten bits and full chroma; and the
+  runtime's own conversion of the captured picture against the host's, which this step decides by
+  measurement as W2.7 did ([05 §3](05-host.md)).
+  Checked by: on the development machine, from the monitor on the Intel GPU at 1920x1080 and 120
+  and from the host's own display rendered there, ten minutes each of H.264 and HEVC to established
+  clients on macOS, Android and Windows and the library's demo, each decoding the bidirectional
+  slices; ten-bit HEVC and full chroma where the part codes them; once each mid-session, a rate
+  change under congestion with no keyframe, a keyframe after loss, a switch between the NVIDIA's
+  monitor and the Intel's with the guest kept and full chroma kept across it, the Intel's driver
+  restarted, the NVIDIA's driver restarted with the host's display on the Intel GPU, and the lock
+  screen; the encode at p50, p95 and p99 against an established host's on the same monitor, at or
+  below it at p50 and p95; both CI jobs and the Linux bar.
+  *Probed 2026-10-25, before any of it was built*, on the development machine's Intel card. The
+  conversion's targets go to the encoder as they are, through a frame allocator that hands it each
+  texture, with no copy; the runtime makes its own references and submits each picture from a thread
+  of its own. **The runtime's own wait is the only sign a picture is done**, and it returns with the
+  picture on the loop's thread; a fence on the device passes at once, the encode running on the
+  video engine unordered against the device's queue. **A live change moves the target, the peak and
+  the encoder's largest-picture limit, never its buffer, and with a buffer under five pictures
+  H.264's rate stays where a cut left it** -- so, amending the rate planned above, the buffer is made
+  at six pictures of the session's ceiling and each picture is bounded at min(768 kbit, 3.1
+  pictures) by that limit, moved with every live change; a change is made from the parameters the
+  encoder was built with, since one made from those it reports back starts H.264 again with a
+  keyframe. HEVC's predicted pictures stay the runtime's low-delay bidirectional slices, which
+  measured no larger or slower than plain predicted ones on this part, and HEVC takes the runtime's
+  remote-gaming tuning, the same pictures with the 95th percentile 0.9 to 1.6 ms lower; H.264's is
+  measured at the build, since it sends a picture set again mid-stream. The part's H.264 is no wider
+  than 4096 and no faster than 165 pictures a second, its HEVC reaching 8K and 240; HEVC refuses a
+  quantiser floor under 10 and keeps its own. One picture in flight, 1920x1080 encodes in 2.7 to 2.9
+  ms and 2560x1440 in 3.9 to 4.2 at the median; four in flight sustain about 630, 415 and 200
+  pictures a second at 1080p, 1440p and 4K in HEVC; ten bits and full chroma at both depths decode
+  as their source. **Decided after it: the host's conversion feeds Intel's encoder** (the
+  maintainer's decision), as it feeds NVIDIA's ([05 §3](05-host.md) unchanged): the runtime's own
+  conversion of the captured picture adds 0.8 to 2.8 ms inside the encode and takes its matrix from
+  the stated colour description the wrong way round -- BT.709 stated gives BT.601 levels -- where
+  the host's costs this card 0.9 ms at 1080p and 1.5 ms at 1440p.
+  *Built 2026-10-25*: the encoder on the output's device as probed -- the conversion's targets
+  registered once and handed over as they are, one picture in the engine at a time and a second
+  refused as the queue's back pressure, a live change asked while a picture is in the engine made
+  before the next submit, the rate as decided above -- chosen where the GPU's driver names the
+  current runtime, and the census asked of the encoder itself with nothing built, which grants
+  full chroma at both depths on the development machine's card. **The conversion is drawn on
+  Intel's GPUs** ([05 §3](05-host.md), amended): the same bytes, 2.8 to 5.6 times cheaper there
+  than the compute pass. **The duplication's wait stalls Intel's encode** -- with it back to back
+  a picture took 11 ms from submit to collected against 3.8 with the loop polling, and the loop
+  ran at half the refresh -- so while Intel's encoder holds a picture the loop sleeps a
+  millisecond at a time instead of entering that wait ([05 §2](05-host.md), amended); the host's
+  own display, read from its driver, needs no such guard. H.264's limits on the part reach the
+  guests as NVIDIA's 4096 does: a guest that decodes nothing else is ended past 4096 wide or 165
+  pictures a second. Checked: H.264 and HEVC, ten bits and full chroma at both depths through the
+  library's decoder on the card, no keyframe across 119 rate changes and none unasked, an external
+  parser's reading of each stream, the census against a build in six cases, each layout at the
+  display's pace from the card's monitor and from the host's own display rendered there, and a
+  stream moved between the NVIDIA's monitor and the Intel's keeping its guest; each check broken
+  once.
+  *Checked 2026-10-25* ([changelog](changelog.md)): on the development machine's Intel card, ten
+  minutes each of H.264 and HEVC from its monitor at 1920x1080 and 120 under moving content --
+  120 a second, the encode 2.9 and 2.3 ms at the median -- and from the host's own display
+  rendered there, read from its driver, 2.4 and 2.0 ms; ten-bit HEVC and full chroma at both
+  depths, granted by the census, 2.4 and 3.3 ms. **H.264 takes the runtime's remote-gaming tuning
+  too**, decided at the gate: without it the one-picture engine reached its limit at 120 a second,
+  6.5 ms at the median with a few pictures outlasting a refresh; with it 2.9 ms, the rate at its
+  ceiling, its picture sets sent once ahead of the first keyframe. That stream and HEVC's
+  bidirectional one decoded on established clients on macOS, Android and in a browser and in the
+  library's demo. Mid-session: 5 % loss for 30 s covered by resends, no keyframe needed; a live
+  raise of the rate past the one the encoder was built at, taken, and H.264 back at it within a
+  second of a cut clearing; switches between the NVIDIA's monitors and the Intel's, the guest
+  kept; full chroma granted at both depths; the lock screen, an elevation prompt and the secure
+  attention sequence; the Intel's driver restarted twice, rebuilt on its new device 1.3 to 1.7 s
+  after the loss with the guest kept -- once, after a duplication refused while it was made
+  again, the guest's picture stayed black for 90 s, not seen again; the NVIDIA's driver
+  restarted with the host's display on the Intel card, nothing rebuilt, the picture paused about
+  2 s, the guest kept. Against an established host on the same monitor, the same client and
+  content, one host at a time, the encode each reports at p50, p95 and p99: H.264 2.81, 2.92 and
+  2.94 ms against 5.05, 6.12 and 6.23; that host served no HEVC from the Intel's monitor. The
+  Linux bar. **A rate change under congestion did not pass, and not for the encoder**: a
+  bottleneck at 7 Mbit/s collapsed the stream at 120 a second on Intel's encoder and NVIDIA's
+  alike, where W2.7's AMD passed it at 60 -- the shared congestion control at 120, a step of its
+  own after this one. *Corrected 2026-10-25, after the gate:* **that collapse was the test
+  content, not the congestion control.** The colour noise repaints every square every refresh and
+  codes at about 9 Mbit/s at 120 a second whatever the encoder is asked -- asked 1, 2 and 4 Mbit/s
+  with no bottleneck it sent about 9 -- so no rate control fits it under 7, where at 60 the same
+  noise costs half and fits. With content whose bits follow the target, the same bottleneck at
+  120 settled within a second: 42 live cuts and none a keyframe, the pictures at 110 to 120 a
+  second, the round trip 45 ms at the median -- **the rate change under congestion passes**.
+  **Found and fixed at the gate**: an output asked for while the stream
+  rebuilt for another reason was never noticed, the loop counting the request while its name
+  waited unread ([06](06-api.md) `output`). **Not run**: an integrated part of the current runtime
+  and the older runtime's parts, none at hand; an established client on Windows, none at the
+  desk. Both CI jobs green on the branch as pushed before the gate's fix, which passed the same
+  checks on the development machine and in a Linux environment.
+  *Closed 2026-10-25.*
+
+**Gate:** the host on the development machine, with established clients on macOS and Android on
+the same LAN:
+
+- ten minutes each of H.264 and HEVC at 2560x1440 through NVENC, and ten-bit and full chroma
+  where the encoder takes them;
+- once each mid-session: the lock screen, an elevation prompt, a logoff and the reconnect after
+  it, and a switch of display where a second one is attached;
+- input: every key class against a USB keyboard's, both pointers, a pad with rumble;
+- sound through a quiet spell with no gap;
+- the wide-area leg the other way round: the host here, the library's demo and an established
+  client on a remote Windows machine over the internet;
+- recorded rather than passed: composition to encoder input at p50, p95 and p99, the baseline
+  W3's direct frame is measured against;
+- both CI jobs, and the Linux bar, since the shared pointer type and the usage translation
+  change.
+
+## Phase W3 - The host's virtual display
+
+**Added 2026-10-14; planned 2026-10-15, interview of the same day.** A display driver of the
+host's own, for a host with no monitor: an indirect display whose composed desktop the host
+converts straight from the system's buffer, and a controller through which any application can
+plug virtual monitors of its own ([00 §D16](00-overview.md)). Behind a virtual display, desktop
+duplication costs two passes after composition -- the system's copy into its duplication image,
+then the conversion -- where this costs one, the conversion itself. W2's desktop duplication is
+what it is measured against, and an established host duplicates its own virtual display like
+any other output, so the direct frame is the whole of what this display adds over one. The
+decisions are recorded once, here; the design they add up to is [11](11-drivers.md).
+
+### Decided when it was added
+
+- **The host reads the system's own buffer.** The driver shares each of the swapchain's
+  buffers once, read-only, as a handle the host takes from the driver's process. After each
+  acquire it signals a fence on the device the swapchain was given, which orders the signal
+  behind the system's write, and the host's conversion waits on that fence. The driver
+  finishes the frame as soon as the signal is queued, then holds the buffer -- acquiring no
+  other -- until the host's release fence passes. It reads the host's fence on the processor
+  only and never waits for it on the device, so a host that dies cannot stall the display.
+  *Amended 2026-10-16, at W3.3's review:* **the driver never waits for the host.** A swapchain
+  hands the driver three buffers in turn, measured, and the system writes a buffer again only for
+  the third composition after it, so a picture stays intact for about three refreshes after the
+  driver acquires it -- 24 ms at 120 a second -- where the host converts within half a
+  millisecond. The driver acquires, signals, publishes and finishes, as it would with nobody
+  reading; the release fence and the hold are gone. The host converts the latest picture and,
+  after queuing the conversion, checks that the driver has not acquired as many newer pictures as
+  the swapchain has buffers less one; when it has, the buffer may have been written again, so the
+  latest is converted instead, and counted. A still desktop's last picture stays the driver's
+  until a newer one is acquired, so it is never written again while it is the latest.
+  *Amended 2026-10-19, at W2.7:* where the encoder reads the buffer itself (an AMD GPU), the check
+  follows the picture's collect, and a buffer found written again is already encoded: counted, and
+  the next picture a keyframe ([05 §2](05-host.md)).
+- **The hold is bounded well inside a frame period**, since a held buffer holds back the
+  compositor. Past the bound the driver releases the buffer anyway and counts it.
+  *Replaced 2026-10-16, at W3.3's review:* nothing is held (above); the system's own cycle of
+  buffers keeps a picture intact while the host reads it, six times longer than the bound would
+  have.
+- **The driver converts nothing.** Formats, depth, full chroma and scaling stay the host's,
+  so changing them never re-signs the driver. As everywhere, the display is standard dynamic
+  range only, so every buffer is eight-bit BGRA.
+- **The frames never cross the library's boundary**: the host's display module reads the
+  driver, as it reads a scanout buffer on Linux, and [06 §13](06-api.md) stands.
+
+### Decisions taken at the interview
+
+- **The monitor lives with the host.** The host plugs its display when a stream finds no lit
+  output and the configuration allows it, or when the configuration names it, and keeps it for
+  as long as the host runs: the driver unplugs a monitor when the handle that plugged it closes,
+  so a host that ends, however it ends, leaves no display behind, and nothing has to keep one
+  alive. Not one per session: a machine with no monitor then has a display for its logon screen
+  and its launchers before anybody connects, a connection waits for no plug, and the desktop's
+  layout does not change with every guest. Allowing it is off in the library's defaults, since
+  it changes the machine, and on in `lowlatd`'s.
+- **The driver is Rust, in this workspace.** A user-mode display driver built from a
+  Windows-only crate here and shipped with `lowlatd`. The declarations of the user-mode driver
+  framework and of the indirect display class are generated once from the driver kit's headers
+  by a script, against an allowlist, and committed, as the other vendor interfaces are; the
+  calls through each framework's function table are written by hand behind their availability
+  checks. A callback never unwinds into the system's code: a panic ends the driver's host
+  process, which the system starts again. **The channel's shared layout and its claim and
+  release are written once, compiled into the driver and the host both, and model-checked**,
+  as every other handoff here is. The driver kit is a pinned package restored by a script, so
+  every machine and CI build against one version and nothing is installed.
+- **A controller, the library's third half** ([00 §D16](00-overview.md)). The control side of
+  the driver's channel is a module the host's display uses and a third half of the library
+  beside the host and the client, under their conventions ([06](06-api.md)): open, close, plug a
+  monitor with its modes and the preferred one, unplug, set a mode, list, and the driver's
+  version. **A monitor is bound to the handle that plugged it, or kept**
+  ([11 §1.3](11-drivers.md)): only its handle re-modes or unplugs a bound one, and the handle's
+  end unplugs it, so an application cannot disturb the host's display, nor the host an
+  application's; a kept one belongs to no handle, lives until removed, and may come back at start
+  from a file the controller writes and the driver only reads, in a folder users may write.
+  **Nothing keeps a monitor alive by traffic**: a ping that stalls with a debugger, a resume from
+  sleep or a starved thread would take a display away mid-session, where a handle's end is the
+  owner's own. Up to sixteen monitors, each a slot whose identity never changes, so the system
+  keeps each one's arrangement; the host plugs one, bound. `lowlatd display` drives the
+  controller from a shell. The control interface admits any interactive user -- plugging a
+  display asks no more than a person at the desk may do, and ownership keeps one user's monitors
+  from another's requests -- while **the frames are never in it** ([06 §13](06-api.md)): the
+  driver's frame interface admits the system account alone, checked when it is opened.
+  *Amended 2026-10-16, at W3.3's review:* what limits the frames is the handles. The answer to a
+  request for a monitor's frames is a set of handle values in the driver's own process, which only
+  a process allowed to take handles from it can use -- the system account, or an administrator
+  who turns on the debugging privilege, who could find them there unasked. So the driver answers
+  anyone the device admits, and nothing it does waits on whoever reads; a check at open would
+  have guarded only what the handles already guard.
+- **The host's display is configured like an output.** Whether a stream may plug it is settled
+  at start; its name, `virtual`, and its size and refresh are live. Zero lets the host decide:
+  the size an owner states as it joins an empty room, within the largest picture that guest
+  accepts -- the owner's machine is not resized for a guest the owner let in -- else the size it
+  already has, 1920x1080 when first plugged. The refresh is the stream's frame-rate ceiling, 60
+  when that is zero: a display composing faster than the stream composes pictures nobody is
+  sent, and the refresh a client states is a fixed number rather than a reading of its screen.
+  A guest's later request for a size reaches it through the application, the last one winning
+  ([06 §14](06-api.md)); `lowlatd` relays the settings panel's. A turn of the host's display is
+  refused until its rotation has been checked. The last guest leaving changes nothing. A mode
+  the monitor lists is set through the system's display configuration, never saved to the
+  system's database of arrangements -- a saved arrangement that only the virtual display can
+  satisfy holds a later boot waiting for the driver -- and a mode it does not list is a replug
+  with that mode added first, since a monitor's modes are fixed when it arrives.
+  *Amended 2026-10-16, at W3.2's review:* the display is plugged when the host starts -- the
+  setting allowing it and nothing lit, or the configuration naming it -- and again whenever
+  nothing is lit while the host runs, never on the first guest's arrival, since a stream exists
+  only once a guest is seated; on a thread of the host's own, since the controller's calls wait
+  for the system. It takes the highest free slot, so it keeps one identity and never takes an
+  application's first free one. The size at a join, stated or kept, is clamped to that guest's
+  largest picture and put before that guest's first picture; an established client states its
+  own screen's size, so the join usually replugs the display with a mode no monitor lists.
+  **The display holds its mode**: another monitor's arrival and a program leaving exclusive
+  fullscreen each put a saved mode back on it, measured, so the host puts its own back
+  whenever the system's differs. The enumeration lists it as `virtual`, the system's name for
+  it beside that, so a request by name survives a renumbering, and reading the configuration
+  back says `virtual` while it is captured. Off Windows the fields are accepted and nothing is
+  plugged, and `virtual` is refused.
+  *Amended 2026-10-16, at W3.2's build:* **lit means a monitor behind the output.** The last
+  monitor's cable pulled leaves its output active and part of the desktop, composed for nobody,
+  and no event marks it -- a DisplayPort and an HDMI panel alike, measured -- so the stream kept
+  serving a still picture and the setting never found nothing lit. The monitor leaves only the
+  list of monitors under the output, so an output counts as lit only with a monitor listed
+  behind it: where outputs are read, and in the stream's check each second that its display is
+  still there. A virtual display lists its monitor as a panel does. Any monitor's arrival clears
+  the dead output.
+  *Amended 2026-10-20, at W3.8 (the maintainer's decisions):* **what nobody asked for is the
+  desk's.** The display holds its size, and its refresh only where one is asked -- `virtual_hz`
+  or a frame-rate ceiling, a guest's included; with neither, the refresh is the display's own:
+  it is plugged for its size alone, the system restoring the refresh its display settings last
+  saved, 60 where there is none, and a refresh set there after stands, the stream pacing from it.
+  Before, 60 was put back over a refresh a person set, at once. **A display turned at the desk
+  is left turned**: a person may turn it freely in the display settings, nothing is put on it
+  while it is turned, and it streams through the duplication (W3.8). A guest's turn stays
+  refused until a turned picture read from the driver has been checked.
+  *Amended 2026-10-20, at W3.9 (the maintainer's decision):* **a guest's turn is put once and
+  never held**, as one at the desk is, the last turn made standing: `lowlatd` relays the
+  settings panel's, and an application through a call of the library's (minor 31). A mode is put
+  keeping whatever turn the display has. A turned display still streams through the duplication:
+  its driver's picture checked the same as the duplication's, the pointer's shape the driver hands
+  over turned for the panel.
+  *Amended 2026-10-20, at W3.10 (the maintainer's decisions):* **the library turns no display,
+  its own included**: the call above was withdrawn before it was published, and the minor is 30
+  again. `lowlatd` turns the host's display for a guest as the desk does, through the system's
+  display configuration by its name. **A guest's size, turn and stream rate are an owner's
+  alone**, its later size included: an established client offers them to an owner alone, and the
+  host refuses them from any other guest whatever its client sent. Which output is captured stays
+  every guest's to pick.
+  *Amended 2026-10-21, at W3.11 (the maintainer's decision):* **the display's mode is put as it is
+  asked and held against the system's restore alone.** A program in exclusive fullscreen at a size
+  of its own changes the display's mode, measured, and holding the host's mode over it took the
+  program's size away within a tenth of a second; a program that takes its size back flapped the
+  display twice a second, each a rebuild. So the host puts its mode when it is asked -- an owner's
+  size, a refresh -- and after that only over the mode the system's store holds for the display
+  among the monitors connected, which is what another monitor's arrival and a program leaving
+  fullscreen put back. Any other mode stands, and the stream follows it: a program's in exclusive
+  fullscreen, one set from outside and not saved. A program asking for exactly the store's mode is
+  the one case it cannot tell from a restore.
+- **A guest's mode on any other display is put by `lowlatd`, not by the library** (*added
+  2026-10-20, at W3.10's interview*). A size and a turn for whatever display is captured were
+  weighed as fields of the library's video configuration and kept out of it, as on Linux: the
+  request is the application's, and on Linux the fields would do nothing. The host runs in the
+  session, so `lowlatd` puts an owner's request itself, on a thread of its own, one at a time: on
+  a panel or another vendor's virtual display through the system's display configuration, never
+  saved, at the refresh the display runs where the new size lists it, else the highest that size
+  lists, and **a size the display does not list refused**, never scaled; on a monitor of the
+  driver that no program holds, through the controller, which adds a size the monitor does not
+  list by plugging it again; on a monitor another program plugged, not at all. **Put once, never
+  held, never given back** when the last guest leaves, as on Linux, and a guest's stated size at
+  its join is never put on a display the host did not plug.
+- **The frame contract, made concrete.** Per swapchain the driver shares each distinct buffer
+  once, with a fence of its device, and publishes their handles in a section the host maps; the
+  host takes the handles from the driver's process and keeps a view per buffer until the
+  swapchain is replaced. Per frame the driver acquires, notes the time, signals the fence,
+  publishes the buffer with its sequence and frame number, finishes the frame, then waits on
+  three things together -- the host's release reaching that sequence, the swapchain's end, and
+  the bound -- before it acquires again. The host claims a sequence before it reads; at the bound
+  the driver lets go of an unclaimed frame, which the host then skips, and of a claimed one too,
+  counting it. **The swapchain's end ends a hold at once**: a frame held across a monitor's
+  departure stalls the system's teardown until its watchdog ends the driver. The frame's time
+  is the driver's acquire, not the time the system says the frame should be shown, which lies
+  ahead of it. A buffer's reference is released at the next acquire. If the system's buffer
+  will not open in the host, or the hold costs more than it saves, the driver converts into
+  targets of its own, then copies, by measurement.
+  *Amended 2026-10-16, at W3.3's review:* everything is the driver's -- the section, the buffers'
+  handles, the fence and an event set at each publish -- and the host takes them from the
+  driver's process, so nothing is ever placed in it. Per frame the driver acquires, notes the
+  time, signals the fence, publishes the latest picture -- its buffer, sequence and frame number
+  -- and finishes; nothing is claimed and nothing waits on the host, and with no hold there is
+  none to end at a monitor's departure. The host takes the latest picture, waits for the fence on
+  its device, converts, and checks the sequence after, as above. The buffer opens in the host as
+  it is: no keyed mutex, read across processes, measured.
+- **Signing.** In development the driver and its catalogue are signed with a test certificate
+  the machine trusts: a user-mode driver needs neither test mode nor a signature from the
+  system's vendor. Releases are signed by a signing service for open-source projects, from CI's
+  build, so CI builds the driver. The library is never linked to demand the system vendor's own
+  signature at load.
+- **The floor**: the indirect display class at 1.4, the first that names the swapchain's render
+  adapter, so Windows 10 1903; the user-mode framework 2.25; later calls behind their
+  availability checks. The host's own floor stays 1703 for a physical display.
+- **Desktop duplication of any virtual display** (W2's gap, corrected above): the device is made
+  on the GPU that renders the output -- for the host's own display the one the driver reports,
+  and for another vendor's whichever the encoder accepts, measured first.
+  *Amended 2026-10-16, at W3.2's review:* nothing to build. The system lists a virtual display's
+  output under the GPU that renders it, so the device W2 makes on the output's adapter is
+  already that GPU's -- seen for the host's own display and an established host's own, each
+  streamed as built. A virtual display rendered on a GPU without the encoder this host builds
+  stays refused, as any output there is.
+- **A kept monitor's arrangement is saved in the system's own store** (*added 2026-10-15, at
+  W3.1's review*). A kept monitor is arranged like any monitor -- the system's own extend of a
+  set it has not seen saves it, a person's settings save it, and the controller's activation and
+  modes for it are saved too -- so it comes back after a reboot at its mode and place by the
+  system's own restore, which on a replug also overrules the mode the plug asked for. **Except
+  an arrangement in which only virtual displays would be active**, applied unsaved: a saved one
+  that only the virtual display can satisfy holds a later boot waiting for its driver. A bound
+  monitor's -- the host's display, an application's -- is never saved, as above.
+- **The controller's calls wait for the system, within a bound** (*added at W3.1's review*): a
+  plug until the monitor is active at its mode, a mode until it is current, an unplug until the
+  monitor has gone; about three seconds, past which a status of its own says the monitor is
+  plugged and the system has not finished. Calls on one handle take turns. The library's other
+  calls never wait so long ([06 §8](06-api.md)); this half's are its stated exception.
+- **One GPU for every monitor: the file's, else the high-performance one** (*added at W3.1's
+  review*). The display class takes one render GPU for the whole adapter and re-creates every
+  swapchain when it changes, so the file names one by vendor and device; with none, or one not
+  in the machine, the driver names the first hardware GPU in the system's high-performance order,
+  at its start and before any monitor. The host never names one: it builds on the GPU each
+  swapchain reports, the encoder following the display.
+  *Checked 2026-10-20:* the newest display class in the pinned kit (1.10) still names one render
+  GPU per adapter; a GPU of its own for each monitor would take a device of the driver's per
+  GPU, each its own adapter. Not taken.
+- **The controller is a program of its own too** (*added 2026-10-17, at W3.6's review*).
+  `lowlat-vdd` takes the commands `lowlatd display` takes, both through one implementation in the
+  controller's crate, for a machine that runs no host. **The library's third half built alone is
+  the C interface to the virtual displays**: the same library and header with neither of the
+  other halves, for an application that wants displays and nothing else; nothing new crosses the
+  boundary. Both are built and checked here and ship with the host. A package of their own, with
+  a command that installs the driver, waits for the release signature, without which a package
+  loads on no other machine.
+- **The driver's files are named `lowlat-idd`** (*added at W3.6's review*): the library
+  `lowlat_idd.dll`, its setup information and catalogue `lowlat-idd.inf` and `lowlat-idd.cat`. A
+  program's debug symbols take its name with underscores, so a driver library named after the
+  program would share one file with it. The device keeps its hardware ID and its service, since a
+  new hardware ID gives an installed machine a second device.
+- **The names a person sees** (*added at W3.6's review*): the adapter "Lowlat Virtual Display",
+  its provider "Lowlat", and each monitor "LowlatDisplay", which fills the thirteen characters an
+  EDID's name holds. A different EDID is a different monitor to the system, so the driver that
+  brings the name makes every slot a new monitor once, the arrangements saved for the old ones
+  left behind.
+- **Nothing of a refused request stays behind, and a wait past its bound names what it left**
+  (*added 2026-10-17, at W3.7's review*). A plug the system's display configuration refuses is
+  unplugged again, its line in the file with it; an unplug removes the line before the monitor;
+  and the status past the bound names the monitor's slot, the library handing back the monitor
+  as it stands (minor 30), so a plug that asked for no slot learns which it got.
+
+### Steps
+
+- [x] **W3.0 the driver and its package**: the crate and its generated declarations; the
+  adapter, its monitors with a fixed identity, their modes and the hardware cursor; a frame loop
+  that finishes every frame; the setup information, the package and its test signature; install
+  and uninstall. Checked by a monitor plugged by hand arriving and composing, listed with the
+  render GPU named, and the package installing silently with no test mode. *Amended at the
+  build:* the system lists the output under the GPU that renders it, not on an adapter of its
+  own as first written.
+  *Built and checked live 2026-10-15.* Two crates: `lowlat-vdd-proto` holds what the driver and
+  its controller share -- the control interface's requests and replies, each slot's identity
+  and EDID, the modes -- with no platform code, tested on every platform; `lowlat-vdd` is the
+  driver, a Windows library the system's user-mode driver host loads. The frameworks'
+  declarations are generated from the pinned driver kit's headers by a script and committed;
+  scripts restore the kit, make and trust the development certificate, package and sign the
+  driver, and install and remove it. The control interface answers the version, a plug, an
+  unplug and the list of slots, a monitor plugged through it bound to its handle; the driver's
+  log goes to the debugger stream. Two things the build found. **A mode that asks for display
+  bandwidth is never made active** when the adapter declares no budget, since the system keeps
+  the active modes' sum within the adapter's: the first build's monitor arrived and never
+  composed, and the target modes now ask for none. **The system makes a plugged monitor active
+  by itself only in a set of monitors it has not seen**; a set it remembers it arranges as
+  remembered, which left the first build's monitor dark ever after. So a monitor is made active
+  by adding its path to the active ones through the system's display configuration, never saved
+  -- W3.1's controller does so, and this step's check did by hand. Checked on the development
+  machine, Windows 10 22H2 with the display class at 1.5: the package installing and updating
+  silently with no test mode; a monitor plugged by an unelevated program in under a fifth of a
+  millisecond, the system making a monitor of its EDID; made active in 164 ms, its mode
+  committed, its swapchain on the RTX 5060 the system named and its pictures counted, at
+  1920x1080 at 60 and at 2560x1440 at 120; a second slot's monitor, a set the system had not
+  seen, extended by the system itself in 15 ms; the output listed under the render GPU; the
+  first one to three swapchains after a mode is set taken back at once -- unassigned before the
+  device is set, or lost at the first acquire -- and another assigned within about a quarter of
+  a second, each ended and deleted without a wait; and the monitor unplugged by a request, by
+  its handle's close and by its process killed mid-hold, each in under 10 ms. The protocol's
+  checks were each broken once and seen to fail, and CI fetches the kit and builds the driver.
+- [x] **W3.1 the controller**: the control interface, bound and kept monitors, plug, unplug, a
+  mode set through the display configuration or by replug, the list; the slots, the custom
+  modes and the file kept monitors come back from; the library's third half and `lowlatd
+  display`. Checked by an unelevated program driving a bound monitor of its own beside another
+  handle's, refused the other's, and killed with no monitor left behind; and by a kept monitor
+  made unelevated coming back after a reboot at its slot, mode and position.
+  *Reviewed 2026-10-15, before its build* (the last three decisions above, added at it): also
+  the monitors reported as DisplayPort, as their EDID says; a replug that keeps its slot from
+  departure to arrival; the file in a folder of its own, read as hostile.
+  *Built and checked live 2026-10-15.* The driver's protocol at version 2:
+  a plug carries the lifetime, whether a kept monitor comes back, and the slot it asks for; a
+  replug adds a mode to one monitor; a reload rereads the file. Kept monitors belong to no
+  handle. The file (`%ProgramData%\lowlat\display\displays.conf`) is read at the driver's start
+  and on a reload -- the GPU, the pointer, the custom modes, a dumped EDID and the kept monitors
+  that come back -- and written by the controller under a lock, replaced whole; the installer
+  makes its folder, writable by users and readable by the driver's own account. The controller
+  is `lowlat-vdd-ctl`: it plugs and waits for the system, makes the monitor active itself when
+  the system has not within 400 ms, reads the mode back and sets the one asked for when a saved
+  arrangement overruled it, saves as the decisions above say, and sets a listed mode through the
+  display configuration and an unlisted one by a replug. The library's third half drives it
+  (minor 26, Windows alone, [06 §3c](06-api.md)), and so does `lowlatd display`. Checked on the
+  development machine: from an unelevated shell, a kept monitor plugged in 612 ms -- a set the
+  system remembered dark, made active by the controller and saved -- set to a listed mode in
+  99 ms and to an unlisted one by a replug in 170 ms, and removed in 197 ms; a bound monitor
+  held by one program, its remove and its mode refused to another, and unplugged in 7 ms when
+  its holder was killed; a kept monitor marked to come back plugged by the driver 7 ms after its
+  device restarted, before any request, and shown by the system at its saved mode and place; the
+  GPU, the pointer, the custom modes and the EDID changed through the file, and refused where
+  wrong; the third half driven through the C interface for both lifetimes, its deliberate panic
+  contained; the protocol's checks each broken once and seen to fail, 45 of them. **And after a
+  reboot**, a kept monitor an unelevated shell made came back at its slot, mode and place:
+  plugged again by the driver from the file at its start, arranged by the system from its
+  store.
+- [x] **W3.2 the host's display, and desktop duplication of any virtual display**: the setting,
+  the name, the live mode, the owner's size at join, `lowlatd`'s relay; the device on the GPU
+  that renders an indirect output. Checked by the host streaming its own display through desktop
+  duplication -- the baseline -- and two other vendors' virtual displays.
+  *Reviewed 2026-10-16, before its build* (the decisions above, and the pace in W2's): the first
+  check passed -- the stream as built takes the host's own display and an established host's
+  own -- so the device half is nothing to build, and an established host's own display stands
+  for the other vendors' here, a second one left to the gate. Checked as well: the display
+  plugged by name with the panels lit, and by the setting with them taken out of the topology;
+  an owner's stated size, listed and not, at the first picture with no blink, a second guest's
+  ignored, one past that guest's largest picture clamped; the live size and refresh through the
+  library and through `lowlatd`'s relay, the blink measured; the saved mode put back by another
+  monitor's arrival and by a program leaving exclusive fullscreen, each restored; the pace at
+  the compositor's clock under a 144 and a 240 Hz mode, settled again when only the refresh
+  changes, and a ceiling below the clock taking each picture as it lands; a turn of the host's
+  display refused.
+  *Built and checked live 2026-10-16.* The host's own display lives with the stream's thread: plugged at the host's start where the
+  configuration names it, or allows it and nothing is lit -- asked again each second while
+  nobody is seated and at every build -- bound to the host, in the highest free slot; held at the
+  mode the host wants, put back whenever the system has it at another; and sized as a guest
+  arrives into an empty room, before that guest's first picture is built, the guest's
+  declaration travelling with its seat. Its name is `virtual` wherever outputs are listed or
+  asked for. The pace is the lowest of the rate asked, the output's mode and the compositor's
+  clock, which is also the refresh the deadlines sit on, and a change of either is a rebuild; the
+  rate asked is kept apart from the pace, so a rebuild settles again from it rather than from
+  what the last display allowed. `lowlatd` turns the setting on (`--no-virtual-fallback` turns it
+  off), passes a guest's rate to the host's display unbounded, since the display follows it,
+  relays a guest's size into the display's setting and refuses a turn of it, and tells the guests
+  a new rate. **The controller puts a mode again when the system takes it back**: a monitor
+  plugged again is restored to its set's saved arrangement as its arrival completes, which came
+  after the mode was put -- more than three seconds after while a program presented on the
+  display, measured -- and a bound monitor's unsaved mode did not survive it. **An output is lit
+  only with a monitor behind it** (the amendment above), since the last cable pulled leaves its
+  output on the desktop. Checked on the development machine: the display plugged by name with the panels lit 26 to 118 ms after the
+  host started, in slot 15, streamed at 120 a second with each picture handed over 0.08 ms after
+  its composition at the median, and gone when the host stopped; an owner's 2560x1440 put 163 ms
+  before the first picture, which was already that size; 3420x2148, which no monitor lists, put
+  by a replug in 201 ms, and in 622 ms with a program presenting on the display; a guest's rate
+  re-moding the display in 109 to 116 ms, the stream rebuilt behind it; a mode set from outside
+  the host put back in 119 ms; asking 144 of the display paced at 120, the compositor's clock, and
+  the guests told 120; asking 60, each picture taken 0.9 ms after its composition at the median
+  and 1.4 at p95, where 8.3 was measured with the deadlines on the mode; an established host's own
+  display at 144 paced at 120; the default `lowlatd` with the panels lit plugging nothing; the C#
+  host at minor 27; the new checks each broken once and seen to fail, nineteen of them; both
+  bars. **At the desk**, an established client on a laptop through `lowlatd`: its owner's
+  1366x768 put 179 ms after the declaration, the first picture at that size; the settings
+  panel's 1920x1080, 2560x1440 and 1366x768 each put 121 to 127 ms after the request, the
+  picture at the new size 331 to 335 ms after it; two turns refused with a line, nothing
+  rebuilt. The setting with the last panel's cable pulled while streaming: the stream left the
+  output with nothing behind it 0.96 s after the pull, the host's display was plugged 113 ms
+  later and streamed 0.27 s after that, about 1.35 s from the pull to the picture; the panel
+  plugged back, the host's display stayed and its saved 60 Hz, put back by the arrival, was put
+  to the asked 30 in 154 ms. Before the rule the same pull froze the picture until a monitor
+  arrived. Nothing lit cannot be made from software here -- the system refuses a desktop with no
+  output, and disabling a monitor's device leaves its output lit -- hence the cable. A program
+  leaving exclusive fullscreen takes the road a mode set from outside took, not checked again.
+- [x] **W3.3 the direct frame**: the frame interface, the section, the shared buffers and
+  fences, the claim, the hold and its bound, a view per buffer, the frame's time; the Windows
+  display's second source. Checked by the gate's comparison, run offline first, and by each part
+  broken and seen to fail: no wait on the fence, no release, a claimed frame past the bound.
+  *Reviewed 2026-10-16, before its build* (the decisions above, amended): a probe answered what
+  the design rested on, on the development machine. The system's buffer is eight-bit BGRA, read
+  by a shader, shared by an NT handle and with no keyed mutex, so a D3D11 reader in another process
+  opens it as it is; a swapchain has three, used in turn, at 2560x1440 at 120 and 1920x1080 at 60
+  alike. A reader as the system account took the buffers and the fence out of the driver's process,
+  opened them on a device of its own on the GPU that renders them, and read 1,790 pictures in
+  fifteen seconds, each the one published and none torn, with the wait on the fence and without:
+  on one GPU with the scheduling in its driver, the reads ran after the composition either way, so
+  that the wait is needed cannot be shown here, and it stays. The driver's acquire to the reader
+  seeing the picture took 0.013 ms at the median, to four pixels read back 0.39 ms. Read late on
+  purpose, every picture was intact up to 24 ms after its acquire at 120 a second and none from
+  25 ms -- the buffer written again for the third composition after it -- and at a 60 Hz mode none
+  was wrong up to 30 ms. Hence no hold (above). **The duplication stays the host's path through
+  this step**: the direct source is built into the Windows display and run by the hardware tests
+  and the comparison, as the system account, and becomes the host's own display's source at W3.4.
+  Its checks become: the publication model-checked; the freshness check broken by a stalled
+  reader, which then converts a later picture; the driver's process killed and its device
+  restarted mid-stream, twenty times each, the host never stuck behind its wait on the fence; two
+  readers at once; a user's process given nothing it can use. No release, bound or claim exists to
+  break.
+  *Built 2026-10-16*, not ticked: three checks wait on a restart of the machine. The page is
+  written once for both sides, its layout and its sequence lock, model-checked over every
+  interleaving of a writer publishing twice and a reader, and shown to fail with the reader's
+  second look or the writer's release removed. The driver makes a monitor's page at the first
+  request for its frames and keeps it for its life; per swapchain it shares each buffer once and
+  signals a fence of its device after each acquire, then publishes. **It keeps each acquired
+  buffer until the next acquire**, so a page asked for while the desktop is still is given the
+  picture on the display -- missing at first, when a reader that asked after the desktop went
+  still waited for its next change. The request is answered to anyone the device admits: an
+  ordinary user's process was answered and refused the page, the system account given it. The
+  host's display reads the page as a second source, run by hardware tests and the comparison
+  alone (the decision above). Found at the build as well: **a reader's same picture is its own
+  last frame**, never the driver's mark of a repeat; and, by reading, **the refresh comes with
+  each swapchain**: taken once at the open, the rate stays at 120 after the monitor is put at 60,
+  as a test shows with the read taken out, where it now settles at 60 within a tenth of a
+  second. Checked on the development machine, as the
+  system account: the first picture at once on a still desktop; a reader stalled 30 ms after
+  queuing each conversion caught 20 times in 20 and converted again, and never on time; a reader
+  that stopped taking during a burst converting the still desktop's last picture; the driver's
+  process ended right after a publish five times, each conversion queued behind its fence
+  finished, the output gone in 85 to 97 ms and the driver back in 120 to 300 ms. **The comparison,
+  offline**, a load presenting on the display, interleaved blocks of 600, composition to the
+  conversion done in ms at p50/p95/p99/max: at 2560x1440 at 120 the duplication
+  0.661/0.833/0.870/0.924 and the direct frame 0.608/0.767/0.820/1.326; at 3840x2160 at 120,
+  0.943/1.139/1.189/1.462 and 0.841/0.997/1.053/1.277; at 1920x1080 at 60 under the 120 Hz clock,
+  1.663/4.144/5.531/6.120 and 1.229/4.904/5.203/6.282, both tails unexplained; none converted
+  again. The duplication's own copy delays the conversion's start by about 0.05 ms at 1440p and
+  0.1 at 4K. **Owed, after a restart of the machine**: the driver restarted twenty times
+  mid-stream -- the first restart, made while the test held a handle on the device, was refused
+  and left the device waiting for a reboot ([11 §1.8](11-drivers.md)) -- the still desktop's
+  picture broken on purpose in the driver, and the frame thread's priority measured with and
+  without under load. The 240 Hz leg is the gate's.
+  *Checked 2026-10-16, after a restart of the machine*, as the system account: the device
+  restarted twenty times mid-stream with the test's handle closed first, nothing stranded, the
+  output gone in 160 to 206 ms; the driver's process ended five times, not twenty -- the system
+  starts a driver whose process ends again no more often in a few minutes. The driver's
+  publication of the held picture switched off, the first picture on a still desktop did not
+  come within 150 ms, and on, it came at once. Two readers waiting on one page together at 120 a
+  second each converted all 240 pictures, neither waiting more than 9.9 ms; no break was built
+  for it. **The frame thread stays at normal priority** ([11 §1.1](11-drivers.md)): under one
+  busy loop per logical processor, raised through the system's multimedia scheduling it acquired
+  one picture in twenty 1.4 to 1.6 ms later than the median, where at normal priority nineteen in
+  twenty came within 0.09 ms. *Amended 2026-10-17:* **raised after all**, to the highest priority
+  of its class: that measurement timed the acquire, and the fence's signal after it ran late
+  beside busy threads of its own priority (the gate's comparison below, [11 §1.1](11-drivers.md)).
+  Found: an update restarts the other virtual displays' devices too,
+  and one held open by its own software leaves the update waiting for a reboot, this driver
+  restarted onto the new one all the same ([11 §1.8](11-drivers.md)).
+- [x] **W3.4 the pointer from the hardware cursor**: shape, hotspot and visibility from the
+  driver, position and show state as in W2. Checked by each kind of shape, one larger than the
+  wire's 256, and the visibility while the system draws the pointer itself.
+  *Amended 2026-10-16, at W3.3's review:* with its pointer, the host's own display reads the
+  direct frame whenever the driver answers, and duplicates it otherwise, so W3.5's checks and the
+  gate stream it; before this step its pictures would carry no pointer.
+  *Amended 2026-10-20, at W3.8 (the maintainer's decision):* any monitor of the driver reads it,
+  and only while upright -- the driver is told nothing of a turn -- the host's own display's
+  included.
+  *Reviewed 2026-10-16, before its build.* **The driver publishes the pointer in the monitor's
+  frame section**, after the pictures' page ([11 §1.7](11-drivers.md)): whether a hardware cursor
+  is set up and whether it is visible, and the shape -- its kind, size, row pitch, hotspot and the
+  system's number for it -- with its pixels copied in only when that number moves; each part under
+  a sequence lock of its own, written by the monitor's worker when the system signals new cursor
+  data, model-checked as the pictures' part is. The frame channel's version becomes 2. The host's
+  own display reads it in place of the duplication's frames: the visibility and a new shape into
+  the pointer state W2 built, the position, the show state and the touch flag from the system as
+  for any display, settled as in W2. **The frames need no desktop, the pointer's read does**: the
+  reading thread follows the input desktop whenever that read fails, at the duplication's retry
+  pace, so the lock screen and an elevation prompt keep their pointer. The system hands the
+  driver two kinds of shape, alpha and masked colour, every monochrome pointer converted to the
+  latter, which is drawn as the monochrome one it is (W2's decisions, amended). **A pointer
+  larger than 256 stays the system's to draw**: drawn into the pictures and reported invisible,
+  so a guest is told it is drawn and takes it over until it shrinks, as for any pointer the
+  system draws; the duplication keeps its last shape, its pictures never carrying the pointer.
+  No hardware cursor -- the file's setting, or a setup the system refused -- is said as such:
+  the pointer is in the pictures. The cursor is read on the frame's own worker unless measured
+  to move the frame's acquire. The host's own display opens the direct frame when the driver
+  answers -- the host runs as the system account -- and the duplication otherwise; no
+  configuration selects it. Checked by: each kind of shape on both sources from the same pointer
+  -- an arrow, the text cursor, a coloured inverting pointer, a monochrome one of the test's own,
+  a hand -- drawn alike, and the monochrome rule broken once; a pointer over 256 reported hidden
+  with the picture carrying it; a pointer an application hides turning relative, and its showing
+  again carrying the position; the pointer leaving the display and coming back; the lock screen
+  and the secure attention screen keeping their pointer, broken by not following the desktop; a
+  pointer swept a thousand times a second against the frame's acquire; the host's own display
+  streaming direct as the system account and duplicating as a user, and back on direct after its
+  driver restarts; the publication model-checked; both bars.
+  *Built and checked 2026-10-16*, on the development machine, as the system account. **The
+  pointer reads the same from the driver as from the duplication**: the system's arrow, text
+  cursor and hand, a monochrome pointer of the test's own and one inverting in colour, each the
+  same picture to the byte with the same hotspot; with the monochrome rule taken out, the text
+  cursor and the monochrome pointer differed and the rest did not -- the duplication reports the
+  text cursor monochrome and the driver is handed it in masked colour, as the review read. Hidden
+  by an application the pointer turned relative on both, and shown again absolute at its place;
+  off the display nothing was said, and back on it the state was right. **The secure desktop
+  keeps the hardware cursor**: brought up by a person with Ctrl+Alt+Del, the reading thread
+  followed the input onto it and the driver's pointer was said there, not hidden; with the
+  following taken out, a desktop of the test's own taking the input left the pointer's change
+  unsaid. The host's own display opened on the direct frame as the system account and duplicated
+  as an ordinary user, said once why; opened again after its driver's device restarted, direct.
+  The cursor's read costs 4 to 5 us at the median, 13 at p99, about 920 a second with the
+  pointer swept, so a picture's acquire waits behind one at most that long -- one read in 48,000
+  took 1.7 ms -- and the read stays on the frame's worker; the acquire's own timing could not
+  show it, the compositor's clock sitting at a refresh's edge of the display's and splitting
+  its frames between two refreshes, swept or not. The publication model-checked, a reader
+  waiting for the state to name the shape; shown to fail with the state published before the
+  pixels. Found: **a pointer over 256 is hidden on the duplication too** -- it keeps its last
+  shape and reports the pointer not visible, the system drawing it (the review said otherwise,
+  corrected in [05 §8.2](05-host.md)); that the picture then carries it was not read back.
+- [x] **W3.5 lifecycle and no monitor**: a host killed mid-hold, the driver updated, the GPU's
+  driver restarted, the display asleep, the lock screen, the secure attention screen and an
+  elevation prompt, a logoff, a remote desktop connection, and a machine with no monitor.
+  Checked by each once while streaming.
+  *Reviewed 2026-10-16, before its build.* Nothing has held a picture since W3.3's review, so the
+  first check is the host killed mid-stream and started again. **The logoff and the remote
+  desktop connection move to W2.5**: each is a change of the console's session, which only the
+  service follows, and for the display either is the host's end and a new host's start, checked
+  here; the boot with no monitor stays the gate's. Read in the code: the host keeps its
+  controller's handle for its life and never closes it when the driver is asked to be removed,
+  which an update needs -- an open handle refuses the removal, and the update then waits for a
+  reboot ([11 §1.8](11-drivers.md)); a handle left by a driver whose process ended is kept for
+  good, so the host's display never comes back; and a stream that lost the host's display waits
+  for one without plugging it again. So **the controller follows its driver**, for every user:
+  it closes its handle when the driver is asked to be removed or has gone, the monitors bound to
+  it going with it, and every call after answers that the driver is absent, a new open being a
+  new handle; and **the host's own display follows its driver**, opened and plugged again
+  whenever it went, also while the stream waits for a display, so an update, a restart or the
+  driver's end costs the guests a rebuild rather than the session. Probed on the development
+  machine: the GPU's driver restarted three times under a monitor of the driver, the system put
+  the monitor back on the GPU by itself, on the GPU's new identity, 3.5 s after the old swapchain
+  was lost twice and 17.5 s once -- the first restart since boot, the GPU itself back that late
+  -- so the driver names no GPU again. **But for about 1.5 s mid-restart the system lists the
+  display under the integrated GPU**, and the panels under its software renderer, where a stream
+  rebuilding -- it sees its device lost within a second -- refuses the display as one without its
+  encoder and ends the guests: **a display found under a GPU without the encoder is waited for**
+  within the display wait, as one that went, and refused only past it. **A display asleep keeps
+  its output and loses its pictures**: the system took the driver's swapchain away about five
+  seconds before saying the display was off, and gave one back as it woke; the stream's request
+  kept a display on past its timeout but did not wake one, and one injected pointer move of no
+  distance woke it, which a setting off by default does as a stream starts (W2's decisions,
+  amended). Checked by: the host killed mid-stream and started again; the driver updated
+  mid-stream, through with no reboot owed and the guest kept; the driver's process ended once;
+  the GPU's driver restarted, the guest kept; a guest arriving at a display asleep with the
+  setting off and on, and the display held awake while streaming; the lock screen and its unlock
+  typed through the guest, the secure attention screen and an elevation prompt; the host's end,
+  the update and the GPU's restart again with the panels' cables out; the machine asleep with the
+  host idle and its display plugged, and streaming after it wakes; both bars. The update's close
+  broken leaves the device waiting for a reboot, so it is broken only at the user's word.
+  *Built 2026-10-16*, not ticked: the checks that need a person at the machine wait for one.
+  **The controller follows its driver**: a notification on its handle closes it as the driver is
+  asked to be removed, and a request answered that the driver's process ended closes it too --
+  that answer comes within 2 ms of the end, measured, with no notification before it. **The
+  host's own display follows**, plugged again on a new handle, also while the stream waits for a
+  display, which waits out an output under a GPU without the encoder. `wake_display` in the
+  library's host configuration and `lowlatd --wake-display`, off by default. **Found live: the
+  stream spun after its driver was updated** -- the wait for the direct frame had no bound before
+  its first picture and answered at once once the driver's process had ended, so a stream built
+  before the new driver's first picture was paced by the clock and ticked every few
+  microseconds; both waits now run to the refresh ([05 §2](05-host.md)). Checked on the
+  development machine, the host as the system account and the library's demo as the guest: the
+  host killed mid-stream, its display gone with it and plugged again by the next host 30 ms
+  after its start; the driver updated mid-stream twice, installed with no reboot owed and the
+  guest kept, about 0.9 s without pictures; the driver's process ended mid-stream, the display
+  plugged again 0.2 s after and the guest kept; the device restarted with a handle open and a
+  monitor bound to it, through in 87 ms where it was refused before; the GPU's driver restarted
+  mid-stream, the host's display read again on its GPU 3 s after the stream saw its device lost --
+  the demo, decoding on the same GPU, did not survive its own device's loss; the host's display
+  rendered on the integrated GPU on purpose and back, the stream waiting 6 s and going on, where
+  the build before ended the guest at once; **the display asleep**, its swapchain taken away
+  with the output still listed: with the setting off a guest arriving got nothing for 13 s until
+  one pointer move standing in for its first input, then pictures within a quarter second; with
+  it on, the stream woke the display as it started and the guest had pictures in its second
+  second, and watched 90 s with no input past the 60 s timeout with the display held on; each new
+  check broken once where it can be without a reboot; both bars. **Owed**: a guest on another
+  machine through the GPU's restart and on the lock screen, its unlock typed through it, and the
+  secure attention screen; the host's end, the update and the GPU's restart with the panels'
+  cables out; the machine asleep with the host idle. **No elevation prompt could be raised on the
+  development machine** as it was set: its administrators elevated with no prompt, so none
+  reached the secure desktop.
+  *Checked with a person 2026-10-16*, an established client on a laptop over the LAN driving the
+  host's own display at the laptop's 2880x1800. The GPU's driver restarted with the panel lit:
+  the rebuild landed in the integrated GPU's listing, waited it out and went on in about 3 s, the
+  session kept. **The lock screen and the secure attention screen with the panel lit showed black
+  to the guest** -- the system draws them on the primary display alone, and the host's display
+  was a secondary; the stream followed the input onto them and back regardless ([05 §2](05-host.md)).
+  With both cables out, the host's display the only one: the host killed and started again, its
+  display plugged again by the next host and the guest connecting again; the driver updated, the
+  session kept; the GPU's driver restarted, the session kept through about two seconds without
+  pictures; the lock screen and the secure attention screen shown to the guest and unlocked by the
+  password typed through it; and **the machine put to sleep** by a person, woken to the lock screen
+  on the host's display, the stream reading it again on the GPU's new identity and the guest
+  connecting again -- its session had ended while the machine slept. A reset of the display stack
+  from the keyboard put the display's saved mode back, which the host put right in a tenth of a
+  second. **An elevation prompt**, once the person turned prompting on: the stream followed the
+  input onto it; the host's display beside the lit panel showed the prompt's dimmed backdrop, its
+  dialog drawn on the primary alone; the guest switched its stream to the panel, answered the
+  prompt through it, and switched back.
+- [x] **W3.6 the controller on its own**: the controller's commands as the program `lowlat-vdd`
+  beside `lowlatd display`, one implementation of them; the library's third half built alone and
+  checked the way an application links it; the driver's files and the names a person sees as the
+  decisions above say; the package dated in UTC, as its version is. Checked by every command
+  through both programs on the installed driver, the library's check made to fail both ways, and
+  the renamed package installed over the driver it replaces.
+  *Reviewed 2026-10-17, before its build* (the last three decisions above, added at it). The
+  command line depended on the controller alone, so it moves into the controller's crate whole. A
+  library with the third half alone already built -- about 330 KB against about 5 MB for the
+  whole library, the shared calls and the third half's and nothing else -- though nothing built
+  or checked it. A program named `lowlat-vdd` beside the driver's library of the same name writes
+  one debug symbols file for both, the build warning of it, measured on a copy of the layout. And
+  the package's date was the local one, a day ahead of the version's UTC for hours after local
+  midnight east of Greenwich, which the verifier refuses as a date to come.
+  *Built and checked 2026-10-17:* `lowlat-vdd` and `lowlatd display` call one module of the
+  controller's crate, `lowlatd display` keeping its answer off Windows; the driver's library, its
+  setup information and catalogue renamed, the names capitalized, the EDID's name
+  "LowlatDisplay"; the package stamped with the UTC date. A gate among the library's builds a
+  library of the third half alone in a target directory of its own -- in the profile's it would
+  land on the object the other gates test -- requires every `lowlat_vdd_*` call the header
+  declares among its exports and nothing of the other halves, then links a C program against its
+  import library with the other halves hidden and runs it. Checked on the development machine:
+  every command through both programs on the installed driver, the same lines from both, an
+  unlisted mode by a replug included; the gate red with the client half forced in and with no
+  half at all, the parser's test and the EDID name's each broken once; the driver and the program
+  built together with no collision, their four files side by side; the package signed,
+  catalogued and valid, dated in UTC. Found and fixed: `modes remove` said "removeed", and that
+  displays plugged after would list the mode it removed. **Installed over the driver it
+  replaces**, with a kept monitor marked to come back plugged under the old one: the update
+  returned in 1.2 s, the driver's process carrying `lowlat_idd.dll` 11 ms after, no reboot owed;
+  the kept monitor plugged again by the new driver at its slot and mode; the system reading the
+  adapter as "Lowlat Virtual Display" from the provider "Lowlat" and the monitor's EDID name as
+  "LowlatDisplay", all thirteen characters. The old `lowlat_vdd.dll` stays in the system's
+  folder for user-mode drivers, which nothing loads; the store keeps every older package, as
+  every update has. Both bars: on Windows tests 1362 passed, none failed; on Linux 1372 passed
+  with the two that need a `localhost` answering on both families, and off Windows `lowlat-vdd`
+  refuses while `lowlatd display` answers as it did.
+- [x] **W3.7 the review's fixes**: a reading of the driver's process's access list; the save's
+  test of a virtual display by its adapter; a monitor's description handed over from its own
+  bytes; the pictures skipped counted across the frame number's wrap; and the controller's
+  answers as the last decision above says (minor 30). Checked by each fix's own test broken once,
+  the access list and the adapters read on the development machine, and the driver with the
+  fixes installed over the one it replaces.
+  *Reviewed 2026-10-17, before its build* (the last decision above, added at it). The access
+  list was read before anything was built, since it could have changed the frame channel's
+  design: the driver's process admits its own identity alone, administrators may only query it,
+  and the account it runs as is not in the list, so another service of that account is refused
+  it -- the frame channel's guard is the debugging privilege, as [11 §1.2](11-drivers.md) said.
+  *Built and checked 2026-10-17:* the adapter's kernel type made readable by its identity and
+  the save's test a function of each active path, tested with another vendor's virtual display
+  reporting DisplayPort and broken by leaving the kernel's word out; read live, a panel on HDMI
+  real and this driver's DisplayPort display virtual by its adapter. The description's address
+  taken from its bytes, and the system read the monitor's name through it after the driver was
+  installed again. The wrap's arithmetic a function of the shared crate's, tested across the top
+  and broken by one comparison. The controller's not-ready status names its slot; the library
+  fills `out` with the monitor as it stands, checked by a status made up for a monitor really
+  plugged and broken by not filling; an unplug held by a busy file left the monitor and its line
+  both in place and, with the old order, unplugged the monitor and left its line -- the bug
+  itself, reproduced; the refused plug's unplugging is built but could not be forced, the system
+  here showing a plugged monitor before the plug returns. The header regenerated at minor 30 and
+  every ABI gate green. The driver installed over the one it replaces in about a second, no
+  reboot owed. Both bars: on Windows tests 1364 passed, none failed; on Linux 1373 passed with
+  the two that need a `localhost` answering on both families.
+- [x] **W3.8 every monitor of the driver read straight from it, and the desk's settings left to
+  it**: a monitor of the host's display driver that the host captures -- one plugged through
+  `lowlatd display`, `lowlat-vdd` or another program's handle -- read through its frame page as
+  the host's own display is, its slot found in the driver's list by the output's name; duplicated
+  where the driver does not answer or its frames cannot be taken, and while the output is turned,
+  a turn seen under a direct read being a rebuild; the controller saying whether a monitor is
+  turned; the host's own display holding only what was asked of it. Checked by a monitor of the
+  driver read straight from it as the system account and duplicated as a user, a turned one
+  duplicated and a turn under a direct read rebuilt, and the host's own display keeping a refresh
+  and a turn set at the desk and a refresh saved there coming back with it; each check broken
+  once.
+  *Added and decided 2026-10-20, after a review of the driver* (the decisions above marked W3.8).
+  The review found the host read only its own display from the driver -- a monitor plugged from
+  the command line, a machine's only display among them, was duplicated though the driver
+  answers any slot's page to the host -- and that the driver is told nothing of a turn: the
+  class's commit carries the target's signal alone, so a turned monitor's pictures cannot say so,
+  and the direct read checked their size only. And the host's own display put back what a person
+  set in its display settings: 60 over a refresh, at once, the change being itself a rebuild.
+  *Built and checked 2026-10-20.* On the development machine, from the build and from one with
+  each fix undone, every check failing on the latter: a monitor plugged by a test and never the
+  host's own, opened by its name, read straight from the driver as the system account and
+  duplicated as a user; turned a quarter as the display settings turn one, it opened duplicated
+  with the quarter turn declared, and turned under a read from the driver, the next look at the
+  output asked for the rebuild. The host's own display, held with no refresh asked, kept 120 set
+  at the desk and took 60 when asked; turned at the desk it was left turned, its mode read as the
+  monitor's own; and a refresh saved at the desk came back with the display plugged again for its
+  size alone. **Measured on the way:** the system's configuration keeps a turned display's source
+  at the monitor's own sides, the turn on its path -- 1920x1080 a quarter turned read 1920x1080
+  there and 1080x1920 as the desktop's pixels -- so the controller's mode was never the turned
+  one, and a turn of the same size was never put back; a swap first written on the opposite
+  premise was caught by the desk's check. The name's match, the upright test and the refresh
+  rule are tests of their own, each broken once. Both bars: on Windows tests 1391 passed, none
+  failed; on Linux 1385 passed with the two that need a `localhost` answering on both families.
+- [x] **W3.9 the turn of the host's own display**: a guest's turn put once and never held, through
+  `lowlatd`'s relay and the library's call (minor 31); the controller turning a monitor through
+  the system's configuration and putting a mode on a turned one at the desktop's sides; a turned
+  output duplicated at the panel's sides with no rebuild at its open; W3.8's comparisons opening
+  a real duplication. Checked by what a turned monitor's driver hands over against the
+  duplication, the host's own display turned and put at another mode while turned, a turned
+  monitor opened with no rebuild asked, and a guest's turn from an established client, live;
+  each check broken once.
+  *Added and decided 2026-10-20* (the decisions above marked W3.9). **Probed first**: a turned
+  monitor's driver picture was the duplication's to the sample (0 of 2,073,600 luma samples
+  differing; 2,047,272 against it turned a half), both at the panel's sides, but the pointer's
+  shape the driver hands over is turned for the panel, every hotspot moved -- so turned monitors
+  stay on the duplication. The probe's log showed **a turned output looping through rebuilds**
+  when duplicated: the duplication describes its mode at the desktop's sides, and every open of a
+  turned output compared it with the picture's and asked for another -- since W2.2 for a panel,
+  and since W3.8 for every turned monitor of the driver. And W3.8 had left its own comparisons --
+  the latency A/B and the pointer test -- opening the duplication through the plain open, which
+  reads the driver as the system account: they compared the driver against itself.
+  *Built and checked 2026-10-20*, each check failing with its fix undone: the turned monitor
+  opened with no rebuild asked, the quarter declared ("a rebuild asked" true with the old
+  comparison); the comparisons' duplication side a duplication (both failing on it with the old
+  open); the host's own display turned a quarter, put at 2560x1440 while turned and still turned,
+  then turned upright (the mode put without the swap replugged it and lost the turn); the
+  desktop's sides and the library's turns tests of their own. Both bars: on Windows tests 1393
+  passed, none failed; on Linux 1386 passed with the two that need a `localhost` answering on
+  both families; the ABI gates at minor 31.
+  *Checked live 2026-10-20*, the service on this build with the host's own display captured:
+  an established client joined at 3420x2148 and asked 2560x1080 then 2560x1440, each put; its
+  rotate turned the display a quarter 53 ms after the ask, and the stream rebuilt onto the
+  duplication with the quarter declared -- the duplication made again three times as the turn
+  settled, then steady, no rebuild after; turned back, the display was upright 64 ms after the
+  ask and read straight from its driver again. The maintainer saw the turned picture working at
+  the client, and turned it back.
+- [x] **W3.10 a guest's mode on any display, put by `lowlatd`, an owner's alone**: the library's
+  live setter asking for its output and its own display only where they changed; the turn call
+  withdrawn and the minor back at 30; the controller putting a size and a turn on any display by
+  the system's name for it; `lowlatd` putting an owner's size and turn on whatever display is
+  captured, by whose display it is, and refusing a guest's size, turn and stream rate. Checked by
+  the setter's rebuilds counted, an owner's request passed on and a guest's refused, the road each
+  display takes, the refresh a size keeps, a panel resized and turned by its name and a size it
+  does not list refused, the host's own display turned from outside and put at another size still
+  turned, and an owner's request live from an established client; each check broken once.
+  *Added and decided 2026-10-20, after a review of W3's gate* (the decisions above marked W3.10).
+  The review asked whether the library should take a size and a turn for any captured display as
+  fields of its video configuration; it keeps them out, as on Linux. Read on the way: **the live
+  setter rebuilt the stream on every call** -- it asked for its output and its own display each
+  time, and either is a rebuild -- so changing only the bitrate through the library cost a
+  keyframe; `lowlatd` sets each field on its own and never went that way. Read in an established
+  client: it draws its orientation, resolution and bitrate controls for an owner alone, and in
+  game mode only the bitrate.
+  *Built 2026-10-20.* The setter's fix first, on its own: a configuration set again with only its
+  bitrate changed asked for both rebuilds on the old setter and for none with the fix, the output
+  read back -- the captured one -- for none, another output and size for one each, and the last
+  word won over a request still on its way; each part of the rule undone failed at its own check.
+  Then the rest: the call and its turn removed and the header at minor 30 again, to the byte;
+  `put_size` and `put_turn` in the controller; `lowlatd`'s Windows relay; the owner rule in its
+  reader of a guest's configuration, the Linux tray counting as the desk. Each new check broken
+  once: the owner's gate on the display and on the stream, the road a kept monitor takes, the
+  refresh a size keeps. Both bars: on Windows tests 1397 passed, none failed; on Linux 1387
+  passed with the two that need a `localhost` answering on both families. *Checked on the
+  development machine*, as a user, nothing saved: a panel at 1920x1080 and 120 put at 1280x720 by
+  its name, keeping its 120, then turned a quarter -- read back at the monitor's own sides, turned
+  -- a size it does not list refused, and the panel put back as it was; a monitor of the driver
+  plugged as the host's own display, turned a quarter by its name as `lowlatd` turns it, put at
+  2560x1440 while turned and still turned, then turned upright the same way.
+  *Checked live 2026-10-20*, the service on this build and the library's demo client a guest of
+  it as an owner, driven with a size and a turn of its own (`LOWLAT_MODES`) where an established
+  client's settings would send them. **The first run found the name wrong**: the host lists an
+  output as `DISPLAYn` and the system's interfaces take `\\.\DISPLAYn`, so every size and turn
+  was refused -- a size as one the display does not list, a turn as no display -- where the
+  hardware check, handed the full name, had passed; and a kept monitor named so would have gone the
+  road of any display. The controller now takes either form and the road compares names without
+  the prefix, each check failing first and passing after, and the panel's check passed again
+  handed the bare name. **Then live**: the guest asked for the panel and the stream moved onto it;
+  1280x720 was put 225 ms after the ask, a quarter turn 179 ms after, upright 21 ms after, and
+  1920x1080 225 ms after -- the stream following each, the turn declared and steady after the
+  duplication settled -- and 3420x2148, which the panel does not list, was refused with its reason.
+  The Windows bar again: tests 1398 passed, none failed. **Owed**: the gate.
+- [x] **W3.11 a program's own mode on the host's display**: the host's own display put at its mode
+  as it is asked and held against the system's restore alone, so a program in exclusive fullscreen
+  keeps the mode it set and the stream follows it; the controller reading the mode the system's
+  store holds for a monitor. Checked by a program taking the held display fullscreen at a size of
+  its own, and taking its size back whenever the display is not at it, left alone while it holds
+  the display, and the host's size put back over the system's restore once it leaves; each check
+  broken once; and live, a guest following such a program's size and back.
+  *Added and decided 2026-10-21, after a probe at the gate's second review* (the decision above
+  marked W3.11). The review read in the code that a game in exclusive fullscreen at a size of its
+  own would be fought: the rebuild its new size causes holds the host's size again. **Probed** on a
+  monitor of the driver held as the host holds its display, a program taking it fullscreen at
+  1280x720, in the flip model and the older one alike: the display took the program's size, and
+  the hold put the host's back in 70 to 90 ms; a program that leaves it at that was left
+  fullscreen in name at the host's size, its pictures scaled, and one that takes its size back
+  flapped the display twice a second -- 24 holds in 11 s, 463 pictures drawn against 1,201 with
+  nothing held. The system tells the program nothing of it -- its presents succeed and its
+  fullscreen state stays -- and nothing marks the program's hold on the display: fullscreen on a
+  virtual display is composed, and the kernel reads no exclusive owner of the output. The system's
+  notification state says a fullscreen program runs about 150 ms after the mode changes, for the
+  whole session rather than one display. What tells them apart is the mode the system's store
+  holds for the display among the monitors connected: the mode it puts back as a program leaves,
+  where the program's own is another.
+  *Built 2026-10-21.* The controller reads the store's mode for a monitor; the hold remembers the
+  ask it last put, and puts its mode again only for a new ask, a display not shown, or the store's
+  mode found on the display, saying once that it left another's. The check failed on the hold as it
+  was -- the host's size put over the program's 18 times -- and passed with the rule: nothing put
+  while the program held the display at its size for eight seconds, and the host's size put back
+  over the system's restore as the program left. The rule a test of its own, each of its six parts
+  broken once and failing at its own assertion; W3.8's and W3.9's hardware checks passing as they
+  did. The Windows bar: fmt and clippy clean, tests 1399 passed, none failed. The Linux bar is
+  unchanged by it: the controller and the host's own display build for Windows alone.
+  *Checked live 2026-10-21*, the service on this build capturing the host's own display and the
+  library's demo a guest of it as an owner: the size it asked, 2560x1440, put; then a program
+  taking the display fullscreen at 1280x720 for fifteen seconds left at it, the host saying once
+  that it left another's mode, and the stream reading 1280x720 straight from the driver 0.25 s
+  after the change, the demo receiving the program's sixty pictures a second; the program drew
+  undisturbed, entering fullscreen once. As it left, the system put back the store's 1920x1080
+  and the host its 2560x1440, the stream there 0.5 s after the program's exit. The configuration
+  was put back after, the service left on this build. **Owed**: the gate.
+- [x] **W3.12 a display read from its driver paced on the period it is handed pictures at**: the
+  loop's deadlines, for a display read from its driver, on the slower of the compositor's clock and
+  the display's mode; the duplication's left on the clock. Checked by the period a test of its own,
+  and the frame clock against a driver's pictures -- the first composition after each of its own
+  refreshes, the two clocks drifting -- taking each as it lands on that period, each broken once;
+  and live, the host's own display at 60 under the 120 Hz primary with a program drawing at 120,
+  composition to hand-over before and after.
+  *Added and decided 2026-10-21, after W3.11's live check* (the decision above marked W3.12). Seen
+  there: the host's own display at 1280x720 and 60 under the 120 Hz primary, a program drawing 120
+  pictures a second on it, each picture went to the conversion 9.3 ms after the driver acquired it
+  at the median, 9.85 at p95, where W3.8's live check had read 1.2. **Read**: the take does not
+  wait -- the device waits for the driver's fence, not the processor -- so the newest picture was
+  that old when the loop took it. **Measured**: the driver was handed 60.008 pictures a second at
+  that mode, from the monitor's own count, where the duplication sees every composition, 120 a
+  second -- the measurements the deadlines' period was chosen from at W3.2. **Modelled**: the
+  frame clock's own rule, fed the first composition of a 120.001 Hz clock after each refresh of a
+  60.008 Hz display, locks once the two drift a composition apart: one picture lands a
+  composition early, the clock keeps its grid as it does for a picture left from a skipped
+  refresh, and every deadline after lands half a millisecond past a composition that carried no
+  picture, the one before it taken, 8.8 ms old, at every tick. On the driver's own period every
+  picture is taken as it lands, in every phase and at every rate tried.
+  *Built 2026-10-21.* The period the deadlines sit on is a function of the compositor's clock, the
+  mode and whether the display is read from its driver; the period test failed on the rule as it
+  was (the driver's display at 60 under 120 put on the clock) and passes with it. The frame clock's
+  test feeds it a driver's pictures at 60, 60.008, 60.1 and 59.94 a second in five phases against
+  a 120.001 Hz clock: on the driver's period no two pictures in a row taken past the margin and at
+  most one in a hundred at all -- the one a drift brings early -- and on the clock's, broken once,
+  1,438 in a row. Both bars: on Windows fmt and clippy clean, tests 1400 passed and one failed --
+  the reclamation test's port taken by another program while the Linux bar ran beside it, as it
+  has been before -- passing alone four times in four and in the host crate's run again, 205
+  passed; on Linux 1388 passed with the two that need a `localhost` answering on both families.
+  *Checked live 2026-10-21*, the service on this build capturing the host's own display at 60
+  under the 120 Hz primary, the library's demo a guest of it as an owner, and a program drawing
+  120 a second on the display at 1280x720 twice for twenty seconds, each entry a rebuild and a
+  phase of its own: composition to hand-over 0.192/0.430/0.932 and 0.189/0.559/1.023 ms at
+  p50/p95/p99, 600 pictures each, where W3.11's live check had read 9.313/9.851/10.049 with the
+  same program; the pictures handed to the encoder 16.67 ms apart at the median, where they had
+  been 16.94; none converted again. The configuration was put back after, the service left on
+  this build. **Owed**: the gate.
+**Gate:** after W2.5, on the development machine, with established clients on macOS and Android
+on the LAN and one on a Windows machine:
+
+- with no monitor: the machine booted with its monitors unplugged, the service's host plugging
+  its display, the logon screen streamed, a sign-in, the desktop at the owner's size;
+- ten minutes each of H.264 and HEVC at 120 a second, ten-bit and full chroma where the encoder
+  takes them;
+- once each mid-session: a size change from a client's settings, its blink recorded; the lock
+  screen, the secure attention screen and an elevation prompt; a logoff and the reconnect; the
+  GPU's driver restarted; the driver updated; the host killed and started again -- no watchdog,
+  no stop error, no blank beyond a swapchain's replacement; *amended 2026-10-20, at W3.10:* the
+  lock screen, the secure attention screen and the elevation prompt with the host's display the
+  only one or the primary, since the system draws them on the primary alone and a secondary
+  shows black (W3.5); a size and a turn from an owner's settings, on a panel and on the host's own
+  display, and turned back; each refused from a guest who is not an owner;
+  *amended 2026-10-21, at W3.11:* the blank is bounded per event -- the size change, the secure
+  screens, the prompt, the driver's update and the GPU's restart each keep the session, the time
+  without pictures recorded (W3.5 saw about 0.9 s at an update and 2 to 3 s at the GPU's restart),
+  and the logoff and the host's end each end it, the guest connecting again, told nothing at a
+  logoff (W2.5's D10); a size an owner put on a panel left so when the last guest leaves, and an
+  owner joining on a panel leaving its size; a guest who is not an owner shown no orientation,
+  resolution or bitrate by its established client -- the owner byte the host sends -- and
+  switching the captured output, the refusals asked through the library's demo signed in as that
+  guest, since an established client sends none of them for it: a size, a turn, a bitrate and a
+  frame rate, each refused with its line; a game in exclusive fullscreen at a size of its own on
+  the host's display, kept at it with the stream following, and the host's size back as it leaves
+  (W3.11); W3.4's pointer larger than 256 seen drawn into the picture, on the host's display and on
+  a panel, which W3.4 did not read back;
+- the controller: an unelevated program plugs, re-modes and unplugs a monitor of its own beside
+  the host's, and is refused the host's and the frame interface; a kept monitor made through
+  `lowlatd display` comes back after a reboot where it was; *amended 2026-10-20, at W3.8:* and,
+  asked for by a guest, streams straight from the driver; *amended 2026-10-20, at W3.10:* the
+  frame interface answers it, as it answers every caller since W3.3's review, and it can take
+  nothing from the answer; the reboot after W3.6's names, every slot a new monitor then;
+  *amended 2026-10-21, at W3.11:* the first reboot after W3.6's names is past -- W2.5's, on
+  2026-10-18 -- so the leg is any reboot; an owner's size the kept monitor does not list put on it
+  by a replug, and a turn, both there again after the reboot, a kept monitor's modes being saved;
+  an owner's size and turn refused on a monitor another program plugged;
+- two other vendors' virtual displays streamed through desktop duplication, an established
+  host's own among them; *amended 2026-10-21, at W3.11:* on one of them an owner's listed size put
+  and one it does not list refused, as on a panel; *amended 2026-10-24, the maintainer's
+  decision:* one, an established host's own, the second vendor dropped -- another vendor's virtual
+  display is a panel to the host: captured through the duplication, its size left as it is when a
+  guest arrives, and changed only by an owner's request from a client's settings, a listed size
+  put and one it does not list refused;
+- **the comparison decides the host's default**: in one session at 60, 120 and 240 Hz,
+  composition to encoder input at p50, p95 and p99 for desktop duplication of the host's display
+  and for the direct frame, with the hold's distribution and how often its bound fires; the
+  direct frame becomes the host's path only at or below the duplication at every rate and
+  percentile, else the duplication stays the path and the numbers are recorded;
+  *amended 2026-10-16, at W3.3's review:* with no hold, how often a picture is converted again for
+  coming too late in its place; for both sources, the blackout at the lock screen and at an
+  elevation prompt, from the switch to the first picture of the new desktop; the 240 Hz leg with
+  the host's display as the primary, unsaved and held, since the compositor's clock is the
+  primary's; and the GPU scheduling mode recorded, every measurement so far having had it in the
+  driver;
+  *run offline 2026-10-17, before the gate:* both sources timed from one reference -- the
+  compositor's vblank, from a presenting load's own statistics -- since each source's own time
+  for a picture differs from the other's by about the gap measured; vblank to encoder input,
+  interleaved blocks. With hardware scheduling on, the host at its high class and the driver's
+  frame thread raised, the direct frame was at or below the duplication at every percentile at
+  1440p 120 idle and under one busy loop per logical processor (p50 0.06-0.10 ms ahead), and at
+  1080p 60 but for p99 (+0.01 ms, inside the run's noise). Under a load's GPU pass of half a frame
+  and more it was 1.0-1.5 ms ahead at p50 (3.5 ms with scheduling off), and at 240 Hz -- the
+  host's display the primary, the panel lit, the compositor's clock then 240 -- 0.8 ms ahead
+  loaded. No picture converted again. At light load the GPU lowers its clocks every few seconds,
+  each time slowing either source by ~1.5 ms for ~0.2 s; blocks short enough to share that alike,
+  or clocks held, are needed for a fair tail;
+  *amended 2026-10-20, at W3.10:* the default this was to decide was taken at W3.4 and widened at
+  W3.8, so the comparison confirms it, a percentile counting as at or below the duplication within
+  the spread between the run's own blocks of one source;
+  *amended 2026-10-21, at W3.11:* in one run of the comparison's test as the system account, since
+  nothing selects the source of a monitor of the driver (W3.4, W3.8), timed from the compositor's
+  vblank as the offline run was, with the GPU's clocks held or the blocks short; and the blackout
+  timed by a test of its own -- both sources open on one display as the system account, the input
+  desktop watched, the switch made by a person -- since nothing in the stream marks a new
+  desktop's first picture: the duplication's loss and its making again are logged, and the direct
+  frame loses nothing at a switch;
+- the test-signed package installing silently with no test mode, by its script (*amended
+  2026-10-22*: the service installs no driver); CI building the driver; both CI jobs and the Linux
+  bar; *amended 2026-10-24, at the gate:* a display gone past the wait for one under a seated guest
+  -- the driver removed and installed again more than 20 s apart -- ends the guests with the
+  capture's reason and drops none of their preferences, the next guest given the codec it asks
+  for (found at this leg and fixed, [05 §2](05-host.md)).
+
+*Passed 2026-10-24* on the development machine, every leg as amended, the figures in the
+[changelog](changelog.md)'s entry of the day; two faults found at it were fixed the same day,
+a display gone past the wait for one and a refused mode of the host's display.
+
+- [x] **W3.13 the virtual displays' GPU named by its maker, or as the power-saving one**: `gpu`
+  takes `nvidia`, `amd` or `intel` beside `auto` and `VVVV:DDDD` -- kept in the file as the
+  maker's number alone, and matched when the driver starts to the first GPU of that maker in the
+  system's high-performance order, so a card replaced by another of its maker's keeps the choice
+  where a `VVVV:DDDD` falls back to `auto` -- and `igpu`, kept as the word, the first GPU that
+  renders in the system's minimum-power order. A name with no GPU of it present falls back to
+  `auto` with a warning, as a number does; a driver that predates the names reads `auto` from the
+  line it cannot parse. Both programs that drive the controller take the names, and
+  [11 §1.4](11-drivers.md) and its commands are amended. Checked by the file's round trips, each
+  form's choice against the enumeration on a machine with GPUs of three makers, and a monitor
+  moved by each.
+  *Added 2026-10-25, after W3 closed (the maintainer's ask); built after W2.8.* **No `dgpu`**:
+  the high-performance order puts a discrete GPU first, so it would be `auto` under a second
+  name. **`igpu` checked first**: on the development machine -- an RTX 5060, an Arc A380 and the
+  processor's Radeon -- the minimum-power order's first GPU that renders is the Radeon, which the
+  kernel marks the hybrid system's integrated GPU (the Arc its discrete one); the
+  high-performance order is the RTX, the Arc, then the Radeon. On a machine without an
+  integrated GPU the minimum-power order still has a first, so `igpu` there is the GPU the system
+  ranks lowest in power, logged as chosen.
+  *Built 2026-10-25, its live check still to run*: the file's choice is an exact GPU, a maker or
+  the power-saving GPU, read and written in the file's own words; the driver walks the order the
+  choice says; the commands read a maker's name and give everything else to the file's own
+  reader, so the two cannot disagree. **The library is left as it is** (the maintainer's
+  decision): its settings say an exact GPU or none, a maker's choice and the power-saving one
+  read as none, and settings written back as read keep the choice the file holds, where writing
+  them would otherwise have turned it into the high-performance GPU. Checked: the file's round
+  trips for every form; which GPUs each choice takes; the commands' names and the lines they
+  refuse; the library's write-back; and on the development machine the minimum-power order --
+  the processor's Radeon first, the RTX and the Arc after -- each check broken once.
+  *Checked 2026-10-25* ([changelog](changelog.md)): the driver installed, a monitor held on it
+  moved by each name -- `nvidia` to the RTX, `intel` to the Arc, `amd` and `igpu` to the Radeon.
+  **Found with it**: `auto` put the monitor on the Arc, while every process of the signed-in user
+  ranks the RTX first in the high-performance order -- since the RTX's driver was restarted, where
+  before it gave the RTX; where it comes from is not yet known. And **the host's own display did
+  not come back after the driver's update** while the host captured another output, so a guest
+  could no longer ask for it until the host restarted ([06](06-api.md) `output`).
+  *Closed 2026-10-25.*
+
+## Phase W4 - The host's input device
+
+**Planned 2026-10-22, interview of the same day.** A HID driver of the host's own, so that a
+guest's keyboard, mouse and Sony pads reach Windows as devices rather than as a program's input:
+a user-mode filter above the system's virtual HID framework, presenting a keyboard, a mouse, a
+DualShock 4 and a DualSense to the system's own drivers ([00 §D17](00-overview.md)). The batch
+input call stays the default for the keyboard and the mouse, and the fallback wherever the driver
+cannot carry them; the Xbox 360 pad stays on the ViGEm bus. It is built once W2's and W3's gates
+are through. The decisions are recorded once, here; the design they add up to is
+[11 §2](11-drivers.md).
+
+### Decisions taken at the interview
+
+- **Four kinds, and no Xbox pad.** The driver presents a keyboard, a mouse, a DualShock 4 and a
+  DualSense, and nothing else. A HID pad never reaches the system's Xbox pad interface, which a
+  game that knows no other reads, so the Xbox 360 pad stays the bus's (W2.3) for every such game,
+  and the driver presents none.
+- **Why a device: the system takes its input as hardware's.** A low-level hook sees no injected
+  flag on it and raw input names the device it came from, so a game whose anti-cheat ignores the
+  batch input call's input takes it -- the maintainer's own runs of virtual HID devices on the
+  same framework, behind such games, showed it, so the gate checks the mechanism and names no
+  game. A device's input also reaches the input desktop by itself, the lock screen and elevation
+  prompts included, with no thread attached to it; a mouse gives a machine with none of its own a
+  pointer the system shows while a guest is seated; and the system's own keyboard driver gives
+  Pause, Break, PrintScreen and SysRq their forms, each keyboard keeping its own modifiers.
+- **Rust, in this workspace, as the display driver is** (W3): a Windows-only library the
+  system's user-mode driver host loads, `lowlat_hid.dll` from `lowlat-hid.inf`, on a
+  root-enumerated device of the system class, `Root\lowlat-hid`, named "Lowlat Virtual Input"
+  from "Lowlat". The framework beneath it is the system's, its kernel half included, so nothing of
+  this project's is in the kernel. The user-mode framework's and the HID framework's declarations
+  are generated from the pinned kit's and the SDK's headers by a script of their own and
+  committed, so the display driver's declarations and package stay as they are. What the host and
+  the driver share -- the kinds, the requests, the feature table -- is `lowlat-hid-proto`, with no
+  platform code, tested on every platform and fuzzed on what the driver parses. A callback never
+  unwinds into the system's code.
+- **A fixed set of kinds, each device bound to its handle.** A caller names a kind; the four
+  descriptors and identities are compiled into both sides and never sent, so nothing describes a
+  device to the driver, at the cost of a re-signed driver for a descriptor's change. One device to
+  a handle, opened for overlapped requests: a handle that is not serializes them, and an
+  outstanding read then holds every report behind it. **The handle's end removes the device, a
+  killed host's included, and the driver first submits the device's neutral report** -- no key,
+  no button, the sticks centred -- so a host that dies leaves nothing held. *Amended 2026-10-22, at
+  W4's review:* **the neutral report is each kind's own**, defined beside its descriptor and
+  checked against it: a pad's d-pad is a hat whose released value lies outside its range, so a
+  report of zeroes holds it up and pulls both sticks into a corner; the mouse's moves nothing.
+  *Amended 2026-10-23, at W4.0's measurements:* **the device goes 50 ms after its neutral
+  reports** ([11 §2](11-drivers.md)). The host closes its handles when the system asks for the
+  device, as the display's controller does, so the driver's update or removal never waits for a
+  reboot on the host. Nothing keeps a device
+  alive by traffic. A device's instance is stable per kind and slot, so the system sets a slot's
+  device up once rather than at every connection. *Amended 2026-10-23:* **the framework names each
+  device's instance, the driver none**, as two devices of one name stop the machine rather than
+  being refused ([11 §2](11-drivers.md)); a kind and slot stays one device at a time, in a
+  container of its own. The pads carry the real products' identities,
+  as on Linux; the keyboard and the mouse carry an identity of the project's own, never a real
+  vendor's.
+- **The control interface admits the system account and administrators alone.** A device's
+  input reaches the secure desktop and its elevation prompts, and lands on the console session's
+  input desktop whoever made the device, so a user who could open the driver could type into a
+  consent prompt or into another person's session. The display driver's interface admits
+  interactive users because plugging a display asks no more than a person at the desk may do;
+  this asks more. An administrator matches only elevated. **No C interface of its own**: the host
+  is the driver's one user, an application embedding the host half runs as the system account
+  (W2), and one holding its own pads keeps the pad sink ([05 §7.2](05-host.md)).
+- **Input has a live configuration of its own**, `lowlat_host_input_config`: nested in the whole
+  as `input` and set and read back through its own pair of calls, as the sound's is, every field
+  live, and declared on Windows alone. Not a field of the video configuration: the input devices
+  are not the stream's, and switching them should neither carry nor re-send the stream's fields.
+- **The application switches the keyboard and the mouse onto the driver, while guests are
+  seated.** `virtual_input`, in the input configuration, **off by default**: off, a guest's keys
+  and pointer go through the batch input call as in W2; on, through that guest's HID keyboard and
+  mouse. Zero is off, so a caller that never sets it keeps W2's input. Switching it on with no
+  driver installed refuses the call and changes nothing; a driver lost while it is on gives the
+  guests the batch input call again, said once. The devices exist only while it is on: made for
+  each seated guest on its next pass, that guest's input held until they deliver, and removed when
+  it goes off. **A switch either way first releases everything held on the old path**, as a
+  permission taken away does, so a key held across it comes up rather than staying down.
+  `lowlatd` takes it at start, by a flag; with no driver installed it says so once and keeps the
+  batch input call, its start not failed (*amended 2026-10-22*). *Built 2026-10-26 (W4.1):* in
+  minor 32. A driver that cannot be used is refused with a status of its own -- not installed,
+  another version, refusing this process, or answering an error of its own (-700 to -703) -- so an
+  application can say which; a start asking for it is not refused for it, as sound's is not for
+  its server, says why once, and reads back off. `lowlatd`'s flag is `--virtual-input`.
+- **The keyboard** is a bitmap of the keyboard page with its modifiers, so no number of keys held
+  at once is too many, and a consumer collection for mute, volume and the media keys, where the
+  codes peers send for them on the keyboard page and above it land. **No system control
+  collection, and the keyboard page's power key never set**, so the power, sleep and wake keys
+  stay out of a guest's reach; no lock lights. The host's own lock state is read and a lock tapped
+  where it differs, as in W2.
+- **The mouse** is a relative collection -- sixteen-bit deltas, a larger one split, five
+  buttons, the wheel and the horizontal wheel in the peer's own units through a resolution
+  multiplier -- and an absolute one. ~~Buttons and wheels ride the report of the pointer that
+  moved last~~ *Amended 2026-10-22, at W4's review (the maintainer's decision):* **every button
+  and wheel rides the relative collection, and the absolute one carries positions alone** -- its
+  buttons declared and never pressed. Each collection is a pointer of its own to the system, with
+  its own buttons: a release sent on the other leaves the button held there, and a report of the
+  absolute collection carries a position, so a button sent on it after relative motion moves the
+  pointer back to where the absolute one last was. With every button on one collection neither
+  happens, and a drag held while the client turns its pointer relative goes on. It rests on the
+  system keeping a move on one collection before the click that follows it on the other, measured
+  at W4.0; where it does not, a button rides the absolute report at the pointer's place read back.
+  Where the absolute range lands with more than one display is measured before the pointer is
+  built (W4.0), and an output it cannot reach is decided then. *Decided 2026-10-23, at W4.0's
+  measurements:* the range spans the primary display alone, so **an absolute position on any
+  other output goes through the batch input call**, its relative motion, buttons and wheels
+  through the HID mouse (the maintainer's decision); and a move on one collection stayed ahead of
+  the click on the other in 300 of 300 pairs, idle and under load.
+- **The attention chord is never typed on the HID keyboard.** A hardware keyboard's
+  Ctrl+Alt+Del raises the secure screen, which the same keys through the batch input call never
+  do ([05 §7.3](05-host.md)), so on this keyboard a guest's ordinary key messages would raise it,
+  past the policy the service honours for its own call (W2.5). So a Delete -- the main key or the
+  keypad's -- going down while Ctrl and Alt are held, on this guest's keyboard or by the system's
+  own key state, goes through the batch input call instead, its form chosen as it goes down and
+  kept until it comes up: applications see the keys as before, and the screen comes from the
+  service's call alone. A Delete already held when Ctrl and Alt arrive is released on the HID
+  keyboard first, unless the build shows that order harmless without raising the screen. Checked
+  by unit tests, each broken once, and never by raising the screen. *Built 2026-10-26 (W4.1):*
+  that order released first, as no build could show it harmless without raising the screen: on
+  this guest's keyboard as Ctrl and Alt come together over a held Delete, the report that goes
+  out next holding neither the Delete nor the key that completed them; from another keyboard,
+  whose keys this one is not told of, at the guest's next pass while a Delete is held, ahead of
+  the keyboard's own repeat -- its first at least a quarter of a second after the key went down --
+  which would type it under them. Its later repeats go through the batch input call.
+- **A pad sent as its reports is presented as its product only where the owner sets it.**
+  `virtual_pads`, in the input configuration and live, **off by default**: off, the reports are
+  not taken and the pad is played as the Xbox pad from its whole states, as in W2.3; on, a
+  DualShock 4 or a DualSense sent as its reports is presented as that product on the driver --
+  touchpad, motion sensors, lights, trigger effects, the reports both ways
+  ([05 §7.2](05-host.md)). A change applies to the pads plugged after it, each pad keeping the
+  family its first message fixed, so an owner moving between kinds of game changes it without
+  ending anybody's session. Off by default
+  because a HID pad never reaches a game that reads only the Xbox pad's interface, and an
+  established client holding a DualSense always sends its reports: with the peer deciding, every
+  such guest would lose every such game, and an established host defaults its own pad type to the
+  Xbox pad too. **This amends [00 §D12](00-overview.md) for Windows alone**; on Linux, where the
+  kernel's own driver makes the pad readable by everything, the peer still decides. On, with no
+  driver, a pad is the Xbox pad again, said once; whole-state pads stay on the bus; an application
+  that takes the reports itself still takes them. The driver answers a pad's feature reads from a
+  table it is given as the pad is made -- the peer's calibration and firmware, else a real pad's,
+  and a pairing report around an address the host makes up, unique per guest and pad -- and
+  completes what is written to the pad at once, keeping it for the host, which sends it to the
+  peer. *Amended 2026-10-26, at W4.3's review (the maintainer's decisions):* **what a program
+  writes to a pad's features stays on the host**, on Linux as well: the device answers the write
+  and keeps none of it, and nothing of it travels; an application holding its own device gives
+  back output reports alone, the library refusing a feature write from it in W4.3's minor. A
+  pad's features carry its pairing, test commands and, on a DualSense, its firmware update --
+  none a game needs -- and the peer applying one would change the guest's own controller. Output
+  reports travel back whole as before.
+  **Switching `virtual_pads` on where the input driver is not installed, or does not admit the
+  process, is refused as `virtual_input` is**, with the same statuses, and changes nothing; a
+  start asking for it is not refused for it, says why once and reads back off, and `lowlatd`'s
+  `--virtual-pads` the same. A driver lost while it is on gives the pads plugged after it the Xbox
+  pad, said once, and **a pad already presented as its product whose device never comes or goes
+  plays on as the Xbox pad from its own reports** -- the sixteen-button state each report carries
+  -- so no pad does nothing.
+- **The fields only Windows acts on are declared on Windows alone.** In the C header the input
+  configuration -- its structure, its member of the whole and its two calls -- and
+  `virtual_width`, `virtual_height` and `virtual_hz` in the video configuration and
+  `virtual_fallback` and `wake_display` in the settled half exist where the header is compiled for
+  Windows and nowhere else, where until then the fields are accepted and do nothing. A value with
+  a meaning on Windows alone, the output `virtual`, stays refused at the call elsewhere. The
+  configuration's layout then differs by platform, which the bindings follow
+  ([06 §11](06-api.md)); it lands with the input configuration, so they change once.
+- **Signed as the display driver is, and installed as it is, by a script of its own**
+  (*amended 2026-10-22, the maintainer's decision*): the test certificate in development with no
+  test mode, the signing service for releases from CI's build; the machine's administrator runs
+  the script, which installs, updates and removes the driver, and nothing of the host or its
+  service does -- the service installs no driver (W2, amended). The floor is the display
+  driver's, Windows 10 1903, unless its setup information needs a later release; the host's own
+  floor stays 1703, on the batch input call.
+
+### Steps
+
+- [x] **W4.0 the driver and its package**: the two crates and the generated declarations; the
+  four kinds; a device to a handle and its neutral report at the handle's end; the feature table
+  and the written reports; the setup information, the package and its test signature; the script
+  that installs, updates and removes it, nothing of it in `lowlatd` (*amended 2026-10-22*); CI
+  building it. Checked by each kind made
+  by an elevated program arriving as the system's own device -- a keyboard, a mouse, a game
+  controller -- a standard user refused, and a handle's end and a killed process each removing
+  the device with nothing held. Measured there, before the devices are built on it: a device's
+  creation to its first delivered report, and whether anything announces that it delivers; where
+  the absolute range lands with two displays, and the pixel a value names; a report submitted
+  just before the device goes, and a key held on a keyboard removed; the bitmap keyboard, the
+  consumer collection and the keys whose form changes; the wheel's multiplier; a report to its
+  arrival in raw input against the batch input call, at p50, p95 and p99, idle and under one busy
+  loop per logical processor, at 125 and 1000 reports a second, with the driver host's processor
+  time and its priority. *Amended 2026-10-22, at W4's review:* measured as well, how many reports
+  the framework keeps for a device nothing reads yet and which it lets go when full, since the
+  last report of a state -- a key's release -- must reach the system whoever keeps them, the
+  driver keeping its own where the framework would drop it; whether a button pressed on one of the
+  mouse's collections and released on the other stays held, and whether a click on the relative
+  collection lands where a move on the absolute one just put the pointer, over many pairs idle and
+  under load; the script's install, update and removal each with no reboot, the update and
+  removal with a pad held open by a program; `lowlatd install` and `uninstall` leaving the driver
+  as they found it. Each kind's neutral report checked against its descriptor.
+  *Built 2026-10-22, unticked:* the two crates, the declarations, the setup information and the
+  package, test-signed and valid; both drivers' install scripts on nefcon, an open-source device
+  tool shipped beside them with its licence, since the system's own tool cannot make a root
+  device; the host's side of the interface and its checks on the machine, ignored until the
+  driver is installed. Run: every check needing no installed driver, each broken once. Owed: the
+  install, the checks on the machine and the measurements above.
+- [x] **W4.1 the keyboard and the switch**: the input configuration with `virtual_input` and its
+  two calls in its minor, the Windows-only fields declared on Windows alone in the same minor,
+  `lowlatd`'s flag; a guest's HID keyboard while the switch is on, the chord's rule, the batch
+  input call where there is no driver. Checked by every
+  key class against a USB keyboard's as W2.3 listed them, read by raw input and a low-level hook --
+  a device named, no injected flag; typing on the lock screen and into an elevation prompt with no
+  thread attached; a guest's Ctrl+Alt+Del keys reaching applications and never the secure screen;
+  the power, sleep and wake keys never reaching the system; the switch moved both ways mid-session
+  with a key held, the key coming up; switched on with no driver, refused.
+  *Built 2026-10-26, unticked:* the input configuration, `virtual_input` and its two calls in
+  minor 32, with the fields only Windows acts on declared there alone -- off Windows the video
+  configuration and the whole are shorter, and a caller laid out as minors 27 to 31 is refused
+  by its size rather than misread; `lowlatd --virtual-input`; a guest's keyboard on the driver
+  from its admission or the switch, in the first slot the driver gives, its keys held until the
+  system lists it, and the batch input call where the driver gives none, where it is not listed
+  within 5 s and after it refuses a report; the chord's rule, the other order released first;
+  the switch first releasing what the old way holds; the host's handles closed when the system
+  asks for the driver's device back. Beside it, **a leaving guest's keys released on the batch
+  input call**, which nothing did: a key held as a guest's loop ended stayed down (W2.3, found
+  reading for this step). Run: every check needing no driver, each new one broken once; on the
+  development machine, a key held until the keyboard was listed and released across the switch
+  both ways, and the library's calls switching it as the driver allowed. Owed: the live checks
+  above, and W4.0's driver taken up at the next switch-on.
+  *Amended 2026-10-26, the first sitting (a macOS client, the service switched on):* keys and
+  pointer worked; two faults found, fixed and checked live again -- an absolute pointer short of
+  the picture after the desktop changed around the captured output, the place now followed as the
+  layout changes; and a key let go under Command left held and repeated, no key now held while a
+  peer's mask holds Command ([05 §7](05-host.md)). *Amended 2026-10-26 (the maintainer's
+  decision):* **the live checks still owed move to W4's gate**, which lists them for the
+  keyboard and the mouse together -- raw input and the injected flag, the lock screen and an
+  elevation prompt, the chord's keys, the switch moved mid-session, the driver removed -- so one
+  set of machine changes covers both devices; this step stays unticked until the gate runs them.
+- [x] **W4.2 the pointer**: a guest's HID mouse while the switch is on -- both collections, the
+  multiplier, every button and wheel on the relative collection (*amended 2026-10-22*; as W4.0's
+  measurement of the two collections settles it) -- and absolute positions as W4.0's measurement
+  settles them.
+  Checked by W2.3's sweep through the guest's own devices landing every position on its pixel at
+  100 and 125 percent; relative motion in raw input naming a device; the wheels in the peer's
+  units, a trackpad's fine scroll included; a machine with no mouse showing its pointer while a
+  guest is seated; absolute motion turned into deltas while an application holds the pointer; a
+  button held while the client turns its pointer relative and back, nothing left held, no click
+  lost and the drag not ended.
+  *Built 2026-10-26, unticked:* a guest's mouse on the driver beside its keyboard, under the same
+  switch, made, held for and let go of as the keyboard is; every button, wheel and motion on the
+  relative collection, the wheels in the peer's units, a move past a report's range split; a
+  position on the primary display on the absolute collection at the pixel the batch input call
+  would have named, by the system's own layout, and a position on any other display through the
+  batch input call; a switch either way releasing the buttons as well as the keys. Run: every
+  check needing no driver, each broken once -- the buttons and wheels after a position and under
+  motion, a long move split with nothing lost, every pixel of a primary across two layouts and
+  the positions off it refused, the switch letting go of a key and a button. On the development
+  machine: the guest's mouse through the host's own devices, positions on the primary on their
+  pixels through it, and W2.3's sweep with the switch on, every position on its pixel on three
+  displays. Live, a macOS client: the pointer in a game whose anti-cheat refuses the batch input
+  call's motion, a window dragged, a browser game's relative aim, both wheels and a trackpad's
+  pinch, clicks on a second display; the primary at 125 percent, its positions where they were
+  asked. Owed, at W4's gate: the sweep's pixel count at 125 percent, raw input naming the
+  device, a machine with no mouse, a drag held across the client turning relative. *Seen:* the
+  devices carry no name of their own -- the framework's, "HID VHF Driver" ([11 §2.3](11-drivers.md)).
+- [x] **W4.3 the report pads**: `virtual_pads` taking a reserved byte of the input configuration
+  in its minor; the DualShock 4 and the DualSense on the driver, the feature table filled from the
+  peer, what is written to a pad sent back to the peer; the answers a Linux pad gives moved to
+  where both platforms build them, Linux unchanged. Checked by the library's demo's DualShock 4
+  and DualSense and an established client's DualSense each read as its product -- features asked
+  and answered, touch, motion, the lightbar and player lights, trigger effects and rumble back --
+  by the common game launcher, the controller libraries' HID layer, a browser's gamepad interface
+  and the system's own game controller panel; the setting off, the Xbox pad as before; the setting
+  changed mid-session, the next pad plugged following it and one already plugged keeping its
+  family; the Linux bar.
+  *Reviewed 2026-10-26:* **the pads checked against their consumers on the installed driver,
+  before the host's side is built**: the maintainer's DualShock 4 and DualSense on USB, each relayed
+  for ten minutes into a pad of its product on the driver, 150,000 reports each and none refused,
+  read as their products by the controller libraries' HID layer, the common game launcher, the
+  game controller panel and a browser's gamepad interface, the standard mapping there, and the
+  lightbar, player lights, rumble and trigger effects written back whole and felt on the real pad;
+  the framework's string showed only in a browser's HID chooser and in the text its gamepad
+  interface names a pad by ([11 §2.3](11-drivers.md)). Not run: a game on the pads' maker's own PC
+  library. **Taken into the step**: the decisions above (feature writes kept on the host, on Linux
+  too, and refused from an application's own device by `lowlat_host_send_pad_report` in the
+  minor; the switch refused without the driver, a pad whose device goes played on as the Xbox
+  pad from its reports); a pad presented as its product keeping its reports when the setting goes
+  off -- the setting decides a new pad's family alone; the version the real pads show on Windows,
+  0x0100; `lowlatd --virtual-pads`; the driver keeping 32 of a pad's output reports for the host,
+  a DualSense's naming by its flags the parts it changes, so a dropped one is counted and said; a
+  pad's end off the guest's thread, and the 50 ms wait before a device goes the keyboard's alone;
+  the application example's live switches, which the gate's mid-session legs need. **Checked as
+  well**: an established client's DualSense on a cable -- a wireless one sends its wireless
+  reports, which the host takes from no peer, and plays as the Xbox pad, as on an established host.
+  *Corrected 2026-10-26, at the build:* the 50 ms wait before a device goes stays every kind's
+  ([11 §2.2](11-drivers.md)): with the keyboard's alone, a mouse let go of at once held the
+  keyboard's removal beside it for about five seconds.
+  *Built 2026-10-26, unticked:* `virtual_pads` in a reserved byte of the input configuration, in
+  minor 33, its set taking both switches or neither; a DualShock 4 or a DualSense sent as its
+  reports made on the driver at its first report while the setting is on, in the first slot the
+  driver gives its kind, its table filled from what the peer sent around a pairing the host makes
+  up, its latest report held until the system lists it, and what a game writes to it handed back
+  as an output report; the answers a Linux pad gives built where both platforms build them,
+  Linux unchanged; the review's findings and decisions as taken above; `lowlatd --virtual-pads`
+  and the application example's live switches. Found and fixed beside it, for the keyboard and
+  the mouse too: **a device counts as listed only with every collection under a raw input handle
+  of its own** ([11 §2.4](11-drivers.md)) -- raw input went on listing the previous device of a
+  slot used again soon for up to a second, and the next one, taken as listed at once, lost its
+  first reports. Run: every check needing no driver, each broken once. On the development
+  machine, the driver admitting the process: W4.0's checks; a pad's feature write answered and
+  handed to no one, its output report back by the interrupt write, a set-report of it refused by
+  the framework; a guest's DualSense through the host's own devices, made at its first report,
+  listed 12 ms after, a game's output report back 4 ms after that, gone 52 ms after its unplug;
+  the keyboard's and the mouse's checks back to back, the second's devices made while raw input
+  still listed the first's, ready after 490 ms, positions on their pixels within 2 ms; the
+  library's switches. Live, a macOS client's DualSense on a cable against the service: every
+  button, the touchpad, both motion sensors, the lightbar, the player lights and the microphone's
+  light, the trigger effects and the rumble, through eleven unplugs of a failing cable; its
+  DualShock 4 the Xbox pad, as that client sends one. Owed, at W4's gate: the library's demo's
+  DualShock 4 and DualSense, the setting changed mid-session and off, a game on the pads' maker's
+  own PC library.
+
+**Gate:** on the development machine, with established clients on macOS and Windows and the
+library's demo:
+
+- through the HID keyboard, every key class, typing on the lock screen and into an elevation
+  prompt, the chord's keys raising nothing and the attention chord asked for still the service's;
+- through the HID mouse, the sweep, relative aim and both wheels, and a drag held across the
+  client turning its pointer relative;
+- for both, raw input naming a device and no injected flag;
+- the switch moved both ways mid-session with keys and buttons held, nothing left held;
+- both pads as their products with everything back -- the library's demo's, and an established
+  client's DualSense on a cable -- the setting off giving the Xbox pad, and the setting changed
+  mid-session reaching the next pad plugged;
+- the driver removed and the host killed mid-session, nothing left held and no device behind;
+- recorded rather than passed: a report to its arrival in raw input against the batch input call,
+  across the switch, at p50, p95 and p99, idle and under load, and a slot's first setup;
+- the test-signed package installing silently with no test mode, by its script; CI building the
+  driver; both CI jobs and the Linux bar.
+
+*Passed 2026-10-27* on the development machine, every leg as written, the figures in the
+[changelog](changelog.md)'s entry of the day; three faults found at it, with the library's demo
+on a laptop, were fixed the day before -- AMD's decoder on a cropped stream and on ten-bit HEVC
+under an older runtime, and a ten-bit request without the second codec's bit. Not run, and
+named there: W4.2's pixel count at 125 percent and a machine with no mouse, and a game on the
+pads' maker's own PC library.
+
+## Change log
+
+- 2026-10-28: W1's gate run on Linux made: ten minutes at the desk, both Sony pads through SDL's
+  HID layer; the gate passed in full.
+- 2026-10-28: W1's gate passed, its run on Linux left (the maintainer's decision); W1 closed.
+- 2026-10-27: W1.10 built and closed: the client's Windows zip from the build workflow, and the
+  software decoder and the demo in Windows CI; the workflow's zip checked unpacked on two AMD
+  laptops.
+- 2026-10-27: W1.9 built and closed: no GPU menu, no check of the display's GPU and no placement
+  rule (the maintainer's decision); the decoder created on the GPU the demo draws on; W1's
+  decision and gate amended.
+- 2026-10-27: W4's gate passed; W4 closed.
+
+- 2026-10-26: W1.6 amended again: ten-bit HEVC on AMD's ten-bit component, the other
+  corrupting memory on an older runtime ([10 §5.2](10-client.md)).
+- 2026-10-26: W1.6 amended: AMD's decoder initialised at the size a stream shows, an older
+  runtime decoding nothing of a cropped one at its coded size ([10 §5.2](10-client.md)).
+- 2026-10-26: W4.3 built: the report pads as their products on the input driver behind
+  `virtual_pads` (minor 33), checked on the machine and live with a macOS client's DualSense; a
+  device's readiness fixed for all three kinds, every collection listed under a handle of its
+  own; the review's keyboard-alone wait corrected, every kind waiting
+  ([05 §7.2](05-host.md), [06 §3](06-api.md) and [11 §2](11-drivers.md) amended).
+- 2026-10-26: W4.3 reviewed: what a program writes to a pad's features stays on the host, on both
+  platforms and from an application's own device; `virtual_pads` without the input driver refused
+  as `virtual_input` is, and a pad whose device goes played on as the Xbox pad from its reports
+  (the maintainer's decisions); the pads checked against their consumers on the installed driver;
+  the step's build and checks and the gate's pad leg amended. W4's pads decision amended
+  ([01 §11.2](01-protocol.md),
+  [05 §7.2](05-host.md), [06 §3](06-api.md) and [11 §2](11-drivers.md) amended).
+- 2026-10-26: W4.2 built: a guest's mouse on the input driver beside its keyboard, every button,
+  wheel and motion on its relative collection, the primary display's positions on its absolute
+  one and every other display's through the batch input call; the switch releasing the buttons
+  too; checked on the machine and live with a macOS client. W4.1's live checks moved to W4's
+  gate.
+- 2026-10-26: W4.1's first sitting: the place followed as the desktop changes around the captured
+  output, and no key held while a peer's mask holds Command; both checked live.
+- 2026-10-26: W4.1 built: the input configuration in minor 32 with the Windows-only fields
+  declared on Windows alone, a guest's keyboard on the input driver with the chord's rule, the
+  switch, `--virtual-input`; the input driver's refusals given statuses of their own, and a
+  start not refused for it; the chord's other order released first. Found and fixed beside it: a
+  leaving guest's keys were never released on the batch input call.
+- 2026-10-25: W2.8's congestion leg corrected: the collapse at 120 a second was the test
+  content's floor; with content that fits, the rate change under congestion passes at 120.
+- 2026-10-25: W2.8 closed: both CI jobs green.
+- 2026-10-25: W2.8 built and checked on the development machine's Intel card: the conversion
+  drawn on Intel's GPUs, the duplication's wait not entered while Intel's encoder holds a
+  picture, H.264's remote-gaming tuning taken at the gate; a rate change under congestion at 120
+  a second not passed, the shared control's; an output asked during a rebuild fixed.
+- 2026-10-25: W3.13 built, checked and closed: a monitor moved by each name; `auto` found on the
+  Arc where the user's processes rank the RTX first, and the host's own display found not to come
+  back after a driver update while another output was captured.
+- 2026-10-25: W3.13 added after W3 closed: the virtual displays' GPU named by its maker
+  (`nvidia`, `amd`, `intel`) or as the power-saving one (`igpu`, checked on the development
+  machine first); no `dgpu`, which `auto` already is.
+- 2026-10-25: W2.8 probed: the host's conversion kept for Intel's encoder (the maintainer's
+  decision); the rate's buffer made from the session's ceiling with each picture bounded by the
+  encoder's own limit, amending the rate planned; the runtime's wait on the loop's thread; H.264's
+  limits on the part.
+- 2026-10-25: W2.8 added and planned at its interview: Intel's encoder, following the captured
+  output's GPU, on the current runtime alone; the parts only the older runtime reaches a step of
+  their own.
+- 2026-10-24: a stream holds an NVIDIA GPU's memory clock at a floor while it runs (the
+  maintainer's decision), after W3's gate found the encoder at 4 to 5 ms in the card's middle
+  memory state against about 1 above it ([05 §4.2](05-host.md)).
+- 2026-10-24: W3's gate passed; W3 closed.
+- 2026-10-24: W3's gate leg of other vendors' virtual displays cut to one, an established host's
+  own (the maintainer's decision): another vendor's virtual display is a panel to the host.
+- 2026-10-24: at W3's gate's logoff leg, a new session's logon screen refused the owner's size of
+  the host's display for seconds, and the host asked no more while the stream ran: the owner
+  signed in at the configured size. Fixed the same day: a running stream asks again every two
+  seconds while a mode stands refused ([11 §1.5](11-drivers.md)).
+- 2026-10-24: at W3's gate, a display gone past the wait for one (the display driver removed and
+  installed again under a seated guest, 21 s) was answered as a refused configuration: the guest
+  was kept though the line said it was ended, and the second codec was taken off for every guest
+  after it. Fixed the same day: the wait's deadline drops no preference, sends a guest's request
+  for an output that never lit back to the one before it, and otherwise ends the guests with the
+  capture's reason ([05 §2](05-host.md)). The gate's package leg amended to check it.
+- 2026-10-23: W4.0 measured on this machine: the absolute range spans the primary display alone,
+  so an absolute position on any other output goes through the batch input call (the
+  maintainer's decision; [11 §2](11-drivers.md) amended); a move on one collection stays ahead of
+  the click on the other. W4's decision on the pointer amended. The device goes 50 ms after its
+  neutral reports: the system's keyboard path dropped a release still on its way at the delete,
+  so raw input kept the key held ([11 §2](11-drivers.md) amended). The input driver keeps a host
+  process of its own and raises it to the high class as it loads: at the normal class a write
+  waited 10 to 15 ms now and then under load (the maintainer's decision; [11 §2](11-drivers.md)
+  amended).
+- 2026-10-23: the input driver names no device's instance; the virtual HID framework names each
+  itself (the maintainer's decision, after a run of W4.0's checks stopped the machine on two
+  devices of one name, the per-slot name having reached the framework a character short). A kind
+  and slot stays one device at a time, in a container of its own ([11 §2](11-drivers.md)
+  amended). W4's decision on the kinds amended.
+- 2026-10-22: W4 reviewed: the mouse's buttons and wheels on its relative collection alone, the
+  absolute one carrying positions (the maintainer's decision); a neutral report per kind; the
+  host letting the driver go when the system asks; `lowlatd`'s flag with no driver; W4.0's
+  measurements of the framework's own buffer, the two collections and the script; W4.2's checks
+  and the gate amended ([11 §2](11-drivers.md) amended).
+- 2026-10-22: the service installs no driver (the maintainer's decision, at W4's review): each of
+  the host's drivers is installed, updated and removed by a script of its own, which the
+  machine's administrator runs, and what needs one -- the host's own display and its fields, W4's
+  input devices -- needs it installed ([06 §3](06-api.md), [07 §10](07-platforms.md) and
+  [11](11-drivers.md) amended). W2's service decision, W3's gate, and W4's install decision, W4.0
+  and its gate amended.
+- 2026-10-22: W4 added and planned at its interview: a HID driver of the host's own for a
+  guest's keyboard, mouse and Sony pads, the keyboard and the mouse switched onto it by the
+  application, a pad sent as its reports presented as its product where the owner sets it, off by
+  default ([00 §D12](00-overview.md) amended for Windows and §D17 added; [05 §7](05-host.md),
+  [06 §3, §11](06-api.md), [07 §4.2, §10](07-platforms.md) and [11 §2](11-drivers.md) amended).
+  W2's input decision amended.
+- 2026-10-22: W2's pacing decision amended: a panel slower than the primary, duplicated, left with
+  its late pictures (the maintainer's decision; [05 §2](05-host.md) amended); W2.7's late
+  compositions at 60 corrected to the frame clock in the changelog and
+  [09](09-compatibility.md).
+- 2026-10-21: W3.12 added after W3.11's live check, decided, built and checked live (composition
+  to hand-over 0.19 ms at the median, from 9.31): a display read from its
+  driver paced on the slower of the compositor's clock and its mode, the period it is handed
+  pictures at, where the clock's alone locked each picture a composition late once the two
+  drifted apart ([05 §2](05-host.md) amended).
+- 2026-10-21: W3.11 added after a probe at W3's gate's second review, decided, built and checked
+  live: the host's display put at its mode as asked and held against the system's restore alone, a
+  program's own mode in exclusive fullscreen left to it and followed ([05 §2](05-host.md),
+  [06 §3](06-api.md) and [11 §1.5](11-drivers.md) amended). The gate's legs amended at it: the blank
+  per event; the size an owner put left after, and a non-owner's refusals sent through the demo;
+  a game's own mode; a pointer over 256 read back; the kept and the bound monitor's roads and
+  another vendor's display; any reboot; the comparison as one run of its test from the vblank,
+  and the blackout's own test.
+- 2026-10-20: W3.10 added after a review of W3's gate, decided and built: a guest's size and turn
+  of any display put by `lowlatd`, an owner's alone, as the stream's rate is; the library's live
+  setter rebuilding only for what changed; the turn call withdrawn and the minor back at 30; the
+  gate's legs corrected -- the frame interface's answer, the lock screen on a secondary, the
+  comparison confirming a default already taken -- and an owner's size and turn added
+  ([06 §3, §11, §13, §14](06-api.md), [07 §5.1](07-platforms.md) and [impl-plan.md](impl-plan.md)
+  *Output selection* amended).
+- 2026-10-20: W3.9 added, probed, built and checked live: a guest's turn of the host's display
+  put once (minor 31); turned monitors kept on the duplication, whose open of a turned output no
+  longer loops through rebuilds; W3.8's comparisons on a real duplication
+  ([05 §2](05-host.md), [06 §3, §11, §14](06-api.md) and [11 §1.5](11-drivers.md) amended).
+- 2026-10-20: W3.8 added, built and checked: every monitor of the driver read straight from it
+  while upright, a turn under the read a rebuild; the host's own display keeping a refresh and a
+  turn set at the desk; one GPU per adapter checked against the newest class
+  ([05 §2](05-host.md), [06 §3, §11, §14](06-api.md) and [11 §1.5, §1.6](11-drivers.md)
+  amended).
+- 2026-10-20: W2.7 closed: clients on Windows, macOS (native and in a browser) and Android.
+- 2026-10-20: W2.7 checked on two AMD GPUs: a frame read in place goes back once the encoder is
+  done with it, and the encoder is let go unended on a removed device ([05 §2](05-host.md),
+  [05 §4](05-host.md) and [06 §3](06-api.md) amended, [09 §8](09-compatibility.md) graded).
+- 2026-10-19: W2.7 probed: the encoder's own thread waits for each picture, latency-constrained
+  rate within the buffer, the delimiter and the forced type written with every picture; on an AMD
+  GPU the encoder converts the captured picture in its own hardware ([05 §3](05-host.md) amended;
+  W2's duplication and W3's frame decisions, 05 §2 and 11 §1.6 amended to match).
+- 2026-10-19: W2.7 added and planned at its interview: AMD's encoder, following the captured
+  output's GPU; the full-chroma census narrowed to the captured output's encoder on both
+  platforms ([00 D7](00-overview.md) amended).
+- 2026-10-18: W2.5 closed: the reboot checked; a host ended with its session telling its guests
+  nothing recorded as a known gap and deferred.
+- 2026-10-18: W2.5: what a guest is told at a change of session measured on three clients -- the
+  status stays; the ordinary-user refusals and a guest without the keyboard checked.
+- 2026-10-18: W2.5: a user switch, a logoff and guests through the firewall checked; a job for
+  each host, and a host waiting for a display ending when asked.
+- 2026-10-18: W2.5: the attention policy's key read before it is written, and the locked key's
+  two cases checked through a guest.
+- 2026-10-18: W2.5 checked on the fixed build (the end request with a guest, the host killed
+  with one, a remote connection both ways, the chord from a guest, the listing); the driver's
+  install on a machine without a device, and the log's rotation, fixed; the attention policy's
+  per-call form kept for a value a policy set on an unlocked key.
+- 2026-10-18: W2.5 reviewed after the checks: the end request cleared before each host, an
+  exit the service asked for followed at once, a session's end followed on the same number,
+  and the guests' kicks waited for. Uninstall and the end request with a guest are owed too.
+- 2026-10-18: W2.5 checked on the machine: install (stopped, stopped over running), the
+  configuration's access, the not-logged-in host, the host killed and back in two seconds, the
+  service killed with the host going with it, stop and start. Three fixes: the driver folder is
+  copied, the stop sends the control code, the copies retry while the image unmaps. The checks
+  needing a session, guests or a reboot remain.
+- 2026-10-18: W2.5 built: the advertisement, wording, configuration and login (the first
+  commit); the service role, install and uninstall, and the chord's call (the second). The
+  machine checks and D1's measurement remain, so the step stays open.
+- 2026-10-18: W2.5 in part built: the Windows advertisement (Windows, the major version, the
+  computer's name, a random identifier kept beside the configuration); the two Linux-worded
+  lines worded for their platform; the configuration file's parser and Windows template; the
+  login tool's Windows branch; the staging script. The service role, install and the chord's
+  call remain.
+- 2026-10-17: W2.5 reviewed: the service decides on every pass and restarts only a failed exit;
+  two inherited events between the service and its host; the programs copied into the
+  program-files directory and the program-data folder protected explicitly; the display driver
+  installed with the service; the policy for the chord set around each call (amending W2's input
+  decision); what a guest is told at a change of session decided by measurement; the login tool
+  taught Windows; the host's advertisement on Windows corrected.
+- 2026-10-17: W3.7 reviewed, built, checked and ticked: the driver's process's access list read (no
+  other account admitted); a virtual display told by its adapter for the save; the monitor's
+  description from its own bytes; the frame number's wrap; the controller's refusals leaving
+  nothing behind and its not-ready status naming the slot (minor 30).
+- 2026-10-17: W3.6 reviewed, built, checked and ticked: the program `lowlat-vdd` beside
+  `lowlatd display` through one module; the library's third half built alone and gated as an
+  application links it; the driver's files `lowlat-idd` and the names a person sees
+  capitalized, the EDID's "LowlatDisplay"; the package dated in UTC and installed over the old
+  driver, a kept monitor back under the new names; stale statuses corrected here and in 11.
+- 2026-10-17: the gate's comparison run offline from one reference (the compositor's vblank):
+  the direct frame at or below the duplication at every percentile once the driver's frame
+  thread was raised, milliseconds ahead under GPU load; the 240 Hz leg with the host's display as
+  the primary; the GPU's clock changes at light load named as a tail both sources share.
+- 2026-10-16: W3.5 checked with a person and ticked: a guest on a laptop through the GPU's
+  restart, the lock screen and the secure attention screen, with both panels' cables out the host's
+  end, the update and the GPU's restart, and the machine's sleep; the secure screens black on the
+  host's display while it is a secondary; an elevation prompt answered through the guest, its
+  dialog drawn on the primary alone.
+- 2026-10-16: W3.5 built, not ticked: the controller follows its driver, the host's own display
+  follows it and the stream's wait plugs it again and waits out a display under a GPU without the
+  encoder; `wake_display`; the stream's spin after a driver update found live and fixed. Checked
+  with the demo as the guest; a guest on another machine, the cables and the machine's sleep owed.
+- 2026-10-16: W3.5 reviewed: the logoff and the remote desktop connection moved to W2.5; the
+  controller closes its handle when its driver is asked to be removed or goes, for every user;
+  the host's own display follows its driver, also while a stream waits for a display; a display
+  listed under a GPU without the encoder is waited for, as the system lists one there while a
+  GPU's driver restarts; a setting, off by default, wakes a sleeping display as a stream starts.
+- 2026-10-16: W3.4 built, checked and ticked: the pointer the same to the byte from the driver
+  as from the duplication, the text cursor by the monochrome rule; the secure desktop keeping
+  the hardware cursor, the pointer's read following the input onto it; the host's own display
+  direct as the system account and duplicated as a user; a pointer over 256 hidden on both
+  sources; the cursor's read 4 to 5 us, kept on the frame's worker.
+- 2026-10-16: W3.4 reviewed: the driver publishes the pointer in the monitor's frame section,
+  the channel's version 2; the pointer's read follows the input desktop; a masked colour pointer
+  that is a monochrome one in another form is drawn as one; a pointer over 256 stays the
+  system's to draw; the host's own display reads the direct frame when the driver answers.
+- 2026-10-16: W3.3 checked and ticked after a restart of the machine: the device restarted twenty
+  times mid-stream, the held picture's publication broken and caught, two readers at once both
+  served; the frame thread left at normal priority, since raised it took a fifth of its pictures
+  up to 2 ms late under load; an update restarts the other virtual displays' devices, and one
+  held open leaves the update waiting for a reboot.
+- 2026-10-16: W3.3 built: the frame page written once and model-checked; the driver's half -- a
+  page per monitor for its life, each buffer shared, the fence signalled, the last picture kept
+  -- and the host's display's second source, offline until W3.4; the comparison offline at 1440p
+  and 4K at 120 and 1080p at 60; a restart refused with a handle open leaves the device waiting
+  for a reboot; three checks owed after one.
+- 2026-10-16: W3.3 reviewed: the driver never waits for the host -- a probe found the system's
+  buffer shared with no keyed mutex and read across processes, three buffers in turn, and a
+  picture intact for about three refreshes, so the hold, the release fence and the claim go; the
+  frames limited by who can take handles from the driver's process; the duplication the host's
+  path until W3.4; the gate's comparison without a hold to measure.
+- 2026-10-16: W3.2 built and checked: the host's own display plugged, held, sized at an owner's
+  join and named `virtual`; an output lit only with a monitor behind it, since the last cable
+  pulled leaves its output on the desktop; the pace and the deadlines' refresh at the
+  compositor's clock, the rate asked kept apart from the pace; the controller putting a mode
+  again after a replug; `lowlatd`'s setting, relay and new-rate notice; minor 27.
+- 2026-10-16: W3.2 reviewed: any virtual display streams through the duplication as built; the
+  pace and the deadlines' refresh at the rate the desktop is composed at, amending W2's
+  duplication decision; the host's display plugged at the host's start, in the highest free
+  slot, sized at an owner's join within that guest's limit, holding its mode, listed as
+  `virtual`.
+- 2026-10-15: W3.1 checked after a reboot, a kept monitor back at its slot, mode and place;
+  ticked.
+- 2026-10-15: W3.1 reviewed and built, checked live but for the reboot: a kept monitor's
+  arrangement saved in the system's store unless only virtual displays would be active, a
+  bound one's never; the controller's calls waiting for the system within a bound; one GPU
+  for every monitor, the file's or the high-performance one, never the host's; the monitors
+  reported as DisplayPort; the file, its folder and its reader; the controller crate, the
+  library's third half (minor 26) and `lowlatd display`.
+- 2026-10-15: W3.0 built and checked live: the driver and its protocol crate, the generated
+  declarations, the kit restored by a script, the package test-signed and installed silently;
+  a mode asks for no display bandwidth; a plugged monitor made active through the display
+  configuration, unsaved, since the system leaves a set it remembers as it was; the output
+  listed under the GPU that renders it, correcting W2's correction; the first swapchains after
+  a mode is set taken back while it settles.
+- 2026-10-15: W3 planned at its interview: the monitor lives with the host, plugged when a
+  stream finds nothing lit and the configuration allows it, or when named; the driver in Rust in
+  this workspace, its channel's layout and handshake written once and model-checked; a
+  controller as the library's third half, a monitor bound to its handle or kept and restored at
+  start, no keepalive, `lowlatd display` for people; the design in 11; the host's display
+  sized through the configuration from an owner's stated size and the stream's rate; test
+  signing in development and an open-source signing service for releases; the floor Windows 10
+  1903; desktop duplication of any virtual display, which W2 refused (its decision corrected);
+  the gate after W2.5, its comparison deciding the default path.
+- 2026-10-15: W2.4 built and checked live: the loopback and its silent stream, the host's own
+  rounding, flagged packets as silence, the default followed and a lost output opened again at
+  once where it can be, the local mute only where the output mutes in hardware.
+- 2026-10-15: W2.4 reviewed before its build: the silent stream started once, a flagged packet
+  counted as silence, the sound taken as floating point and rounded by the host, the default
+  followed through the system's notifications, exclusive use a lost device, the local mute only
+  where the output mutes in hardware; leaving one program out of the sound deferred to W2.6.
+- 2026-10-15: W2.3 built and checked live: the generated key translation, the batch input call
+  following the input desktop, the locks from the host's state with a lock key as the peer's
+  state, the bus's pads with their readiness and rumble, opcode 5 pointing down on both
+  platforms, the chord refused; absolute positions aimed at their pixel's centre on both
+  platforms, Linux's measurement owed.
+- 2026-10-15: W2.3 reviewed before its build: the key translation generated from the system's
+  own, with the peers' extra codes and the keys a scancode cannot carry; the power key unmapped;
+  the locks from the host's state; report pads played as the Xbox pad without the application;
+  opcode 5's vertical axes pointing down on the wire; the attention chord the system's own call,
+  made by the service (W2.5).
+- 2026-10-14: W2.2 checked further: a lost device is a rebuild with the guest kept, and a name
+  the system renumbered follows its monitor (amending the naming decision); exclusive
+  fullscreen at another mode is followed in both presentation models.
+- 2026-10-14: W2.2 built and checked live: the duplication and the conversion in all four
+  layouts, the display on the output's own adapter, the pointer settled by the display, the
+  daemon per-monitor aware; streamed as the system account through the lock screen, the secure
+  attention screen and a switch of display. A frame of the pointer alone ends no wait, and
+  ten-bit full chroma is granted, amending the review's two defaults.
+- 2026-10-14: W2.2 reviewed before its build: the pointer's three bits each from its own
+  source and one message per settled state ([05 §8](05-host.md) corrected with it); the host
+  per-monitor DPI aware, its duplication call refused otherwise; a still desktop's presents;
+  the display kept awake; full chroma's packed layouts; the encoder's own conversion measured
+  no dearer than ours on the development card ([05 §3](05-host.md) corrected); the second
+  display moved onto the NVIDIA card for the gate's switch.
+- 2026-10-14: W2 planned at its interview: one process of the system account in the console
+  session, the service starting and watching it; NVENC alone, AMD's and Intel's encoders
+  deferred; desktop duplication converted straight from the acquired image; outputs named
+  `DISPLAYn`; input by scancode through the platform's own translation, and the ViGEm pad; the
+  loopback kept running by a silent stream; the floor at Windows 10 1703.
+- 2026-10-14: W3 added, the host's own virtual display, with its frame hand-off decided: the
+  host converts straight from the system's buffer, which the driver holds to a bound. W2's
+  frames question answered by it; W2's virtual pad is the ViGEm bus's, and a HID device of
+  the host's own is deferred.
+- 2026-10-01: W1.8 built: the system's decoder, its own kind and slot, last in the automatic
+  order; HEVC at ten bits as well, amending W1's decision.
+- 2026-10-01: W1.7 reviewed before W1.8: on an Intel GPU the automatic order tries the
+  system's interface first and builds Intel's decoder only where it does not open
+  ([10 §5.2](10-client.md)).
+- 2026-09-30: W1.7 built: Intel's decoder, second on an Intel GPU as measured; its older
+  runtime planes only, its check owed until a part that needs it is at hand.
+- 2026-09-30: W1.6 reviewed before W1.7: the automatic order now tries both hardware decoders
+  on a GPU before it leaves it, and a fault met handing a picture out is judged as one met
+  decoding, on every decoder ([10 §5](10-client.md), §5.2).
+- 2026-09-30: W1.6 built: AMD's decoder first on an AMD GPU where its runtime has the
+  low-latency mode, as measured; the demo's growth by handle on a GPU other than the display's
+  found and left to W1.9.
+- 2026-09-29: W1.5 built: NVDEC first on an NVIDIA GPU, as measured; a decoder that fails past
+  recovery ends the session by the library's own departure, on both platforms.
+- 2026-09-29: W1.4's search for a lost GPU amended: the same hardware alone, for five seconds
+  rather than ten, a session nobody placed taking another GPU only when it has run its course
+  ([10 §4.2](10-client.md)).
+- 2026-09-28: NVDEC moved ahead of AMF, as W1.5, AMF W1.6; W1.7 Intel VPL added, with the
+  older runtime for the parts the current one does not reach, built though the system's
+  interface did not prove short on the Intel card, its place on an Intel GPU by measurement;
+  the steps after it renumbered: the system's decoder W1.8, the demo W1.9, packaging W1.10.
+- 2026-09-28: W1.4 closed; the renderer's placement by the display's GPU added to W1.8, from
+  W1.4's measurement; the handle route's processor time on the AMD GPU noted for W1.5.
+- 2026-09-28: W1.5 AMF added, in its low-latency mode and first on an AMD GPU; the steps after
+  it renumbered: NVDEC W1.6, the system's decoder W1.7, the demo W1.8, packaging W1.9.
+- 2026-09-28: W1.3 closed with the Intel card's pass.
+- 2026-09-27: W1.3 built on two GPUs, the third's pass owed; a GPU named by its identity moved
+  from W1.4 to W1.3; the never-waits decision scoped to the handle kind.
+- 2026-09-27: W1.2 built; W1.4's minor corrected to 19.
+- 2026-09-26: W1.1 built; the seam and the library's client half moved to W1.2.
+- 2026-09-26: W1 planned at its interview.
+- 2026-09-26: planned; W0 built, W0.1 to W0.6.

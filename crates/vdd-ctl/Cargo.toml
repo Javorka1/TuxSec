@@ -1,0 +1,43 @@
+[package]
+name = "lowlat-vdd-ctl"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The display driver's controller (docs/11-drivers.md section 1): plug, unplug,
+# set a mode, list, and the file kept monitors come back from. The library's
+# third half, `lowlatd display` and the host's own display drive the driver
+# through it. Built for Windows alone; elsewhere it is empty.
+
+# The controller as a program of its own (section 1.9): the commands `lowlatd
+# display` takes, for a machine that runs no host. Elsewhere it says there is
+# no driver.
+[[bin]]
+name = "lowlat-vdd"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+lowlat-common.workspace = true
+# The GPUs a person may name in the file.
+lowlat-drivers.workspace = true
+lowlat-vdd-proto.workspace = true
+# The driver's interface and its requests, the system's display
+# configuration, and a monitor's frame page taken from the driver's process.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

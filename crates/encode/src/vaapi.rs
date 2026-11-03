@@ -1,0 +1,3430 @@
+//! The open-stack encoder.
+//!
+//! Second backend, and the reason the encoder interface will be a trait rather
+//! than one concrete type: an interface shaped by a single implementation
+//! encodes that implementation's assumptions, which is what the phase gate
+//! requiring two backends exists to prevent.
+//!
+//! **This one is not the zero-copy pairing on every machine, and neither is the
+//! other.** Which backend can take a captured frame without a copy depends on
+//! which device drives the display, discovered at construction
+//! ([`crate::cuda`] carries the same rule). Where they disagree the pipeline
+//! refuses rather than inserting a transfer, per docs/05-host.md section 4.
+//!
+//! Loaded at runtime like everything else here, so a machine without the
+//! driver has a missing backend rather than a process that will not start.
+
+use core::ffi::{CStr, c_int, c_uint};
+
+pub use lowlat_drivers::va::Vaapi;
+use lowlat_drivers::va::count;
+
+use crate::{Encoder as EncoderTrait, Poll};
+
+use crate::ffi::va::{
+    VA_ATTRIB_NOT_SUPPORTED, VA_ENC_PACKED_HEADER_PICTURE, VA_ENC_PACKED_HEADER_SEQUENCE,
+    VA_PROGRESSIVE, VA_RC_CBR, VA_RC_CQP, VA_RC_VBR, VA_RT_FORMAT_YUV420, VABufferID, VABufferType,
+    VAConfigAttrib, VAConfigAttribEncPackedHeaders, VAConfigAttribRTFormat,
+    VAConfigAttribRateControl, VAConfigID, VAContextID, VADisplay, VAEntrypoint,
+    VAEntrypointEncSlice, VAEntrypointEncSliceLP, VAProfile, VAProfileH264High, VAProfileH264Main,
+    VAProfileHEVCMain, VAProfileHEVCMain10, VAStatus, VASurfaceID,
+};
+use crate::ffi::va::{
+    VA_FOURCC_NV12, VA_SURFACE_ATTRIB_SETTABLE, VAGenericValue, VAGenericValueTypeInteger,
+    VAGenericValueTypePointer, VASurfaceAttrib, VASurfaceAttribExternalBufferDescriptor,
+    VASurfaceAttribMemoryType,
+};
+
+/// Why the backend could not be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// No such library, which is the ordinary case without the driver.
+    Unavailable,
+    /// Loaded, but missing an entry point it must export.
+    MissingSymbol,
+    /// The render node could not be opened. Usually a permission on the device
+    /// rather than an absent device.
+    NoDevice,
+    /// A call failed, carrying its status.
+    Status(VAStatus),
+    /// As many pictures are in flight as there are surfaces. Back pressure,
+    /// not a fault.
+    QueueFull,
+    /// The driver has no encode entry point for any codec we speak. A decode
+    /// only device reaches here, and it is a refusal rather than a fault.
+    NoEncoder,
+    /// A surface was offered in a layout this backend does not write, or its
+    /// reported extent does not cover the frame. Refused rather than filled
+    /// in on a guess, because a wrong guess is a picture that decodes to
+    /// something plausible and wrong.
+    UnsupportedLayout,
+    /// A picture needed more buffers than the array that carries them holds.
+    ///
+    /// **A programming error, reported rather than absorbed.** This used to be
+    /// a silent drop: the array was one short of what a refresh needs, the
+    /// last buffer pushed was the slice header's payload, and the stream went
+    /// out with keyframes a decoder could not find a slice in. Every predicted
+    /// picture was fine, so nothing failed until an output switch forced a
+    /// refresh.
+    TooManyBuffers,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("display runtime not present"),
+            Self::MissingSymbol => f.write_str("display runtime is missing an entry point"),
+            Self::NoDevice => f.write_str("render node could not be opened"),
+            Self::Status(status) => write!(f, "display runtime returned status {status}"),
+            Self::QueueFull => f.write_str("every surface is in flight"),
+            Self::NoEncoder => f.write_str("device offers no encode entry point"),
+            Self::UnsupportedLayout => f.write_str("surface layout cannot be written"),
+            Self::TooManyBuffers => f.write_str("a picture needed more buffers than are carried"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<lowlat_drivers::va::Error> for Error {
+    fn from(error: lowlat_drivers::va::Error) -> Self {
+        use lowlat_drivers::va::Error as Runtime;
+        match error {
+            Runtime::Unavailable => Self::Unavailable,
+            Runtime::MissingSymbol => Self::MissingSymbol,
+            Runtime::NoDevice => Self::NoDevice,
+            Runtime::Status(status) => Self::Status(status),
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+type Result<T> = core::result::Result<T, Error>;
+
+/// Which bitstream, in this interface's terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    H265,
+}
+
+impl Codec {
+    /// Profiles worth trying, best first.
+    ///
+    /// High before Main for H.264: every decoder that matters handles High,
+    /// and it is what a peer expects to receive.
+    /// The profiles this codec may be coded as, best first.
+    ///
+    /// **Ten bits is HEVC only and this is where that stops being a comment.**
+    /// No H.264 profile on any device here codes above eight bits, so asking
+    /// for one returns the eight-bit list and the caller's own check refuses
+    /// what it cannot serve, rather than a profile being invented that the
+    /// device would then reject for a reason naming neither depth nor codec.
+    fn profiles(self, ten_bit: bool) -> &'static [VAProfile] {
+        match (self, ten_bit) {
+            (Self::H264, _) => &[VAProfileH264High, VAProfileH264Main],
+            (Self::H265, false) => &[VAProfileHEVCMain],
+            (Self::H265, true) => &[VAProfileHEVCMain10],
+        }
+    }
+}
+
+/// The runtime layout a device is asked to allocate surfaces in.
+///
+/// Named once because four places need it and a disagreement between any two
+/// of them is a surface the encoder reads as the other depth.
+const fn runtime_format(ten_bit: bool) -> u32 {
+    if ten_bit {
+        crate::ffi::va::VA_RT_FORMAT_YUV420_10
+    } else {
+        VA_RT_FORMAT_YUV420
+    }
+}
+
+/// The same, for a full-resolution-chroma configuration.
+///
+/// Kept beside its 4:2:0 twin rather than folded into it, because nothing
+/// shipped uses this and the two questions must not share an answer by
+/// accident: a device offering 4:4:4 profiles that takes only 4:2:0 surfaces
+/// is a device this cannot serve, and folding the constants would read that
+/// as capable.
+const fn runtime_format_444(ten_bit: bool) -> u32 {
+    if ten_bit {
+        crate::ffi::va::VA_RT_FORMAT_YUV444_10
+    } else {
+        crate::ffi::va::VA_RT_FORMAT_YUV444
+    }
+}
+
+/// What an encoder codes with, which is the codec and that codec's parameters
+/// in one value.
+///
+/// **The two cannot be chosen separately.** Each codec's parameter sets are
+/// written by hand and every field the device is told has a counterpart in
+/// them, so a codec paired with the other one's parameters is a stream nothing
+/// decodes rather than a configuration error.
+#[derive(Debug, Clone, Copy)]
+pub enum Params {
+    H264(crate::h264::Params),
+    H265(crate::h265::Params),
+}
+
+impl Params {
+    pub fn codec(self) -> Codec {
+        match self {
+            Self::H264(_) => Codec::H264,
+            Self::H265(_) => Codec::H265,
+        }
+    }
+
+    fn width(self) -> u32 {
+        match self {
+            Self::H264(p) => p.width,
+            Self::H265(p) => p.width,
+        }
+    }
+
+    fn height(self) -> u32 {
+        match self {
+            Self::H264(p) => p.height,
+            Self::H265(p) => p.height,
+        }
+    }
+
+    /// Whether these parameters describe a ten-bit stream.
+    pub fn ten_bit(self) -> bool {
+        match self {
+            // No H.264 profile here codes above eight bits.
+            Self::H264(_) => false,
+            Self::H265(p) => p.bit_depth_minus8 != 0,
+        }
+    }
+
+    /// How far the picture order count runs before it wraps.
+    fn poc_period(self) -> u32 {
+        let minus4 = match self {
+            Self::H264(p) => p.log2_max_poc_lsb_minus4,
+            Self::H265(p) => p.log2_max_poc_lsb_minus4,
+        };
+        1 << (minus4 + 4)
+    }
+}
+
+/// A display bound to one render node, seen by the encoder.
+///
+/// The binding itself is the runtime's; this is the encode half's view of
+/// it, with the encode entry points, the capability questions and the
+/// context built on top.
+#[derive(Debug)]
+pub struct Display<'a> {
+    va: &'a Vaapi,
+    raw: VADisplay,
+    /// Owns the binding; the display is terminated when this is dropped.
+    _bound: lowlat_drivers::va::Display<'a>,
+}
+
+impl<'a> Display<'a> {
+    /// Bind a display to a render node, by path.
+    pub fn open(va: &'a Vaapi, node: &CStr) -> Result<Self> {
+        let bound = va.open(node)?;
+        Ok(Self {
+            va,
+            raw: bound.raw(),
+            _bound: bound,
+        })
+    }
+
+    /// The interface version the driver implements.
+    pub fn version(&self) -> (i32, i32) {
+        self._bound.version()
+    }
+
+    /// The raw handle, for the calls that take one.
+    pub fn raw(&self) -> VADisplay {
+        self.raw
+    }
+
+    /// The profile this driver will encode `codec` with, if any.
+    ///
+    /// **Asked, not assumed.** A device may decode a codec and not encode it,
+    /// and the two are separate entry points against the same profile; taking
+    /// the profile's presence as proof of encode support is the mistake this
+    /// exists to avoid.
+    pub fn encode_target(&self, codec: Codec) -> Result<(VAProfile, VAEntrypoint)> {
+        self.encode_target_at(codec, false)
+    }
+
+    /// The same, for a chosen depth.
+    pub fn encode_target_at(
+        &self,
+        codec: Codec,
+        ten_bit: bool,
+    ) -> Result<(VAProfile, VAEntrypoint)> {
+        let mut profiles = vec![0 as VAProfile; self.max_profiles()?];
+        let mut found: c_int = 0;
+        // SAFETY: the buffer is writable for the length the interface was told
+        // about, and the count is written back.
+        let status = unsafe {
+            (self.va.query_config_profiles)(self.raw, profiles.as_mut_ptr(), &raw mut found)
+        };
+        self.va.check(status)?;
+        let available = profiles.get(..count(found)).unwrap_or(&[]);
+
+        for wanted in codec.profiles(ten_bit) {
+            if !available.contains(wanted) {
+                continue;
+            }
+            if let Some(entrypoint) = self.encode_entrypoint(*wanted)? {
+                return Ok((*wanted, entrypoint));
+            }
+        }
+        Err(Error::NoEncoder)
+    }
+
+    fn max_profiles(&self) -> Result<usize> {
+        // SAFETY: the display is live.
+        Ok(count(unsafe { (self.va.max_num_profiles)(self.raw) }))
+    }
+
+    fn encode_entrypoint(&self, profile: VAProfile) -> Result<Option<VAEntrypoint>> {
+        // SAFETY: the display is live.
+        let capacity = count(unsafe { (self.va.max_num_entrypoints)(self.raw) });
+        let mut entrypoints = vec![0 as VAEntrypoint; capacity];
+        let mut found: c_int = 0;
+        // SAFETY: the buffer is writable for the length passed.
+        let status = unsafe {
+            (self.va.query_config_entrypoints)(
+                self.raw,
+                profile,
+                entrypoints.as_mut_ptr(),
+                &raw mut found,
+            )
+        };
+        self.va.check(status)?;
+        let offered = entrypoints.get(..count(found)).unwrap_or(&[]);
+        // **The order is what a device already serving us keeps.** Where both
+        // are offered the slice entry point is what every shipped run has
+        // measured, and preferring the other one on that hardware would be a
+        // change to the encode nobody asked for. Which of the two a device
+        // that has both should use is a question for a measurement, not for
+        // this list.
+        Ok([VAEntrypointEncSlice, VAEntrypointEncSliceLP]
+            .into_iter()
+            .find(|entrypoint| offered.contains(entrypoint)))
+    }
+
+    /// The profile this driver would code 4:4:4 with, if any.
+    ///
+    /// **Kept apart from [`Display::encode_target_at`]**, which names the
+    /// 4:2:0 profiles only. Folding the two would let a device that offers
+    /// full-chroma profiles but takes only subsampled surfaces read as capable
+    /// of both. A device without the profile is a refusal, exactly as a
+    /// missing depth is.
+    pub fn encode_target_444(&self, ten_bit: bool) -> Result<(VAProfile, VAEntrypoint)> {
+        let wanted: &[VAProfile] = if ten_bit {
+            &[crate::ffi::va::VAProfileHEVCMain444_10]
+        } else {
+            &[crate::ffi::va::VAProfileHEVCMain444]
+        };
+        let mut profiles = vec![0 as VAProfile; self.max_profiles()?];
+        let mut found: c_int = 0;
+        // SAFETY: the buffer is writable for the length the interface was told
+        // about, and the count is written back.
+        let status = unsafe {
+            (self.va.query_config_profiles)(self.raw, profiles.as_mut_ptr(), &raw mut found)
+        };
+        self.va.check(status)?;
+        let available = profiles.get(..count(found)).unwrap_or(&[]);
+
+        for wanted in wanted {
+            if !available.contains(wanted) {
+                continue;
+            }
+            if let Some(entrypoint) = self.encode_entrypoint(*wanted)? {
+                return Ok((*wanted, entrypoint));
+            }
+        }
+        Err(Error::NoEncoder)
+    }
+
+    /// The capabilities of a 4:4:4 configuration, asked of the device.
+    ///
+    /// The shipped path asks [`Display::caps_at`]; this asks the profile that
+    /// path does not name. The runtime-format check is the 4:4:4 one, so a
+    /// device that lists the profile but takes only 4:2:0 surfaces reports a
+    /// refusal rather than a configuration that cannot be built.
+    pub fn caps_444(&self, ten_bit: bool) -> Result<Caps> {
+        let (profile, entrypoint) = self.encode_target_444(ten_bit)?;
+        let mut attribs = [
+            VAConfigAttrib {
+                type_: VAConfigAttribRTFormat,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribRateControl,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribEncPackedHeaders,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: crate::ffi::va::VAConfigAttribEncQualityRange,
+                value: 0,
+            },
+        ];
+        // SAFETY: the array is writable for the length passed.
+        let status = unsafe {
+            (self.va.get_config_attributes)(
+                self.raw,
+                profile,
+                entrypoint,
+                attribs.as_mut_ptr(),
+                c_int::try_from(attribs.len()).unwrap_or(0),
+            )
+        };
+        self.va.check(status)?;
+
+        let value = |attrib: &VAConfigAttrib| {
+            if attrib.value == VA_ATTRIB_NOT_SUPPORTED {
+                0
+            } else {
+                attrib.value
+            }
+        };
+        if value(&attribs[0]) & runtime_format_444(ten_bit) == 0 {
+            return Err(Error::NoEncoder);
+        }
+        Ok(Caps {
+            profile,
+            entrypoint,
+            ten_bit,
+            chroma_444: true,
+            rate_control: value(&attribs[1]),
+            packed_headers: value(&attribs[2]),
+            quality_range: value(&attribs[3]),
+        })
+    }
+
+    /// What the driver will bind as an encode surface under a configuration.
+    ///
+    /// **The 4:4:4 question the shipped path cannot answer, and the reason
+    /// this method exists.** The conversion writes the layout the encoder
+    /// reads, so the four-character codes named here decide whether a 4:4:4
+    /// path is a second shader with a third plane or something else entirely.
+    /// Asked against a built configuration because the driver's answer is per
+    /// profile and entry point, not a global list.
+    ///
+    /// The runtime format is a parameter rather than a constant for the same
+    /// reason the probe asks both: the 4:4:4 answer is only readable next to
+    /// the 4:2:0 one the shipped path already uses, and the two must come
+    /// from the same call.
+    #[cfg(test)]
+    fn surface_attributes(&self, caps: Caps, rt_format: u32) -> Result<Vec<VASurfaceAttrib>> {
+        let mut wanted = [
+            VAConfigAttrib {
+                type_: VAConfigAttribRTFormat,
+                value: rt_format,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribRateControl,
+                value: if caps.rate_control & VA_RC_VBR != 0 {
+                    VA_RC_VBR
+                } else if caps.rate_control & VA_RC_CBR != 0 {
+                    VA_RC_CBR
+                } else {
+                    VA_RC_CQP
+                },
+            },
+        ];
+
+        let mut config: VAConfigID = 0;
+        // SAFETY: the array is readable for the length passed and the output
+        // is a live local.
+        let status = unsafe {
+            (self.va.create_config)(
+                self.raw,
+                caps.profile,
+                caps.entrypoint,
+                wanted.as_mut_ptr(),
+                c_int::try_from(wanted.len()).unwrap_or(0),
+                &raw mut config,
+            )
+        };
+        self.va.check(status)?;
+
+        let mut count: c_uint = 0;
+        // SAFETY: a null list makes the call report the count it would fill.
+        let status = unsafe {
+            (self.va.query_surface_attributes)(
+                self.raw,
+                config,
+                core::ptr::null_mut(),
+                &raw mut count,
+            )
+        };
+        if let Err(error) = self.va.check(status) {
+            // SAFETY: created above and owned by this scope until the destroy.
+            unsafe { (self.va.destroy_config)(self.raw, config) };
+            return Err(error.into());
+        }
+
+        let mut list = vec![
+            // SAFETY: the interface writes every field it reports.
+            unsafe { core::mem::zeroed::<VASurfaceAttrib>() };
+            usize::try_from(count).unwrap_or(0)
+        ];
+        // SAFETY: the list is writable for its length, which is the count the
+        // driver reported for this configuration, and the count is read back.
+        let status = unsafe {
+            (self.va.query_surface_attributes)(self.raw, config, list.as_mut_ptr(), &raw mut count)
+        };
+        let result = self.va.check(status);
+        // SAFETY: created above; destroyed once, after the last query that
+        // names it.
+        unsafe { (self.va.destroy_config)(self.raw, config) };
+        result?;
+        list.truncate(usize::try_from(count).unwrap_or(0));
+        Ok(list)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// Which render node these tests run against.
+    ///
+    /// **Nameable, because a machine with two cards has an encoder on each and
+    /// they do not answer the same.** A constant here can only ever measure
+    /// whichever node the loader numbered first, and the second card is
+    /// exactly where a backend's assumptions get found out. Set
+    /// `LOWLAT_VAAPI_NODE` to point it elsewhere.
+    fn node() -> CString {
+        let named =
+            std::env::var("LOWLAT_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        CString::new(named).expect("a node path with no interior nul")
+    }
+
+    /// The low-delay B decision, from the words two drivers actually answer
+    /// for HEVC Main.
+    ///
+    /// Intel's low-power entry point on Alder Lake (iHD 26.1.2) reports every
+    /// direction including the second list's, and three references in each
+    /// list; handed predicted slices it hangs the video engine. The AMD open
+    /// driver (radeonsi, Mesa 26.0.8) reports no direction and no second list,
+    /// and codes predicted slices as it always has.
+    #[test]
+    fn low_delay_b_is_asked_for_only_where_a_device_needs_it() {
+        let both_lists = (3 << 16) | 3;
+        assert!(needs_low_delay_b(0x7, both_lists), "Intel, Alder Lake");
+        assert!(
+            !needs_low_delay_b(VA_ATTRIB_NOT_SUPPORTED, 1),
+            "AMD, radeonsi"
+        );
+        // A second list that is required but has no room cannot be used.
+        assert!(!needs_low_delay_b(0x5, 3));
+        // No constraint on the second list: predicted slices are fine.
+        assert!(!needs_low_delay_b(0x3, both_lists));
+        assert!(!needs_low_delay_b(0x7, VA_ATTRIB_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn profiles_are_listed_best_first() {
+        // High before Main, because every decoder that matters takes High and
+        // it is what a peer expects.
+        assert_eq!(Codec::H264.profiles(false)[0], VAProfileH264High);
+        assert!(Codec::H264.profiles(false).contains(&VAProfileH264Main));
+        assert_eq!(Codec::H265.profiles(false), &[VAProfileHEVCMain]);
+        // **Ten bits is a different profile, not the same one configured.**
+        // A device offering Main and not Main 10 must be found to have no
+        // encoder for the depth rather than handed Main and told ten bits.
+        assert_eq!(Codec::H265.profiles(true), &[VAProfileHEVCMain10]);
+        assert_eq!(
+            Codec::H264.profiles(true),
+            Codec::H264.profiles(false),
+            "no H.264 profile here codes above eight bits"
+        );
+    }
+
+    /// What the driver offers, and a context built on it.
+    ///
+    /// The packed-header answer bounds how much code this backend may need,
+    /// but does not decide it: it reports what the driver will accept, not
+    /// what it requires. Which of those applies is settled by encoding a frame
+    /// and seeing whether parameter sets come out unasked.
+    #[test]
+    #[ignore = "requires the open-stack driver"]
+    fn the_driver_reports_what_it_will_do_and_a_context_builds() {
+        let va = Vaapi::load().expect("runtime");
+        let display = Display::open(&va, &node()).expect("render node");
+
+        for codec in [Codec::H264, Codec::H265] {
+            let caps = display.caps(codec).expect("caps");
+            println!(
+                "{codec:?}: profile {} rate-control {:#x} packed-headers {:#x} \
+                 (variable rate {}, accepts our headers {})",
+                caps.profile,
+                caps.rate_control,
+                caps.packed_headers,
+                caps.has_variable_rate(),
+                caps.accepts_packed_headers()
+            );
+            assert!(
+                caps.has_variable_rate(),
+                "no bitrate-carrying rate control: the congestion actuator cannot exist"
+            );
+
+            let context = display
+                .create_context(caps, 1920, 1080, 4)
+                .expect("context");
+            assert_eq!(context.surfaces().len(), 4);
+            // **Zero is a surface, not a failure.** The interface spells an
+            // absent surface as its own sentinel, and one vendor's driver
+            // numbers its pool from one while another numbers it from zero, so
+            // reading zero as unallocated fails on the second for no reason.
+            assert!(
+                context
+                    .surfaces()
+                    .iter()
+                    .all(|id| *id != crate::ffi::va::VA_INVALID_SURFACE)
+            );
+
+            // **The two pools must not intersect.** A picture read from the
+            // same surface it reconstructs into makes the driver release the
+            // buffer it is about to read, and the fault surfaces pictures
+            // later, inside the driver, with nothing naming a surface.
+            assert_eq!(context.recon().len(), context.surfaces().len());
+            assert!(
+                context
+                    .recon()
+                    .iter()
+                    .all(|id| !context.surfaces().contains(id)),
+                "a surface is serving as both the source and its own reconstruction"
+            );
+            println!("  context built with {} surfaces", context.surfaces().len());
+        }
+    }
+
+    /// Encode real pictures, and answer three things at once: whether this
+    /// backend's collect can ask rather than wait, whether the driver takes
+    /// our parameter sets, and whether the colour description reads back the
+    /// way it is meant to.
+    ///
+    /// The last one is the check the parameter-set writer has been owed since
+    /// it was written: it is verified by a decoder that knows nothing about
+    /// how these bytes were produced.
+    #[test]
+    #[ignore = "requires the open-stack driver"]
+    fn it_encodes_and_the_stream_says_what_we_wrote() {
+        use std::time::Instant;
+
+        let va = Vaapi::load().expect("runtime");
+        let display = Display::open(&va, &node()).expect("render node");
+        let caps = display.caps(Codec::H264).expect("caps");
+        let context = display
+            .create_context(caps, 1920, 1080, 4)
+            .expect("context");
+
+        let params = crate::h264::Params {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            level_idc: 42,
+            // **Not zero, deliberately.** These size fixed-width fields in
+            // every slice header, so a value the writer and the sequence set
+            // disagree on shifts everything after them. Zero would wrap the
+            // frame number every sixteen pictures and hide that; four is what
+            // a real stream uses and exercises the width plumbing.
+            log2_max_frame_num_minus4: 4,
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: 1,
+        };
+        let mut encoder = context
+            .encoder(Params::H264(params), 20_000_000)
+            .expect("encoder");
+        let mut source = lowlat_capture::synthetic::Synthetic::new(1920, 1080);
+
+        let mut stream = Vec::new();
+        let mut slowest_pending = std::time::Duration::ZERO;
+        let mut pending = 0usize;
+        let mut polls = 0usize;
+
+        // The whole pool in flight, which is the shape the pipeline runs in.
+        // The knob stays so a single picture can be compared against a full
+        // queue, which is how the depth question was settled once already.
+        let burst: usize = std::env::var("LOWLAT_VA_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        for _ in 0..burst {
+            encoder.submit(&source.acquire(), false).expect("submit");
+        }
+        // **More pictures than the pool is deep**, so the run refills behind
+        // the drain. At four the queue is filled once and emptied once, and
+        // anything that only affects a later submission -- a rate change, for
+        // one -- silently affects nothing at all.
+        const PICTURES: usize = 8;
+
+        let drain_started = Instant::now();
+        let mut collected = 0usize;
+        let mut submitted = burst;
+        while collected < PICTURES {
+            if submitted < PICTURES && encoder.in_flight() < burst {
+                encoder.submit(&source.acquire(), false).expect("submit");
+                submitted += 1;
+            }
+            let started = Instant::now();
+            let polled = encoder.poll().expect("poll");
+            let took = started.elapsed();
+            polls += 1;
+            match polled {
+                Poll::Ready { bitstream, .. } => {
+                    assert!(!bitstream.is_empty(), "an empty picture");
+                    stream.extend_from_slice(bitstream);
+                    collected += 1;
+                }
+                Poll::Pending => {
+                    pending += 1;
+                    slowest_pending = slowest_pending.max(took);
+                    std::hint::spin_loop();
+                }
+            }
+
+            // The rate moves mid-run, and the assertions above are what make
+            // it mean something: exactly one refresh in the whole run, so a
+            // reconfigure that forced one would be caught here rather than
+            // merely described.
+            if collected == 2 {
+                encoder.reconfigure(10_000_000);
+            }
+        }
+        let drain = drain_started.elapsed();
+        println!(
+            "drain of {collected} {drain:?}, polls {polls} of which {pending} pending \
+             (slowest pending {slowest_pending:?}), {} bytes",
+            stream.len()
+        );
+
+        // A parameter set leads, which means the driver took ours.
+        assert_eq!(&stream[..4], &[0, 0, 0, 1], "no start code");
+        assert_eq!(
+            stream[4] & 0x1F,
+            7,
+            "the stream does not open with our sequence set"
+        );
+
+        // **Every picture is there, and carries its own sets.** Checking only
+        // the leading unit passes a stream that emitted one picture and then
+        // stopped, which is exactly the failure this backend had. Escaping
+        // makes a three-byte start code impossible inside a payload, so
+        // counting them is exact rather than approximate.
+        let mut units = [0usize; 32];
+        for window in stream.windows(4) {
+            if window[..3] == [0, 0, 1] {
+                units[usize::from(window[3] & 0x1F)] += 1;
+            }
+        }
+        // **One refresh, and the rest predicted.** A backend that refreshed
+        // every picture would pass a count of slices and fail this.
+        assert_eq!(units[5], 1, "more than the one unavoidable refresh");
+        assert_eq!(units[1], collected - 1, "the rest are not predicted slices");
+        assert_eq!(
+            units[7], 1,
+            "a sequence set travelled with a predicted picture"
+        );
+        assert_eq!(
+            units[8], 1,
+            "a picture set travelled with a predicted picture"
+        );
+
+        let path = std::env::var("LOWLAT_DUMP").unwrap_or_else(|_| "/tmp/vaapi.h264".into());
+        std::fs::write(&path, &stream).expect("write");
+        println!("wrote {path}");
+    }
+
+    /// The second codec, through the same loop.
+    ///
+    /// **A half-correct path here encodes without error and decodes to
+    /// nothing**, so the checks are on what the units say rather than on the
+    /// calls returning success: which types came out, how many of each, and
+    /// whether the driver took the three sets we wrote.
+    #[test]
+    #[ignore = "requires the open-stack driver"]
+    fn the_second_codec_encodes_and_the_driver_takes_our_sets() {
+        let va = Vaapi::load().expect("runtime");
+        let display = Display::open(&va, &node()).expect("render node");
+        // **A knob for the same reason the height is one**: the depth changes
+        // the profile, the runtime layout and two fields of the sequence set
+        // together, and the only way to know they agree is to encode at both
+        // and read what came out with something that is not this code. The
+        // chroma knob does the same one level up: the full-chroma profile,
+        // the packed runtime layout and the range-extension sets all have to
+        // name the same thing.
+        let ten_bit = std::env::var("LOWLAT_PROBE_TEN_BIT").is_ok_and(|v| v != "0");
+        let chroma_444 = std::env::var("LOWLAT_PROBE_CHROMA").is_ok_and(|v| v == "444");
+        let caps = if chroma_444 {
+            match display.caps_444(ten_bit) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    println!("this device offers no ten_bit={ten_bit} 4:4:4 encoder: {error}");
+                    return;
+                }
+            }
+        } else {
+            match display.caps_at(Codec::H265, ten_bit) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    println!("this device offers no ten_bit={ten_bit} encoder for H.265: {error}");
+                    return;
+                }
+            }
+        };
+        // **The height is a knob because the rounding had to be measured.**
+        // The device codes at its own alignment and corrects the size in the
+        // sets it is handed, so what that alignment is cannot be read off one
+        // resolution: 1080 and 1000 both round up, 1200 does not, and only the
+        // three together name the unit. It stays so another device can be
+        // asked the same question.
+        let height: u32 = std::env::var("LOWLAT_PROBE_HEIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1080);
+        let context = display
+            .create_context(caps, 1920, height, 4)
+            .expect("context");
+
+        let params = crate::h265::Params {
+            width: 1920,
+            height,
+            fps: 60,
+            level_idc: 123,
+            // As on the other codec: not zero, so the fixed-width order count
+            // in every slice header is actually exercised.
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: 1,
+            transform_depth: crate::h265::TRANSFORM_HIERARCHY_DEPTH,
+            bit_depth_minus8: if ten_bit { 2 } else { 0 },
+            chroma_444,
+        };
+        let mut encoder = context
+            .encoder(Params::H265(params), 20_000_000)
+            .expect("encoder");
+        let mut source = lowlat_capture::synthetic::Synthetic::new(1920, height);
+
+        const PICTURES: usize = 8;
+        const DEPTH: usize = 4;
+        let mut stream = Vec::new();
+        let mut collected = 0usize;
+        let mut submitted = 0usize;
+        while collected < PICTURES {
+            if submitted < PICTURES && encoder.in_flight() < DEPTH {
+                encoder.submit(&source.acquire(), false).expect("submit");
+                submitted += 1;
+            }
+            match encoder.poll().expect("poll") {
+                Poll::Ready { bitstream, .. } => {
+                    assert!(!bitstream.is_empty(), "an empty picture");
+                    stream.extend_from_slice(bitstream);
+                    collected += 1;
+                }
+                Poll::Pending => std::hint::spin_loop(),
+            }
+        }
+        println!("collected {collected} pictures, {} bytes", stream.len());
+
+        // **The type is six bits of the byte after the start code on this
+        // codec**, not five, so a reader written for the other one lands on a
+        // plausible wrong answer rather than failing.
+        let mut units = [0usize; 64];
+        for window in stream.windows(4) {
+            if window[..3] == [0, 0, 1] {
+                units[usize::from((window[3] >> 1) & 0x3F)] += 1;
+            }
+        }
+        assert_eq!(units[32], 1, "the video set is missing or repeated");
+        assert_eq!(units[33], 1, "the sequence set is missing or repeated");
+        assert_eq!(units[34], 1, "the picture set is missing or repeated");
+        // One refresh, and the rest predicted. A backend refreshing every
+        // picture would pass a count of slices and fail this.
+        assert_eq!(
+            units[usize::from(crate::h265::NAL_IDR_N_LP)],
+            1,
+            "more than the one unavoidable refresh"
+        );
+        assert_eq!(
+            units[usize::from(crate::h265::NAL_TRAIL_R)],
+            collected - 1,
+            "the rest are not predicted slices"
+        );
+
+        let path = std::env::var("LOWLAT_DUMP").unwrap_or_else(|_| "/tmp/vaapi.h265".into());
+        std::fs::write(&path, &stream).expect("write");
+        println!("wrote {path}");
+    }
+
+    /// **A set may not declare a transform tree deeper than the device codes.**
+    ///
+    /// This is the invariant the HEVC picture was wrong for: declaring four
+    /// where the device codes two produces a stream that encodes without
+    /// error, decodes without error, and carries the first row of blocks
+    /// followed by nothing that resembles the picture. No decode-error count
+    /// catches it, which is why the check is on the declaration rather than on
+    /// the output.
+    #[test]
+    #[ignore = "requires the open-stack driver"]
+    fn a_set_never_declares_a_deeper_transform_tree_than_the_device_codes() {
+        let va = Vaapi::load().expect("runtime");
+        let display = Display::open(&va, &node()).expect("render node");
+        let caps = display.caps(Codec::H265).expect("caps");
+        let Some(device) = display.transform_depth(caps) else {
+            println!("  this device does not report a depth; nothing to clamp against");
+            return;
+        };
+        let context = display
+            .create_context(caps, 1920, 1080, 2)
+            .expect("context");
+        let asked = crate::h265::Params {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            level_idc: 123,
+            log2_max_poc_lsb_minus4: 4,
+            max_num_ref_frames: 1,
+            transform_depth: crate::h265::TRANSFORM_HIERARCHY_DEPTH,
+            bit_depth_minus8: 0,
+            chroma_444: false,
+        };
+        let encoder = context
+            .encoder(Params::H265(asked), 10_000_000)
+            .expect("encoder");
+        let Params::H265(got) = encoder.params else {
+            panic!("the parameters changed codec");
+        };
+        println!(
+            "  device says {device}, asked {}, declared {}",
+            asked.transform_depth, got.transform_depth
+        );
+        assert!(
+            got.transform_depth <= device,
+            "declared a tree {} deep against a device that codes {device}",
+            got.transform_depth
+        );
+    }
+
+    /// The packed full-chroma export imports into the display interface and
+    /// encodes, on the device where both interfaces are the same card.
+    ///
+    /// **The zero-copy question for the open backend.** The conversion writes
+    /// a packed AYUV or Y410 surface, the descriptor travels over the display
+    /// interface, and the driver must accept the four-character code and the
+    /// layout it names; a refusal here is the refusal the live path would
+    /// meet, and it is the one check nothing else in the suite makes.
+    #[test]
+    #[ignore = "requires the open-stack driver and its display interface"]
+    fn the_packed_444_export_imports_and_encodes() {
+        let va = Vaapi::load().expect("runtime");
+        let display = Display::open(&va, &node()).expect("render node");
+        let ten_bit = std::env::var("LOWLAT_PROBE_TEN_BIT").is_ok_and(|v| v != "0");
+        // **The subsampled layout through this same path is the control.**
+        // Everything else -- the content, the conversion, the export, the
+        // import, the sets, the device -- is held still, so a run that is
+        // healthy here and sick at full chroma has named the chroma as the
+        // variable rather than the zero-copy path or the driver.
+        let full = !std::env::var("LOWLAT_PROBE_CHROMA").is_ok_and(|v| v == "420");
+        let caps = if full {
+            display.caps_444(ten_bit)
+        } else {
+            display.caps_at(Codec::H265, ten_bit)
+        };
+        let Ok(caps) = caps else {
+            println!("this device offers no such encoder; nothing to import into");
+            return;
+        };
+
+        // The conversion device has to be the card behind the display, so the
+        // descriptor stays on one device. The node is the display's own; on a
+        // machine where that card is not the open-stack one, the test skips
+        // rather than importing another vendor's descriptor.
+        let Ok(device) =
+            lowlat_capture::vulkan::Device::for_display(std::path::Path::new("/dev/dri/card0"))
+        else {
+            println!("the display's card does not open; nothing to import into");
+            return;
+        };
+        if !device.name().contains("Arc") {
+            println!(
+                "the display device is {}, not the card behind the node",
+                device.name()
+            );
+            return;
+        }
+
+        // **The size and the frame count are the stream's, not the driver's
+        // minimum.** One small picture of one colour cannot fail: every row
+        // length describes a uniform plane correctly, one workgroup covers the
+        // extent, and a lone intra picture predicts nothing. A wrong pitch, a
+        // dispatch that misses the edge and a broken reference all need a real
+        // size and more than one picture before they can show.
+        let width = sized("LOWLAT_PROBE_WIDTH", 1920);
+        let height = sized("LOWLAT_PROBE_HEIGHT", 1080);
+        let frames = sized("LOWLAT_PROBE_FRAMES", 8) as usize;
+        let all_intra = std::env::var("LOWLAT_ALL_INTRA").is_ok_and(|v| v != "0");
+        let block = sized("LOWLAT_PROBE_BLOCK", 64) as usize;
+        let still = std::env::var("LOWLAT_PROBE_STILL").is_ok_and(|v| v != "0");
+        let depth = if ten_bit {
+            lowlat_capture::convert::Depth::Ten
+        } else {
+            lowlat_capture::convert::Depth::Eight
+        };
+
+        // **However many targets a stream keeps in flight, not one.** A live
+        // pipeline converts into a ring of them and hands the encoder a
+        // different surface every picture, so a fault that needs two
+        // allocations to show -- one read past its end into the next, a
+        // registration paired with the wrong slot -- cannot appear at all
+        // against a single target however long the run is.
+        let targets = sized("LOWLAT_PROBE_TARGETS", 1) as usize;
+        // **The surface is the coded size, not the visible one.** The device
+        // codes whole blocks and the sets crop the difference, so a picture
+        // whose height is not a multiple of the coding alignment is coded
+        // taller than it is shown -- and the surface it is coded out of has to
+        // carry those rows, or the encoder reads past the allocation for them.
+        // The knob is here to put the fault back: without the rows, the
+        // colour of the first ones doubles once a picture and saturates.
+        let (wide, tall) = if std::env::var("LOWLAT_PROBE_PAD").is_ok_and(|v| v == "0") {
+            (width, height)
+        } else {
+            crate::h265::coded_size(width, height)
+        };
+        let mut packed = Vec::new();
+        let mut planar = Vec::new();
+        for _ in 0..targets.max(1) {
+            if full {
+                packed.push(
+                    device
+                        .allocate_packed_444(wide, tall, depth)
+                        .expect("a packed target"),
+                );
+            } else {
+                planar.push(
+                    device
+                        .allocate_planar(wide, tall, depth)
+                        .expect("a subsampled target"),
+                );
+            }
+        }
+        let target = |slot: usize| {
+            packed.get(slot).map_or_else(
+                || planar.get(slot).expect("a target for the slot").target(),
+                lowlat_capture::convert::Packed444::target,
+            )
+        };
+        let mut converter = lowlat_capture::convert::Converter::new(&device).expect("a pipeline");
+        let mut surfaces = Vec::with_capacity(targets.max(1));
+        for slot in 0..targets.max(1) {
+            let (fd, exported) = match (packed.get(slot), planar.get(slot)) {
+                (Some(frame), _) => device.export_packed_444(frame, true),
+                (_, Some(frame)) => device.export_nv12(frame, true),
+                _ => unreachable!("a target is allocated for every slot"),
+            }
+            .expect("export the frame");
+            surfaces.push(
+                display
+                    .import(std::os::fd::AsFd::as_fd(&fd), &exported)
+                    .expect("import the frame"),
+            );
+        }
+
+        let context = display
+            .create_context(caps, width, height, 2)
+            .expect("context");
+        let mut encoder = context
+            .encoder(
+                Params::H265(crate::h265::Params {
+                    width,
+                    height,
+                    fps: 60,
+                    level_idc: 123,
+                    log2_max_poc_lsb_minus4: 4,
+                    max_num_ref_frames: 1,
+                    transform_depth: crate::h265::TRANSFORM_HIERARCHY_DEPTH,
+                    bit_depth_minus8: if ten_bit { 2 } else { 0 },
+                    chroma_444: full,
+                }),
+                sized("LOWLAT_PROBE_BPS", 40_000_000),
+            )
+            .expect("encoder");
+
+        // **What was fed is kept beside what came out, every picture of it.**
+        // A comparison against the first picture alone reads like a correct
+        // run whatever happens afterwards: the failure this is looking for
+        // starts right and walks away, so the trajectory across the run is the
+        // reading and an average over it is not.
+        let mut fed = Vec::new();
+        let mut stream = Vec::new();
+        for frame in 0..frames {
+            let slot = frame % targets.max(1);
+            let pixels = detailed(width, height, block, frame, still);
+            let source = device
+                .upload_rgba(width, height, &pixels)
+                .expect("upload a pattern");
+            converter
+                .run(&device, &source, &target(slot), false)
+                .expect("convert");
+            match (packed.get(slot), planar.get(slot)) {
+                (Some(frame), _) => {
+                    fed.extend_from_slice(
+                        &device
+                            .read_packed_444(frame)
+                            .expect("read back what was fed"),
+                    );
+                }
+                (_, Some(frame)) => {
+                    let (luma, chroma) = device.read_nv12(frame).expect("read back what was fed");
+                    fed.extend_from_slice(&luma);
+                    fed.extend_from_slice(&chroma);
+                }
+                _ => unreachable!("a target is allocated for every slot"),
+            }
+            device.release(source);
+            // **Refreshing every picture is the discriminator.** With nothing
+            // referencing anything, drift has nowhere to accumulate: a run
+            // that decays anyway is decaying per picture, and one that goes
+            // flat was decaying through its references.
+            encoder
+                .submit_registered(surfaces[slot], all_intra || frame == 0)
+                .expect("submit");
+            loop {
+                match encoder.poll().expect("poll") {
+                    Poll::Ready { bitstream, .. } => {
+                        stream.extend_from_slice(bitstream);
+                        break;
+                    }
+                    Poll::Pending => std::hint::spin_loop(),
+                }
+            }
+        }
+
+        let path =
+            std::env::var("LOWLAT_DUMP").unwrap_or_else(|_| "/tmp/vaapi-444-import.h265".into());
+        std::fs::write(&path, &stream).expect("write");
+        std::fs::write(format!("{path}.fed"), &fed).expect("write what was fed");
+        println!(
+            "imported and encoded {frames} {}-bit {} picture(s) of {width}x{height}, \
+             {} bytes, to {path}; every picture as fed is {path}.fed",
+            if ten_bit { 10 } else { 8 },
+            if full { "4:4:4" } else { "4:2:0" },
+            stream.len()
+        );
+        for surface in surfaces {
+            display.release(surface);
+        }
+    }
+
+    /// A size or count from the environment, so one run can be widened without
+    /// a rebuild.
+    fn sized(name: &str, fallback: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(fallback)
+    }
+
+    /// Saturated colour blocks that shift with the frame.
+    ///
+    /// **Flat inside, sharp at the edge, and that is deliberate.** The chroma
+    /// detail that distinguishes full chroma from an upsample lives at a
+    /// one-pixel colour transition, which a block edge is; the flat interiors
+    /// keep the picture codeable, so a healthy run reads near-lossless and any
+    /// drift stands clear of the quantiser instead of being buried in it. A
+    /// block size of one gives the per-pixel version, which no encoder can
+    /// carry and which therefore measures the quantiser rather than this path.
+    ///
+    /// **Grey is deliberately absent.** A grey pixel has equal channels, so
+    /// every luma matrix returns the same answer for it and it carries no
+    /// chroma at all.
+    fn detailed(width: u32, height: u32, block: usize, frame: usize, still: bool) -> Vec<u8> {
+        const COLOURS: [[u8; 3]; 8] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 0],
+            [0, 255, 255],
+            [255, 0, 255],
+            [255, 255, 255],
+            [0, 0, 0],
+        ];
+        let (w, h) = (width as usize, height as usize);
+        let block = block.max(1);
+        let mut pixels = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                // The shift is one pixel a frame, so a predicted picture has
+                // motion to describe rather than a repeat of its reference.
+                //
+                // **Held still, it separates the reference from the coding.**
+                // A predicted picture identical to the one before it has no
+                // motion and no residual to carry, so what a decoder shows is
+                // its own reconstruction of the reference and nothing else: a
+                // run that is right here and wrong once the picture moves has
+                // a working reference and a coding fault, and one that is
+                // wrong here has neither.
+                let bx = if still {
+                    x / block
+                } else {
+                    (x + frame) / block
+                };
+                let by = y / block;
+                let colour = COLOURS[(bx + by * 3) % COLOURS.len()];
+                let at = (y * w + x) * 4;
+                pixels[at] = colour[0];
+                pixels[at + 1] = colour[1];
+                pixels[at + 2] = colour[2];
+                pixels[at + 3] = 255;
+            }
+        }
+        pixels
+    }
+
+    /// Needs the open-stack driver, so it is off by default. Run with
+    /// `cargo test -p lowlat-encode -- --ignored`.
+    #[test]
+    #[ignore = "requires the open-stack driver"]
+    fn the_display_opens_and_reports_an_encoder() {
+        let va = match Vaapi::load() {
+            Ok(va) => va,
+            Err(lowlat_drivers::va::Error::Unavailable) => {
+                panic!("no runtime present; this test needs the driver")
+            }
+            Err(error) => panic!("{error}"),
+        };
+        let display = Display::open(&va, &node()).expect("render node did not open");
+        let (major, minor) = display.version();
+        println!("display interface {major}.{minor}");
+        assert!(major >= 1);
+
+        for codec in [Codec::H264, Codec::H265] {
+            let (profile, entrypoint) = display.encode_target(codec).expect("no encode profile");
+            println!("  {codec:?} encodes with profile {profile} through entry point {entrypoint}");
+        }
+
+        // A profile the driver does not encode must be refused rather than
+        // substituted, which is what makes the answers above mean anything.
+        assert!(
+            display
+                .encode_entrypoint(crate::ffi::va::VAProfileNone)
+                .expect("query")
+                .is_none(),
+            "the driver claims an encode entry point for no profile at all"
+        );
+    }
+
+    /// What layouts a device will bind as a 4:4:4 encode surface, asked of
+    /// the driver rather than read off a support matrix.
+    ///
+    /// **The question the 4:4:4 decision needs answered before any code.**
+    /// The conversion writes the layout the encoder reads, so the
+    /// four-character codes named here decide whether a 4:4:4 path is a
+    /// second shader with a third plane or something else entirely. The
+    /// 4:2:0 answers come back from the same call, so the comparison cannot
+    /// drift. The memory types say whether a 4:4:4 surface can be imported
+    /// through DRM prime at all; the shipped path's zero copy depends on it.
+    #[test]
+    #[ignore = "requires the open-stack driver"]
+    fn the_444_surface_layouts_are_what_the_driver_says() {
+        let va = Vaapi::load().expect("runtime");
+
+        // Every render node, because the question is per device and the two
+        // cards here do not answer the same. An explicit node narrows it.
+        let mut nodes = Vec::new();
+        if let Ok(named) = std::env::var("LOWLAT_VAAPI_NODE") {
+            nodes.push(named);
+        } else {
+            let found = std::fs::read_dir("/dev/dri").expect("no /dev/dri");
+            nodes = found
+                .flatten()
+                .map(|entry| entry.path().display().to_string())
+                .filter(|path| path.contains("renderD"))
+                .collect();
+            nodes.sort();
+        }
+
+        for node in nodes {
+            let path = CString::new(node.as_str()).expect("a node path with no interior nul");
+            let Ok(display) = Display::open(&va, &path) else {
+                println!("{node}: does not open");
+                continue;
+            };
+            println!("{node} (display interface {})", display.version().0);
+            for ten_bit in [false, true] {
+                let depth = if ten_bit { "10-bit" } else { "8-bit" };
+                // The shipped path, as the cross-check the 4:4:4 answers are
+                // read against.
+                match display.caps_at(Codec::H265, ten_bit) {
+                    Ok(caps) => {
+                        println!(
+                            "  4:2:0 {depth}: {} through {}",
+                            profile_name(caps.profile),
+                            entrypoint_name(caps.entrypoint)
+                        );
+                        match display.surface_attributes(caps, runtime_format(ten_bit)) {
+                            Ok(attribs) => print_surface_attributes(&attribs),
+                            Err(error) => println!("    surface attributes refused: {error}"),
+                        }
+                    }
+                    Err(error) => println!("  4:2:0 {depth}: no encoder ({error})"),
+                }
+                match display.caps_444(ten_bit) {
+                    Ok(caps) => {
+                        println!(
+                            "  4:4:4 {depth}: {} through {}",
+                            profile_name(caps.profile),
+                            entrypoint_name(caps.entrypoint)
+                        );
+                        match display.surface_attributes(caps, runtime_format_444(ten_bit)) {
+                            Ok(attribs) => print_surface_attributes(&attribs),
+                            Err(error) => println!("    surface attributes refused: {error}"),
+                        }
+                    }
+                    Err(error) => println!("  4:4:4 {depth}: no encoder ({error})"),
+                }
+            }
+        }
+    }
+
+    /// One attribute line, with the values this question cares about decoded.
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the driver reports these values through a signed field; the bits are what matter"
+    )]
+    #[expect(
+        non_upper_case_globals,
+        reason = "the constants keep the vendored interface's C naming"
+    )]
+    fn print_surface_attributes(attribs: &[VASurfaceAttrib]) {
+        use crate::ffi::va::{
+            VASurfaceAttribExternalBufferDescriptor, VASurfaceAttribMaxHeight,
+            VASurfaceAttribMaxWidth, VASurfaceAttribMemoryType, VASurfaceAttribMinHeight,
+            VASurfaceAttribMinWidth, VASurfaceAttribPixelFormat, VASurfaceAttribUsageHint,
+        };
+        for attrib in attribs {
+            match attrib.type_ {
+                VASurfaceAttribPixelFormat => {
+                    println!("    pixel format {}", fourcc(int(attrib)))
+                }
+                VASurfaceAttribMinWidth => println!("    min width {}", int(attrib)),
+                VASurfaceAttribMaxWidth => println!("    max width {}", int(attrib)),
+                VASurfaceAttribMinHeight => println!("    min height {}", int(attrib)),
+                VASurfaceAttribMaxHeight => println!("    max height {}", int(attrib)),
+                VASurfaceAttribMemoryType => {
+                    println!("    memory types {}", memory_types(int(attrib) as u32))
+                }
+                VASurfaceAttribExternalBufferDescriptor => {
+                    println!("    external buffer descriptor")
+                }
+                VASurfaceAttribUsageHint => println!("    usage hint {}", int(attrib)),
+                other => println!("    attribute {other}"),
+            }
+        }
+    }
+
+    /// The integer an attribute was reported as.
+    ///
+    /// **A union read, and the only one this test makes.** The driver fills
+    /// the union as an integer and nothing here reads it as anything else.
+    fn int(attrib: &VASurfaceAttrib) -> i32 {
+        // SAFETY: the driver sets the type tag to integer and writes this
+        // member; the same tag is how each caller chose this helper.
+        unsafe { attrib.value.value.i }
+    }
+
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the fourcc travels through a signed field; the bytes are what matter"
+    )]
+    fn fourcc(value: i32) -> String {
+        let bytes = (value as u32).to_le_bytes();
+        let mut out = String::with_capacity(4);
+        for byte in bytes {
+            out.push(if (0x20..=0x7e).contains(&byte) {
+                byte as char
+            } else {
+                '?'
+            });
+        }
+        out
+    }
+
+    /// Which import paths a surface takes, decoded rather than printed as a
+    /// word.
+    fn memory_types(bits: u32) -> String {
+        use crate::ffi::va::{
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            VA_SURFACE_ATTRIB_MEM_TYPE_KERNEL_DRM, VA_SURFACE_ATTRIB_MEM_TYPE_USER_PTR,
+            VA_SURFACE_ATTRIB_MEM_TYPE_V4L2, VA_SURFACE_ATTRIB_MEM_TYPE_VA,
+        };
+        let names = [
+            (VA_SURFACE_ATTRIB_MEM_TYPE_VA, "va"),
+            (VA_SURFACE_ATTRIB_MEM_TYPE_V4L2, "v4l2"),
+            (VA_SURFACE_ATTRIB_MEM_TYPE_USER_PTR, "user"),
+            (VA_SURFACE_ATTRIB_MEM_TYPE_KERNEL_DRM, "kernel-drm"),
+            (VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME, "drm-prime"),
+            (VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, "drm-prime-2"),
+        ];
+        let mut out = String::new();
+        for (bit, name) in names {
+            if bits & bit != 0 {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(name);
+            }
+        }
+        if out.is_empty() {
+            format!("{bits:#x}")
+        } else {
+            out
+        }
+    }
+
+    fn profile_name(profile: VAProfile) -> String {
+        let named = match profile {
+            crate::ffi::va::VAProfileHEVCMain => "Main",
+            crate::ffi::va::VAProfileHEVCMain10 => "Main10",
+            crate::ffi::va::VAProfileHEVCMain444 => "Main444",
+            crate::ffi::va::VAProfileHEVCMain444_10 => "Main444_10",
+            _ => return profile.to_string(),
+        };
+        named.to_owned()
+    }
+
+    #[expect(
+        non_upper_case_globals,
+        reason = "the constants keep the vendored interface's C naming"
+    )]
+    fn entrypoint_name(entrypoint: VAEntrypoint) -> String {
+        let named = match entrypoint {
+            VAEntrypointEncSlice => "slice",
+            VAEntrypointEncSliceLP => "slice-low-power",
+            _ => return entrypoint.to_string(),
+        };
+        named.to_owned()
+    }
+}
+
+/// What the driver will do for one codec, asked rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    pub profile: VAProfile,
+    /// Whether these answers are about a ten-bit stream. **Carried with them
+    /// rather than passed again**, because the configuration, the surfaces and
+    /// the parameter sets all have to name the same depth and this is the one
+    /// value they can all read it from.
+    pub ten_bit: bool,
+    /// Whether these answers are about a full-resolution-chroma stream. The
+    /// same reason: the surfaces, the runtime format and the parameter sets
+    /// all have to name the same layout.
+    pub chroma_444: bool,
+    /// Which entry point answered, and the one every later call must name.
+    ///
+    /// **A device offers one or the other and not always both.** The slice
+    /// entry point runs the encode through the shader cores; the low-power one
+    /// runs it on fixed function hardware. Newer parts of one vendor dropped
+    /// the first entirely, so a backend that names only it reports no encoder
+    /// on hardware that encodes perfectly well.
+    pub entrypoint: VAEntrypoint,
+    /// Rate control modes offered, as the interface's bit set.
+    pub rate_control: u32,
+    /// How many effort levels the device offers, or zero where it says
+    /// nothing.
+    ///
+    /// **This is effort, not fidelity, and the two are easy to confuse.** It
+    /// says how hard the encoder searches -- motion range, sub-pixel
+    /// refinement, how many modes it tries -- and not how coarsely it
+    /// quantises. Level one is the most thorough and slowest; the top of the
+    /// range is the fastest. At a fixed bitrate more effort spends fewer bits
+    /// on the same picture, so the rate control lands on a finer quantiser;
+    /// less effort is quicker and coarser. Ranges are the device's own and do
+    /// not compare across vendors.
+    pub quality_range: u32,
+    /// Which headers the driver will **accept** from the caller.
+    ///
+    /// Read this as a capability and not as a requirement: it says what may be
+    /// supplied, not what must be. Whether the driver emits parameter sets on
+    /// its own when none are supplied is not in this answer and is settled by
+    /// encoding a frame and looking at what comes out. Treating the two as the
+    /// same thing is how a backend ends up with a hand-written parameter set
+    /// generator it never needed, or without one it did.
+    pub packed_headers: u32,
+}
+
+impl Caps {
+    /// Live bitrate change needs a rate control mode that has a bitrate.
+    /// Constant quantiser has none, so a device offering only that cannot
+    /// carry the congestion actuator at all.
+    pub fn has_variable_rate(&self) -> bool {
+        self.rate_control & (VA_RC_CBR | VA_RC_VBR) != 0
+    }
+
+    /// True when the driver will take parameter sets from the caller.
+    ///
+    /// Not the same as needing them. See [`Caps::packed_headers`].
+    pub fn accepts_packed_headers(&self) -> bool {
+        self.packed_headers & (VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE) != 0
+    }
+}
+
+/// A configured encode context with its two surface pools.
+#[derive(Debug)]
+pub struct Context<'a> {
+    display: &'a Display<'a>,
+    /// What this context was configured from, kept because a later query has
+    /// to name the same profile and entry point the configuration was read
+    /// under.
+    caps: Caps,
+    config: VAConfigID,
+    context: VAContextID,
+    /// Where a picture's pixels are read from.
+    surfaces: Vec<VASurfaceID>,
+    /// Where its reconstruction is written. Never the same surface that the
+    /// picture was read from; see [`Display::create_context`].
+    recon: Vec<VASurfaceID>,
+}
+
+impl Display<'_> {
+    /// How deep a transform tree this device will actually code, or `None`
+    /// where it does not say.
+    ///
+    /// **Zero is "did not answer" rather than "no splitting".** The attribute
+    /// is a packed word and an unreported field reads as zero, which is a
+    /// legal depth and a plausible wrong answer; one driver here reports two
+    /// and the other reports nothing while demonstrably coding deeper.
+    fn transform_depth(&self, caps: Caps) -> Option<u32> {
+        let mut attribs = [VAConfigAttrib {
+            type_: crate::ffi::va::VAConfigAttribEncHEVCBlockSizes,
+            value: 0,
+        }];
+        // SAFETY: the array is writable for the length passed.
+        let status = unsafe {
+            (self.va.get_config_attributes)(
+                self.raw,
+                caps.profile,
+                caps.entrypoint,
+                attribs.as_mut_ptr(),
+                1,
+            )
+        };
+        if self.va.check(status).is_err() || attribs[0].value == VA_ATTRIB_NOT_SUPPORTED {
+            return None;
+        }
+        // SAFETY: a plain word read through the bitfield view the interface
+        // defines for it. Every bit pattern is a valid value of both.
+        let blocks: crate::ffi::va::VAConfigAttribValEncHEVCBlockSizes =
+            unsafe { core::mem::transmute(attribs[0].value) };
+        // SAFETY: as above; only the bitfield view is read.
+        let (inter, intra) = unsafe {
+            (
+                blocks.bits.max_max_transform_hierarchy_depth_inter(),
+                blocks.bits.max_max_transform_hierarchy_depth_intra(),
+            )
+        };
+        // One number is written for both, so the stricter of the two is what
+        // can be declared.
+        let depth = inter.min(intra);
+        (depth > 0).then_some(depth)
+    }
+
+    /// Whether this device needs predicted pictures sent as low-delay B.
+    ///
+    /// **A device whose bidirectional slices must have a second list, and which
+    /// offers a reference in that list at all, wants a predicted picture as a
+    /// bidirectional slice with both lists naming the same picture.** A device
+    /// that reports no constraint, or that cannot be asked, is left as it is.
+    fn low_delay_b(&self, caps: Caps) -> bool {
+        let mut attribs = [
+            VAConfigAttrib {
+                type_: crate::ffi::va::VAConfigAttribPredictionDirection,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: crate::ffi::va::VAConfigAttribEncMaxRefFrames,
+                value: 0,
+            },
+        ];
+        // SAFETY: the array is writable for the length passed.
+        let status = unsafe {
+            (self.va.get_config_attributes)(
+                self.raw,
+                caps.profile,
+                caps.entrypoint,
+                attribs.as_mut_ptr(),
+                2,
+            )
+        };
+        if self.va.check(status).is_err() {
+            return false;
+        }
+        let [direction, refs] = attribs.map(|attrib| attrib.value);
+        needs_low_delay_b(direction, refs)
+    }
+
+    /// Ask what the driver offers for a codec.
+    pub fn caps(&self, codec: Codec) -> Result<Caps> {
+        self.caps_at(codec, false)
+    }
+
+    /// The same, for a chosen depth.
+    pub fn caps_at(&self, codec: Codec, ten_bit: bool) -> Result<Caps> {
+        let (profile, entrypoint) = self.encode_target_at(codec, ten_bit)?;
+        let mut attribs = [
+            VAConfigAttrib {
+                type_: VAConfigAttribRTFormat,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribRateControl,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribEncPackedHeaders,
+                value: 0,
+            },
+            VAConfigAttrib {
+                type_: crate::ffi::va::VAConfigAttribEncQualityRange,
+                value: 0,
+            },
+        ];
+        // SAFETY: the array is writable for the length passed.
+        let status = unsafe {
+            (self.va.get_config_attributes)(
+                self.raw,
+                profile,
+                entrypoint,
+                attribs.as_mut_ptr(),
+                c_int::try_from(attribs.len()).unwrap_or(0),
+            )
+        };
+        self.va.check(status)?;
+
+        // An unsupported attribute comes back with a sentinel rather than
+        // zero, and treating that as a bit set would read every bit as set.
+        let value = |attrib: &VAConfigAttrib| {
+            if attrib.value == VA_ATTRIB_NOT_SUPPORTED {
+                0
+            } else {
+                attrib.value
+            }
+        };
+        // **The runtime format is asked about for the depth in hand.** A
+        // device offering the eight-bit layout and not the ten-bit one is a
+        // device that cannot serve this configuration, and reporting it as
+        // capable here is how that becomes a failure much later with a status
+        // naming neither.
+        if value(&attribs[0]) & runtime_format(ten_bit) == 0 {
+            return Err(Error::NoEncoder);
+        }
+        Ok(Caps {
+            profile,
+            entrypoint,
+            ten_bit,
+            chroma_444: false,
+            rate_control: value(&attribs[1]),
+            packed_headers: value(&attribs[2]),
+            quality_range: value(&attribs[3]),
+        })
+    }
+
+    /// Build an encode context and its surface pool.
+    pub fn create_context(
+        &self,
+        caps: Caps,
+        width: u32,
+        height: u32,
+        surfaces: usize,
+    ) -> Result<Context<'_>> {
+        // Only the two the pipeline depends on are requested. Asking for more
+        // than is needed is how a configuration fails on one device for a
+        // reason unrelated to anything it does.
+        let mut wanted = [
+            VAConfigAttrib {
+                type_: VAConfigAttribRTFormat,
+                value: if caps.chroma_444 {
+                    runtime_format_444(caps.ten_bit)
+                } else {
+                    runtime_format(caps.ten_bit)
+                },
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribRateControl,
+                value: if caps.rate_control & VA_RC_VBR != 0 {
+                    VA_RC_VBR
+                } else if caps.rate_control & VA_RC_CBR != 0 {
+                    VA_RC_CBR
+                } else {
+                    VA_RC_CQP
+                },
+            },
+        ];
+
+        let mut config: VAConfigID = 0;
+        // SAFETY: the array is readable for the length passed and the output
+        // is a live local.
+        let status = unsafe {
+            (self.va.create_config)(
+                self.raw,
+                caps.profile,
+                caps.entrypoint,
+                wanted.as_mut_ptr(),
+                c_int::try_from(wanted.len()).unwrap_or(0),
+                &raw mut config,
+            )
+        };
+        self.va.check(status)?;
+
+        // **Two pools, and a picture must never take both roles from one
+        // surface.** The surface a picture begins on is where its pixels are
+        // read from; the surface named in its picture parameters is where the
+        // reconstruction is written. Given one surface for both, the driver
+        // releases the buffer it is about to read as it takes the surface into
+        // its reference store, and encodes from the freed pointer. The first
+        // picture survives whenever the allocator hands the same block back,
+        // so this presents as an intermittent fault several pictures in.
+        let mut pool = match self.surface_pool(width, height, surfaces, caps) {
+            Ok(pool) => pool,
+            Err(error) => {
+                // SAFETY: the configuration was created above and nothing else
+                // owns it.
+                unsafe { (self.va.destroy_config)(self.raw, config) };
+                return Err(error);
+            }
+        };
+        let mut recon = match self.surface_pool(width, height, surfaces, caps) {
+            Ok(recon) => recon,
+            Err(error) => {
+                self.destroy_pool(&mut pool);
+                // SAFETY: as above.
+                unsafe { (self.va.destroy_config)(self.raw, config) };
+                return Err(error);
+            }
+        };
+
+        let mut context: VAContextID = 0;
+        // SAFETY: the pool is readable for its length and outlives the call;
+        // it is retained in the returned value.
+        let status = unsafe {
+            (self.va.create_context)(
+                self.raw,
+                config,
+                c_int::try_from(width).unwrap_or(0),
+                c_int::try_from(height).unwrap_or(0),
+                c_int::try_from(VA_PROGRESSIVE).unwrap_or(0),
+                pool.as_mut_ptr(),
+                c_int::try_from(pool.len()).unwrap_or(0),
+                &raw mut context,
+            )
+        };
+        if let Err(error) = self.va.check(status) {
+            self.destroy_pool(&mut recon);
+            self.destroy_pool(&mut pool);
+            // SAFETY: the configuration was created above and nothing else
+            // owns it.
+            unsafe { (self.va.destroy_config)(self.raw, config) };
+            return Err(error.into());
+        }
+
+        Ok(Context {
+            display: self,
+            caps,
+            config,
+            context,
+            surfaces: pool,
+            recon,
+        })
+    }
+
+    /// One pool of `count` surfaces in the encoder's runtime format.
+    fn surface_pool(
+        &self,
+        width: u32,
+        height: u32,
+        count: usize,
+        caps: Caps,
+    ) -> Result<Vec<VASurfaceID>> {
+        let mut pool = vec![0 as VASurfaceID; count];
+        // **A runtime format is a family, not a layout.** At full chroma it
+        // covers a packed member and a planar one, and which the runtime picks
+        // for a pool it allocates is its own choice; the source handed to the
+        // encoder is the packed one this conversion writes. Naming it here
+        // keeps the reconstruction in the layout the source is in. Left
+        // unnamed for the subsampled formats, where the family has one member
+        // and an explicit attribute list is only somewhere a driver can refuse.
+        let mut named = crate::ffi::va::VASurfaceAttrib {
+            type_: crate::ffi::va::VASurfaceAttribPixelFormat,
+            flags: crate::ffi::va::VA_SURFACE_ATTRIB_SETTABLE,
+            value: crate::ffi::va::VAGenericValue {
+                type_: crate::ffi::va::VAGenericValueTypeInteger,
+                value: crate::ffi::va::_VAGenericValue__bindgen_ty_1 {
+                    i: i32::from_ne_bytes(
+                        if caps.ten_bit {
+                            crate::ffi::va::VA_FOURCC_Y410
+                        } else {
+                            crate::ffi::va::VA_FOURCC_AYUV
+                        }
+                        .to_ne_bytes(),
+                    ),
+                },
+            },
+        };
+        let (attributes, count_of) = if caps.chroma_444 {
+            ((&raw mut named).cast::<core::ffi::c_void>(), 1)
+        } else {
+            (core::ptr::null_mut(), 0)
+        };
+        // SAFETY: the pool is writable for its own length, and the attribute
+        // outlives the call.
+        let status = unsafe {
+            (self.va.create_surfaces)(
+                self.raw,
+                if caps.chroma_444 {
+                    runtime_format_444(caps.ten_bit)
+                } else {
+                    runtime_format(caps.ten_bit)
+                },
+                width,
+                height,
+                pool.as_mut_ptr(),
+                c_uint::try_from(pool.len()).unwrap_or(0),
+                attributes,
+                count_of,
+            )
+        };
+        self.va.check(status)?;
+        Ok(pool)
+    }
+
+    /// Take a frame that already lives on this device as a surface.
+    ///
+    /// **The whole point of the open backend having a display source.** The
+    /// conversion writes into an allocation on this same device and hands over
+    /// a descriptor; importing it means the encoder reads those very bytes
+    /// rather than a copy of them through system memory.
+    ///
+    /// The descriptor is borrowed for the call. The runtime duplicates what it
+    /// keeps, so the caller still owns the one it passed in.
+    pub fn import(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        frame: &lowlat_capture::convert::Exported,
+    ) -> Result<VASurfaceID> {
+        use lowlat_capture::convert::Layout;
+        use std::os::fd::AsRawFd;
+
+        // **The descriptor names the layout, and the layout names the size.**
+        // The subsampled frame is luma plus half as much colour; the packed
+        // full-chroma frame is one word per pixel; the planar full-chroma one
+        // has no shape this interface takes and is refused rather than
+        // silently copied.
+        let (bytes, fourcc, drm_format, num_planes) = match frame.kind {
+            Layout::SemiPlanar420 => {
+                let bytes = u64::from(frame.pitch)
+                    .checked_mul(u64::from(frame.height))
+                    .and_then(|luma| luma.checked_mul(3))
+                    .map(|both| both / 2)
+                    .and_then(|size| u32::try_from(size).ok())
+                    .ok_or(Error::UnsupportedLayout)?;
+                // **The depth is named, never inferred.** A ten-bit frame and
+                // an eight-bit one twice as wide describe identically here --
+                // same pitch, same plane split -- so a driver handed the wrong
+                // code accepts the import and decodes noise.
+                let (fourcc, drm_format) = if frame.depth.ten_bit() {
+                    (
+                        crate::ffi::va::VA_FOURCC_P010,
+                        crate::ffi::drm::DRM_FORMAT_P010,
+                    )
+                } else {
+                    (VA_FOURCC_NV12, crate::ffi::drm::DRM_FORMAT_NV12)
+                };
+                (bytes, fourcc, drm_format, 2)
+            }
+            Layout::Packed444 => {
+                let bytes = u64::from(frame.pitch)
+                    .checked_mul(u64::from(frame.height))
+                    .and_then(|size| u32::try_from(size).ok())
+                    .ok_or(Error::UnsupportedLayout)?;
+                let (fourcc, drm_format) = if frame.depth.ten_bit() {
+                    (
+                        crate::ffi::va::VA_FOURCC_Y410,
+                        crate::ffi::drm::DRM_FORMAT_XVYU2101010,
+                    )
+                } else {
+                    (
+                        crate::ffi::va::VA_FOURCC_AYUV,
+                        crate::ffi::drm::DRM_FORMAT_AYUV,
+                    )
+                };
+                (bytes, fourcc, drm_format, 1)
+            }
+            Layout::Planar444 => return Err(Error::UnsupportedLayout),
+        };
+
+        let blank = crate::ffi::drm::VADRMPRIMESurfaceDescriptorLayer {
+            drm_format: 0,
+            num_planes: 0,
+            object_index: [0; crate::ffi::drm::VA_DRM_PRIME_PLANES],
+            offset: [0; crate::ffi::drm::VA_DRM_PRIME_PLANES],
+            pitch: [0; crate::ffi::drm::VA_DRM_PRIME_PLANES],
+        };
+        let mut descriptor = crate::ffi::va::VADRMPRIMESurfaceDescriptor {
+            fourcc,
+            width: frame.width,
+            height: frame.height,
+            num_objects: 1,
+            objects: [crate::ffi::drm::VADRMPRIMESurfaceDescriptorObject {
+                fd: fd.as_raw_fd(),
+                size: bytes,
+                drm_format_modifier: frame.modifier,
+            }; crate::ffi::drm::VA_DRM_PRIME_OBJECTS],
+            num_layers: 1,
+            layers: [blank; crate::ffi::drm::VA_DRM_PRIME_LAYERS],
+        };
+        // **One layer of the frame's own plane count, not one layer per
+        // plane.** The planes live in one allocation at offsets of our
+        // choosing, and describing them as separate layers is how a driver is
+        // told they are separate allocations, which they are not.
+        descriptor.layers[0] = crate::ffi::drm::VADRMPRIMESurfaceDescriptorLayer {
+            drm_format,
+            num_planes,
+            object_index: [0; crate::ffi::drm::VA_DRM_PRIME_PLANES],
+            offset: [frame.planes[0].offset, frame.planes[1].offset, 0, 0],
+            pitch: [frame.planes[0].pitch, frame.planes[1].pitch, 0, 0],
+        };
+
+        let mut attributes = [
+            VASurfaceAttrib {
+                type_: VASurfaceAttribMemoryType,
+                flags: VA_SURFACE_ATTRIB_SETTABLE,
+                value: VAGenericValue {
+                    type_: VAGenericValueTypeInteger,
+                    value: crate::ffi::va::_VAGenericValue__bindgen_ty_1 {
+                        i: i32::from_ne_bytes(
+                            crate::ffi::va::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2.to_ne_bytes(),
+                        ),
+                    },
+                },
+            },
+            VASurfaceAttrib {
+                type_: VASurfaceAttribExternalBufferDescriptor,
+                flags: VA_SURFACE_ATTRIB_SETTABLE,
+                value: VAGenericValue {
+                    type_: VAGenericValueTypePointer,
+                    value: crate::ffi::va::_VAGenericValue__bindgen_ty_1 {
+                        p: core::ptr::from_mut(&mut descriptor).cast(),
+                    },
+                },
+            },
+        ];
+
+        let mut surface: VASurfaceID = 0;
+        // SAFETY: the attribute list and the descriptor it points at both
+        // outlive the call, the descriptor names one live descriptor, and the
+        // surface is one writable identifier.
+        let status = unsafe {
+            (self.va.create_surfaces)(
+                self.raw,
+                if frame.kind == Layout::Packed444 {
+                    runtime_format_444(frame.depth.ten_bit())
+                } else {
+                    runtime_format(frame.depth.ten_bit())
+                },
+                frame.width,
+                frame.height,
+                core::ptr::from_mut(&mut surface),
+                1,
+                attributes.as_mut_ptr().cast(),
+                c_uint::try_from(attributes.len()).unwrap_or(0),
+            )
+        };
+        self.va.check(status)?;
+        Ok(surface)
+    }
+
+    /// Release a surface taken by [`Display::import`].
+    pub fn release(&self, mut surface: VASurfaceID) {
+        // SAFETY: the identifier came from a successful import on this display.
+        unsafe {
+            (self.va.destroy_surfaces)(self.raw, core::ptr::from_mut(&mut surface), 1);
+        }
+    }
+
+    fn destroy_pool(&self, pool: &mut [VASurfaceID]) {
+        // SAFETY: every entry came from a successful create.
+        unsafe {
+            (self.va.destroy_surfaces)(
+                self.raw,
+                pool.as_mut_ptr(),
+                c_int::try_from(pool.len()).unwrap_or(0),
+            );
+        }
+    }
+}
+
+/// Where a picture to encode comes from.
+enum Source<'a> {
+    /// Bytes in system memory, which have to be uploaded first.
+    Bytes(&'a lowlat_capture::Frame<'a>),
+    /// A surface already on this device, imported from the allocation the
+    /// conversion wrote into.
+    Surface(VASurfaceID),
+}
+
+impl Context<'_> {
+    pub fn raw(&self) -> VAContextID {
+        self.context
+    }
+
+    /// The input pool, one entry per in-flight picture.
+    pub fn surfaces(&self) -> &[VASurfaceID] {
+        &self.surfaces
+    }
+
+    /// The reconstruction pool, paired by index with the input pool.
+    pub fn recon(&self) -> &[VASurfaceID] {
+        &self.recon
+    }
+}
+
+impl Drop for Context<'_> {
+    /// Torn down innermost first: the context is built on the surfaces and the
+    /// configuration, so both outlive it.
+    fn drop(&mut self) {
+        let va = self.display.va;
+        let display = self.display.raw;
+        // SAFETY: each was created once by `create_context` and is destroyed
+        // once here, in the reverse of the order it was built.
+        unsafe {
+            (va.destroy_context)(display, self.context);
+        }
+        self.display.destroy_pool(&mut self.recon);
+        self.display.destroy_pool(&mut self.surfaces);
+        // SAFETY: created once above and destroyed once here.
+        unsafe {
+            (va.destroy_config)(display, self.config);
+        }
+    }
+}
+
+/// Copy `rows` of `row_bytes` into a destination laid out at its own stride.
+///
+/// Both sides are walked by their own stride, which is the whole reason this
+/// is a row loop rather than one copy.
+fn copy_plane(
+    destination: &mut [u8],
+    offset: usize,
+    stride: usize,
+    source: &lowlat_capture::Plane<'_>,
+    row_bytes: usize,
+    rows: usize,
+) -> Result<()> {
+    if stride < row_bytes {
+        return Err(Error::UnsupportedLayout);
+    }
+    for row in 0..rows {
+        let from = source
+            .row(row)
+            .and_then(|full| full.get(..row_bytes))
+            .ok_or(Error::UnsupportedLayout)?;
+        let at = offset + row * stride;
+        let into = destination
+            .get_mut(at..at + row_bytes)
+            .ok_or(Error::UnsupportedLayout)?;
+        into.copy_from_slice(from);
+    }
+    Ok(())
+}
+
+/// Write one eight-bit plane into a ten-bit surface, widening as it goes.
+///
+/// **Two moves, and both matter.** Eight bits become ten by repeating the top
+/// two into the bottom, so 255 reaches 1023 rather than 1020 -- plain shifting
+/// leaves white a little short of white at every pixel. Then the ten sit in
+/// the *high* ten of the sixteen-bit word, which is where an encoder reading
+/// this layout looks for them; low-aligned samples decode to a picture that is
+/// dark and washed out and reports nothing.
+///
+/// This exists for the path that hands over a picture from ordinary memory. A
+/// picture converted on the device arrives at the right depth already and is
+/// handed over by reference without passing through here.
+fn widen_plane(
+    destination: &mut [u8],
+    offset: usize,
+    stride: usize,
+    source: &lowlat_capture::Plane<'_>,
+    samples: usize,
+    rows: usize,
+) -> Result<()> {
+    if stride < samples * 2 {
+        return Err(Error::UnsupportedLayout);
+    }
+    for row in 0..rows {
+        let from = source
+            .row(row)
+            .and_then(|full| full.get(..samples))
+            .ok_or(Error::UnsupportedLayout)?;
+        let at = offset + row * stride;
+        let into = destination
+            .get_mut(at..at + samples * 2)
+            .ok_or(Error::UnsupportedLayout)?;
+        for (sample, word) in from.iter().zip(into.chunks_exact_mut(2)) {
+            let value = u16::from(*sample);
+            let ten = (value << 2) | (value >> 6);
+            word.copy_from_slice(&(ten << 6).to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// One picture in flight.
+#[derive(Debug)]
+struct InFlight {
+    surface: VASurfaceID,
+    coded: VABufferID,
+    /// Answered from what was submitted rather than sniffed back out of the
+    /// bitstream, which is the only place it is known without parsing.
+    keyframe: bool,
+}
+
+/// An encoder over a context.
+#[derive(Debug)]
+pub struct Encoder<'a> {
+    context: &'a Context<'a>,
+    params: Params,
+    bitrate_bps: u32,
+    /// One coded buffer per surface, allocated once.
+    coded: Vec<VABufferID>,
+    next: usize,
+    pending: std::collections::VecDeque<InFlight>,
+    idr_pic_id: u16,
+    collected: Vec<u8>,
+    /// Counts reference pictures since the last refresh, wrapping at what the
+    /// sequence parameters declared.
+    frame_num: u32,
+    /// The one picture a predicted picture is allowed to reference.
+    ///
+    /// `None` before anything has been encoded, which is what makes the first
+    /// picture a refresh whether or not one was asked for: there is nothing to
+    /// predict from.
+    reference: Option<Reference>,
+    /// The effort level asked for, or zero to leave the device on its own
+    /// default.
+    quality: u32,
+    /// The quantiser this encoder may not go below.
+    min_qp: u32,
+    /// Predicted HEVC pictures go out as low-delay bidirectional slices,
+    /// because the device codes no predicted ones; see
+    /// [`crate::h265::Picture::LowDelayB`].
+    low_delay_b: bool,
+}
+
+/// A picture an encode may reference, as the driver needs to see it.
+#[derive(Debug, Clone, Copy)]
+struct Reference {
+    surface: VASurfaceID,
+    frame_num: u32,
+    poc: u32,
+}
+
+/// What one submission needs to know about the picture it is coding.
+///
+/// Passed by value so the two codec halves take the same shape and neither
+/// reaches back for counters the other one keeps.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    refresh: bool,
+    recon: VASurfaceID,
+    coded: VABufferID,
+    frame_num: u32,
+    poc: u32,
+}
+
+impl Plan {
+    /// The picture as the second codec's writer names it.
+    fn hevc_picture(self) -> crate::h265::Picture {
+        if self.refresh {
+            crate::h265::Picture::Refresh
+        } else {
+            crate::h265::Picture::Predicted { poc_lsb: self.poc }
+        }
+    }
+}
+
+/// How hard the device is asked to search: the fastest level it offers, or
+/// zero where it offers no choice.
+///
+/// **This is effort, not fidelity, and the trade runs toward speed here.** A
+/// level says how far the encoder searches -- motion range, sub-pixel
+/// refinement, how many modes it tries -- and not how coarsely it quantises.
+/// Level one is the most thorough and slowest; the top of a device's range is
+/// the fastest. A host streams a desktop somebody is waiting on, and the
+/// bitrate is already what holds fidelity up, so effort spent searching is
+/// latency with nothing to show for it.
+///
+/// **Measured on both devices, 1080p H.265, 500 pictures, against what each
+/// does when nothing is sent**:
+///
+/// | | unsent | level 1 | mid | top |
+/// |---|---|---|---|---|
+/// | one vendor's discrete part, 7 levels | 1.98 | 3.33 | 1.94 | **1.48** |
+/// | the other's integrated part, 32 levels | 2.97 | 3.23 | 3.51 | 2.98 |
+///
+/// So the first implements it and the top of its range is worth half a
+/// millisecond against its own default, which behaves like the middle. **The
+/// second advertises a range and does not track it**: its default is already
+/// as quick as anything on offer and the middle of the range is slower, so
+/// naming the top there costs nothing and gains nothing. Asking for the top
+/// everywhere is what serves both, and needs no knowledge of which device is
+/// which.
+///
+/// **Zero means leave it alone**, which is what a device reporting no range is
+/// asking for: a level it never advertised is a configuration it did not agree
+/// to.
+fn quality_for(range: u32) -> u32 {
+    if range <= 1 { 0 } else { range }
+}
+
+/// The decision behind [`Display::low_delay_b`], from the two attribute words.
+///
+/// The reference count packs the first list's limit in its low half and the
+/// second list's in its high half; a device with no room in the second list
+/// cannot be given a bidirectional slice whatever its direction says.
+fn needs_low_delay_b(direction: u32, refs: u32) -> bool {
+    if direction == VA_ATTRIB_NOT_SUPPORTED || refs == VA_ATTRIB_NOT_SUPPORTED {
+        return false;
+    }
+    let second_list = (refs >> 16) & 0xFFFF;
+    direction & crate::ffi::va::VA_PREDICTION_DIRECTION_BI_NOT_EMPTY != 0 && second_list > 0
+}
+
+/// The quantiser a picture opens at, before any per-block delta.
+///
+/// **Both codecs' picture sets declare no offset from it**, so this value and
+/// the zero written there are one setting expressed twice.
+const INITIAL_QP: u8 = 26;
+
+/// The interface's way of saying a picture has no collocated reference, which
+/// is the case whenever temporal motion vector prediction is off. Zero would
+/// name the first reference instead.
+const NO_COLLOCATED_PICTURE: u8 = 0xFF;
+
+impl<'a> Context<'a> {
+    /// Build an encoder over this context.
+    pub fn encoder(&'a self, mut params: Params, bitrate_bps: u32) -> Result<Encoder<'a>> {
+        // **The device decides the transform tree, not the caller.** A set
+        // declaring deeper than the hardware codes is read with the wrong
+        // syntax by every decoder and reported as an error by none. Clamped
+        // here because this is the only place that knows both the device and
+        // the parameters written for it.
+        if let Params::H265(h265) = &mut params
+            && let Some(depth) = self.display.transform_depth(self.caps)
+            && depth < h265.transform_depth
+        {
+            lowlat_common::log_info!(
+                "vaapi: the device codes a transform tree {depth} deep, not {}",
+                h265.transform_depth
+            );
+            h265.transform_depth = depth;
+        }
+        // **Asked once, here, for the same reason.** A device that codes no
+        // predicted HEVC slices accepts the first picture and fails every one
+        // after it, which reads as an encoder that stopped answering.
+        let low_delay_b = matches!(params, Params::H265(_)) && self.display.low_delay_b(self.caps);
+        if low_delay_b {
+            lowlat_common::log_info!(
+                "vaapi: the device codes no predicted HEVC slices, sending low-delay B"
+            );
+        }
+        let va = self.display.va;
+        let display = self.display.raw;
+        // Generous: a keyframe of a hard scene is far larger than the average,
+        // and a coded buffer too small fails the picture rather than truncating
+        // it, which is the right failure but an avoidable one.
+        let size = params.width() * params.height() * 3 / 2;
+
+        let mut coded = Vec::with_capacity(self.surfaces.len());
+        for _ in 0..self.surfaces.len() {
+            let mut id: VABufferID = 0;
+            // SAFETY: no initial data, so the pointer is null and the count is
+            // one buffer of `size` bytes.
+            let status = unsafe {
+                (va.create_buffer)(
+                    display,
+                    self.context,
+                    crate::ffi::va::VAEncCodedBufferType,
+                    size,
+                    1,
+                    core::ptr::null_mut(),
+                    &raw mut id,
+                )
+            };
+            if let Err(error) = va.check(status) {
+                for done in &coded {
+                    // SAFETY: each was created above.
+                    unsafe { (va.destroy_buffer)(display, *done) };
+                }
+                return Err(error.into());
+            }
+            coded.push(id);
+        }
+
+        Ok(Encoder {
+            context: self,
+            params,
+            bitrate_bps,
+            coded,
+            next: 0,
+            pending: std::collections::VecDeque::new(),
+            idr_pic_id: 0,
+            collected: Vec::new(),
+            frame_num: 0,
+            reference: None,
+            quality: quality_for(self.caps.quality_range),
+            min_qp: crate::DEFAULT_MIN_QP,
+            low_delay_b,
+        })
+    }
+}
+
+impl Encoder<'_> {
+    fn va(&self) -> &Vaapi {
+        self.context.display.va
+    }
+
+    fn display(&self) -> VADisplay {
+        self.context.display.raw
+    }
+
+    /// Create one parameter buffer holding `value`.
+    fn buffer<T>(&self, kind: VABufferType, value: &T) -> Result<VABufferID> {
+        let mut id: VABufferID = 0;
+        // SAFETY: the interface copies `size` bytes from the pointer during
+        // the call, and `value` is live for its duration.
+        let status = unsafe {
+            (self.va().create_buffer)(
+                self.display(),
+                self.context.context,
+                kind,
+                c_uint::try_from(size_of::<T>()).unwrap_or(0),
+                1,
+                (value as *const T as *mut T).cast(),
+                &raw mut id,
+            )
+        };
+        self.va().check(status)?;
+        Ok(id)
+    }
+
+    /// A packed header, which is two buffers: what it is, then what it says.
+    fn packed(
+        &self,
+        kind: u32,
+        bytes: &[u8],
+        bit_length: usize,
+    ) -> Result<(VABufferID, VABufferID)> {
+        let parameter = crate::ffi::va::VAEncPackedHeaderParameterBuffer {
+            type_: kind,
+            bit_length: u32::try_from(bit_length).unwrap_or(0),
+            // The escaping is already applied, and saying otherwise makes the
+            // driver apply it a second time.
+            has_emulation_bytes: 1,
+            va_reserved: [0; 4],
+        };
+        let head = self.buffer(
+            crate::ffi::va::VAEncPackedHeaderParameterBufferType,
+            &parameter,
+        )?;
+
+        let mut data: VABufferID = 0;
+        // SAFETY: the interface copies the bytes during the call.
+        let status = unsafe {
+            (self.va().create_buffer)(
+                self.display(),
+                self.context.context,
+                crate::ffi::va::VAEncPackedHeaderDataBufferType,
+                c_uint::try_from(bytes.len()).unwrap_or(0),
+                1,
+                bytes.as_ptr().cast_mut().cast(),
+                &raw mut data,
+            )
+        };
+        self.va().check(status)?;
+        Ok((head, data))
+    }
+
+    /// Write a frame into one of our input surfaces.
+    ///
+    /// **The surface's own strides are used, never the frame's.** A driver
+    /// lays a surface out to its own alignment, and the two chroma rows are
+    /// not necessarily where a tightly packed frame would put them. Walking
+    /// the destination by the source's stride reads correctly for the first
+    /// row and drifts further out of line with every row after it, which
+    /// looks like a skew or a shear rather than like a stride fault.
+    fn upload(&self, surface: VASurfaceID, frame: &lowlat_capture::Frame<'_>) -> Result<()> {
+        // SAFETY: plain data, filled by the call below.
+        let mut image = unsafe { core::mem::zeroed::<crate::ffi::va::VAImage>() };
+        // SAFETY: the surface is live and the output is a live local.
+        let status = unsafe { (self.va().derive_image)(self.display(), surface, &raw mut image) };
+        self.va().check(status)?;
+
+        let result = self.write_image(&image, frame);
+
+        // SAFETY: derived above; released once whether or not the write
+        // succeeded, or the surface stays mapped for the life of the display.
+        unsafe { (self.va().destroy_image)(self.display(), image.image_id) };
+        result
+    }
+
+    fn write_image(
+        &self,
+        image: &crate::ffi::va::VAImage,
+        frame: &lowlat_capture::Frame<'_>,
+    ) -> Result<()> {
+        // Two planes, luma then interleaved chroma, at one depth or the
+        // other; or one packed plane for the full-chroma surfaces. A driver
+        // offering some other layout is refused rather than filled in
+        // wrongly.
+        match image.format.fourcc {
+            crate::ffi::va::VA_FOURCC_NV12 | crate::ffi::va::VA_FOURCC_P010 => {
+                self.write_planar(image, frame)
+            }
+            crate::ffi::va::VA_FOURCC_AYUV | crate::ffi::va::VA_FOURCC_Y410 => {
+                self.write_packed(image, frame)
+            }
+            crate::ffi::va::VA_FOURCC_444P => self.write_planar_444(image, frame),
+            other => {
+                lowlat_common::log_warn!(
+                    "vaapi: a surface derived as {other:#010x}, which the upload cannot write"
+                );
+                Err(Error::UnsupportedLayout)
+            }
+        }
+    }
+
+    /// The ordinary two-plane upload.
+    fn write_planar(
+        &self,
+        image: &crate::ffi::va::VAImage,
+        frame: &lowlat_capture::Frame<'_>,
+    ) -> Result<()> {
+        let ten_bit = match image.format.fourcc {
+            crate::ffi::va::VA_FOURCC_NV12 => false,
+            crate::ffi::va::VA_FOURCC_P010 => true,
+            _ => return Err(Error::UnsupportedLayout),
+        };
+        if image.num_planes < 2 {
+            return Err(Error::UnsupportedLayout);
+        }
+
+        let mut mapped: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: the image's buffer is live until the image is destroyed.
+        let status = unsafe { (self.va().map_buffer)(self.display(), image.buf, &raw mut mapped) };
+        self.va().check(status)?;
+        if mapped.is_null() {
+            return Err(Error::UnsupportedLayout);
+        }
+
+        // SAFETY: the interface reports `data_size` writable bytes at the
+        // mapped address, and nothing else aliases them while mapped.
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(
+                mapped.cast::<u8>(),
+                usize::try_from(image.data_size).unwrap_or(0),
+            )
+        };
+
+        let rows = usize::try_from(frame.height).unwrap_or(0);
+        let luma_samples = usize::try_from(frame.width).unwrap_or(0);
+        let chroma_samples = usize::try_from(frame.width.div_ceil(2) * 2).unwrap_or(0);
+        let mut plane =
+            |offset: u32, pitch: u32, source: &lowlat_capture::Plane<'_>, samples, rows| {
+                let (offset, pitch) = (
+                    usize::try_from(offset).unwrap_or(0),
+                    usize::try_from(pitch).unwrap_or(0),
+                );
+                if ten_bit {
+                    widen_plane(destination, offset, pitch, source, samples, rows)
+                } else {
+                    copy_plane(destination, offset, pitch, source, samples, rows)
+                }
+            };
+        let result = plane(
+            image.offsets[0],
+            image.pitches[0],
+            &frame.luma,
+            luma_samples,
+            rows,
+        )
+        .and_then(|()| {
+            plane(
+                image.offsets[1],
+                image.pitches[1],
+                &frame.chroma,
+                chroma_samples,
+                rows.div_ceil(2),
+            )
+        });
+
+        // SAFETY: balances the map above.
+        unsafe { (self.va().unmap_buffer)(self.display(), image.buf) };
+        result
+    }
+
+    /// Three full-resolution planes, luma then blue difference then red
+    /// difference, with the colour nearest-upsampled from the frame's one
+    /// subsampled pair.
+    fn write_planar_444(
+        &self,
+        image: &crate::ffi::va::VAImage,
+        frame: &lowlat_capture::Frame<'_>,
+    ) -> Result<()> {
+        if image.num_planes < 3 {
+            return Err(Error::UnsupportedLayout);
+        }
+
+        let mut mapped: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: the image's buffer is live until the image is destroyed.
+        let status = unsafe { (self.va().map_buffer)(self.display(), image.buf, &raw mut mapped) };
+        self.va().check(status)?;
+        if mapped.is_null() {
+            return Err(Error::UnsupportedLayout);
+        }
+        // SAFETY: the interface reports `data_size` writable bytes at the
+        // mapped address, and nothing else aliases them while mapped.
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(
+                mapped.cast::<u8>(),
+                usize::try_from(image.data_size).unwrap_or(0),
+            )
+        };
+
+        let width = usize::try_from(frame.width).unwrap_or(0);
+        let rows = usize::try_from(frame.height).unwrap_or(0);
+
+        let outcome = (|| -> Result<()> {
+            let luma_at = |x: usize, y: usize| {
+                frame
+                    .luma
+                    .bytes
+                    .get(y * frame.luma.stride + x)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let chroma_at = |x: usize, y: usize| {
+                frame
+                    .chroma
+                    .bytes
+                    .get(y * frame.chroma.stride + x)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            for y in 0..rows {
+                for x in 0..width {
+                    let luma = luma_at(x, y);
+                    let pair = x / 2 * 2;
+                    let u = chroma_at(pair, y / 2);
+                    let v = chroma_at(pair + 1, y / 2);
+                    for (plane, value) in [(0usize, luma), (1, u), (2, v)] {
+                        let offset = usize::try_from(image.offsets[plane]).unwrap_or(0);
+                        let pitch = usize::try_from(image.pitches[plane]).unwrap_or(0);
+                        let at = offset + y * pitch + x;
+                        let byte = destination.get_mut(at).ok_or(Error::UnsupportedLayout)?;
+                        *byte = value;
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        // SAFETY: balances the map above.
+        unsafe { (self.va().unmap_buffer)(self.display(), image.buf) };
+        outcome
+    }
+
+    /// One packed plane of words, composed here from the two-plane frame.
+    ///
+    /// **The chroma is a nearest upsample**, which is the content the
+    /// full-chroma conversion would have produced from a subsampled source:
+    /// each 2x2 block carries its one colour sample four times. The word
+    /// orders are the ones the conversion shader writes and the importer
+    /// documents.
+    fn write_packed(
+        &self,
+        image: &crate::ffi::va::VAImage,
+        frame: &lowlat_capture::Frame<'_>,
+    ) -> Result<()> {
+        let ten_bit = match image.format.fourcc {
+            crate::ffi::va::VA_FOURCC_AYUV => false,
+            crate::ffi::va::VA_FOURCC_Y410 => true,
+            _ => return Err(Error::UnsupportedLayout),
+        };
+        if image.num_planes < 1 {
+            return Err(Error::UnsupportedLayout);
+        }
+
+        let mut mapped: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: the image's buffer is live until the image is destroyed.
+        let status = unsafe { (self.va().map_buffer)(self.display(), image.buf, &raw mut mapped) };
+        self.va().check(status)?;
+        if mapped.is_null() {
+            return Err(Error::UnsupportedLayout);
+        }
+        // SAFETY: the interface reports `data_size` writable bytes at the
+        // mapped address, and nothing else aliases them while mapped.
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(
+                mapped.cast::<u8>(),
+                usize::try_from(image.data_size).unwrap_or(0),
+            )
+        };
+
+        let width = usize::try_from(frame.width).unwrap_or(0);
+        let rows = usize::try_from(frame.height).unwrap_or(0);
+        let pitch = usize::try_from(image.pitches[0]).unwrap_or(0);
+
+        let outcome = (|| -> Result<()> {
+            for y in 0..rows {
+                for x in 0..width {
+                    let luma = frame
+                        .luma
+                        .bytes
+                        .get(y * frame.luma.stride + x)
+                        .copied()
+                        .unwrap_or(0);
+                    let pair = x / 2 * 2;
+                    let u = frame
+                        .chroma
+                        .bytes
+                        .get((y / 2) * frame.chroma.stride + pair)
+                        .copied()
+                        .unwrap_or(0);
+                    let v = frame
+                        .chroma
+                        .bytes
+                        .get((y / 2) * frame.chroma.stride + pair + 1)
+                        .copied()
+                        .unwrap_or(0);
+                    let (luma, u, v) = (u32::from(luma), u32::from(u), u32::from(v));
+                    let word = if ten_bit {
+                        (3 << 30) | ((v * 4) << 20) | ((luma * 4) << 10) | (u * 4)
+                    } else {
+                        0xff00_0000 | (luma << 16) | (u << 8) | v
+                    };
+                    let start = y * pitch + x * 4;
+                    let bytes = destination
+                        .get_mut(start..start + 4)
+                        .ok_or(Error::UnsupportedLayout)?;
+                    bytes.copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            Ok(())
+        })();
+
+        // SAFETY: balances the map above.
+        unsafe { (self.va().unmap_buffer)(self.display(), image.buf) };
+        outcome
+    }
+
+    /// The two buffers that carry the rate and the rate it is spent at.
+    ///
+    /// **The rate the encoder actually runs at is carried here, not in the
+    /// sequence parameters.** The sequence buffer has a field for it and one
+    /// driver never reads that field, so a rate set only there leaves the
+    /// encoder on its own default with nothing reporting a problem. The
+    /// sequence field is set as well because a different driver does read it.
+    fn rate_buffers(&self, fps: u32) -> Result<(VABufferID, VABufferID)> {
+        #[repr(C)]
+        struct RateControl {
+            header: crate::ffi::va::VAEncMiscParameterBuffer,
+            rate: crate::ffi::va::VAEncMiscParameterRateControl,
+        }
+        // SAFETY: a plain-data header followed by its payload, which is the
+        // layout the interface specifies for this buffer. All-zero is a valid
+        // value of every field, and the ones that matter are set below.
+        let mut rate = unsafe { core::mem::zeroed::<RateControl>() };
+        rate.header.type_ = crate::ffi::va::VAEncMiscParameterTypeRateControl;
+        rate.rate.bits_per_second = self.bitrate_bps;
+        // A variable-rate target is this percentage of the peak above. Zero
+        // asks for a target of nothing, which is what a zeroed buffer says.
+        rate.rate.target_percentage = 100;
+        rate.rate.window_size = 1000;
+        // **The quantiser floor, which bounds a frame's size and so its time
+        // on the wire.** Left zero the encoder is free to descend to a
+        // near-lossless quantiser on content it finds easy, and it does; the
+        // bits that buys refine nothing the eye resolves and every one of them
+        // is a packet. It is written here rather than in the sequence
+        // parameters because it travels with the rate it constrains, and it
+        // applies to every picture kind: a refresh is the largest frame in the
+        // stream and the one that matters most for delay, so bounding only the
+        // predicted pictures leaves the important one unbounded.
+        rate.rate.min_qp = self.min_qp;
+        let rate_buffer = self.buffer(crate::ffi::va::VAEncMiscParameterBufferType, &rate)?;
+
+        // **A rate is meaningless without the rate it is spent at**, and the
+        // driver does not learn the frame rate from anywhere else. Left unset
+        // it uses its own default, which is half what this pipeline runs at,
+        // so it budgets bits for thirty frames and receives sixty: the stream
+        // comes out at exactly twice its target, tracking the setting
+        // faithfully and overshooting it by a factor of two at every value.
+        // A congestion controller actuating through that is wrong by the same
+        // factor, and pushes a path into loss while believing it is well
+        // inside the budget.
+        #[repr(C)]
+        struct FrameRate {
+            header: crate::ffi::va::VAEncMiscParameterBuffer,
+            rate: crate::ffi::va::VAEncMiscParameterFrameRate,
+        }
+        // SAFETY: a plain-data header followed by its payload, which is the
+        // layout the interface specifies. All-zero is a valid value of every
+        // field and the ones that matter are set below.
+        let mut frame_rate = unsafe { core::mem::zeroed::<FrameRate>() };
+        frame_rate.header.type_ = crate::ffi::va::VAEncMiscParameterTypeFrameRate;
+        // Numerator in the low half, denominator in the high half. A zero
+        // denominator is read as one, but it is written out because a field
+        // that happens to work when left zero is one nobody checks.
+        frame_rate.rate.framerate = fps | (1 << 16);
+        let fps_buffer = self.buffer(crate::ffi::va::VAEncMiscParameterBufferType, &frame_rate)?;
+
+        Ok((rate_buffer, fps_buffer))
+    }
+
+    /// How hard the device is asked to search for this picture.
+    ///
+    /// **Left unsent where the device advertises no range**, because a level
+    /// it never offered is a value it has no meaning for. Unsent, a driver
+    /// runs at whatever it considers balanced, which is a choice made for
+    /// transcoding rather than for a desktop somebody is waiting on.
+    fn quality_buffer(&self) -> Result<Option<VABufferID>> {
+        if self.quality == 0 {
+            return Ok(None);
+        }
+        #[repr(C)]
+        struct Quality {
+            header: crate::ffi::va::VAEncMiscParameterBuffer,
+            level: crate::ffi::va::VAEncMiscParameterBufferQualityLevel,
+        }
+        // SAFETY: a plain-data header followed by its payload, which is the
+        // layout the interface specifies. All-zero is a valid value of every
+        // field and the ones that matter are set below.
+        let mut quality = unsafe { core::mem::zeroed::<Quality>() };
+        quality.header.type_ = crate::ffi::va::VAEncMiscParameterTypeQualityLevel;
+        quality.level.quality_level = self.quality;
+        self.buffer(crate::ffi::va::VAEncMiscParameterBufferType, &quality)
+            .map(Some)
+    }
+
+    /// Build one picture's buffers for the first codec.
+    ///
+    /// **The order buffers are pushed in is load bearing twice over.** The
+    /// parameter sets declare the field widths the slice header is then read
+    /// with, and the picture buffer decides which fields the slice header is
+    /// expected to carry at all, so both precede it.
+    fn picture_h264(
+        &self,
+        params: &crate::h264::Params,
+        plan: Plan,
+        push: &mut impl FnMut(VABufferID),
+    ) -> Result<()> {
+        let mut seq =
+            unsafe { core::mem::zeroed::<crate::ffi::va::VAEncSequenceParameterBufferH264>() };
+        seq.level_idc = u8::try_from(params.level_idc).unwrap_or(42);
+        // **Refreshes happen on request, not on a schedule**, and the way to
+        // say that is a period longer than any session rather than zero. Zero
+        // reads as "no period applies" on one driver and as something else on
+        // another, where it produced a picture whose entropy coding could not
+        // be followed past its first macroblock. A period of one would declare
+        // every picture a refresh, which is what this backend used to do and
+        // what the delivery gate exists to decide instead. One picture between
+        // predicted pictures, because there are no bidirectional ones.
+        seq.intra_period = u32::MAX;
+        seq.intra_idr_period = u32::MAX;
+        seq.ip_period = 1;
+        seq.bits_per_second = self.bitrate_bps;
+        seq.max_num_ref_frames = params.max_num_ref_frames;
+        seq.picture_width_in_mbs = u16::try_from(params.width.div_ceil(16)).unwrap_or(0);
+        seq.picture_height_in_mbs = u16::try_from(params.height.div_ceil(16)).unwrap_or(0);
+        // SAFETY: the flags are a union of a bitfield view and a plain word.
+        // The structure was zeroed, so either view is a valid value of it, and
+        // only the bitfield view is used from here on.
+        unsafe {
+            let bits = &mut seq.seq_fields.bits;
+            bits.set_chroma_format_idc(1);
+            bits.set_frame_mbs_only_flag(1);
+            bits.set_direct_8x8_inference_flag(1);
+            bits.set_log2_max_frame_num_minus4(params.log2_max_frame_num_minus4);
+            bits.set_pic_order_cnt_type(0);
+            bits.set_log2_max_pic_order_cnt_lsb_minus4(params.log2_max_poc_lsb_minus4);
+        }
+        let bottom = (params.height.div_ceil(16) * 16 - params.height) / 2;
+        if bottom > 0 {
+            seq.frame_cropping_flag = 1;
+            seq.frame_crop_bottom_offset = bottom;
+        }
+        push(self.buffer(crate::ffi::va::VAEncSequenceParameterBufferType, &seq)?);
+
+        let (rate_buffer, fps_buffer) = self.rate_buffers(params.fps)?;
+        push(rate_buffer);
+        push(fps_buffer);
+        if let Some(quality) = self.quality_buffer()? {
+            push(quality);
+        }
+
+        // **Both parameter sets go into one header of sequence type, and the
+        // picture type is never used at all.** The interface names a type per
+        // set, which invites one header each; a working encoder on this driver
+        // sends them together and never sends the picture type, and sending it
+        // is what the driver faults on while assembling the stream.
+        // **Only with a refresh.** A parameter set is what makes a refresh
+        // decodable on its own, so it travels with one and a guest that joins
+        // mid-stream needs no separate out-of-band step. Repeating it on a
+        // predicted picture is bytes on the wire that change nothing.
+        if plan.refresh {
+            let mut sets = [0u8; 384];
+            let sps_len =
+                crate::h264::sequence_parameter_set(params, &mut sets).ok_or(Error::NoEncoder)?;
+            let pps_len = crate::h264::picture_parameter_set(
+                sets.get_mut(sps_len..).ok_or(Error::NoEncoder)?,
+            )
+            .ok_or(Error::NoEncoder)?;
+            let sets_len = sps_len + pps_len;
+            let (head, data) = self.packed(
+                crate::ffi::va::VAEncPackedHeaderSequence,
+                &sets[..sets_len],
+                sets_len * 8,
+            )?;
+            push(head);
+            push(data);
+        }
+
+        let mut pic =
+            unsafe { core::mem::zeroed::<crate::ffi::va::VAEncPictureParameterBufferH264>() };
+        pic.CurrPic.picture_id = plan.recon;
+        pic.CurrPic.frame_idx = plan.frame_num;
+        pic.CurrPic.TopFieldOrderCnt = i32::try_from(plan.poc).unwrap_or(0);
+        pic.CurrPic.BottomFieldOrderCnt = pic.CurrPic.TopFieldOrderCnt;
+        // Unused entries must be marked invalid, not left zero: zero is a
+        // valid surface identifier and the driver would follow it.
+        for entry in &mut pic.ReferenceFrames {
+            entry.picture_id = crate::ffi::va::VA_INVALID_SURFACE;
+            entry.flags = crate::ffi::va::VA_PICTURE_H264_INVALID;
+        }
+        // **The reference has to be named here even though the slice names it
+        // too.** This list is what the driver keeps its reference store from;
+        // a picture missing from it is one the driver is entitled to release,
+        // and it will, while the slice below still points at it.
+        if let (false, Some(reference)) = (plan.refresh, self.reference) {
+            if let Some(entry) = pic.ReferenceFrames.first_mut() {
+                entry.picture_id = reference.surface;
+                entry.frame_idx = reference.frame_num;
+                entry.TopFieldOrderCnt = i32::try_from(reference.poc).unwrap_or(0);
+                entry.BottomFieldOrderCnt = entry.TopFieldOrderCnt;
+                entry.flags = crate::ffi::va::VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+            }
+        }
+        pic.coded_buf = plan.coded;
+        pic.frame_num = u16::try_from(plan.frame_num).unwrap_or(0);
+        pic.pic_init_qp = INITIAL_QP;
+        // SAFETY: as above, a zeroed union accessed only through one view.
+        unsafe {
+            let bits = &mut pic.pic_fields.bits;
+            bits.set_idr_pic_flag(u32::from(plan.refresh));
+            bits.set_reference_pic_flag(1);
+            bits.set_entropy_coding_mode_flag(1);
+            bits.set_deblocking_filter_control_present_flag(1);
+            // **Every tool named here has a counterpart in the parameter set**
+            // ([`crate::h264`]), which is the rule the other codec's builder
+            // already states. This one is the tool that proved it: the device
+            // was told the eight-by-eight transform was available while the set
+            // written for it stopped above the field that declares it. One
+            // driver rewrites the set to agree with what it coded and the
+            // disagreement never reaches the wire; the other writes exactly the
+            // bytes it is handed, and then the picture is coded with a tool the
+            // decoder was told to expect nothing of.
+            bits.set_transform_8x8_mode_flag(1);
+        }
+        push(self.buffer(crate::ffi::va::VAEncPictureParameterBufferType, &pic)?);
+
+        let mut slice =
+            unsafe { core::mem::zeroed::<crate::ffi::va::VAEncSliceParameterBufferH264>() };
+        slice.num_macroblocks = params.width.div_ceil(16) * params.height.div_ceil(16);
+        // Two is intra, zero is predicted. Both are the plain forms; the
+        // values above four assert the whole picture has this type, and the
+        // packed header carries those.
+        slice.slice_type = if plan.refresh { 2 } else { 0 };
+        // Alternates so two consecutive refreshes are distinguishable, which
+        // is what the field is for.
+        slice.idr_pic_id = self.idr_pic_id;
+        slice.pic_order_cnt_lsb = u16::try_from(plan.poc).unwrap_or(0);
+        for entry in slice
+            .RefPicList0
+            .iter_mut()
+            .chain(slice.RefPicList1.iter_mut())
+        {
+            entry.picture_id = crate::ffi::va::VA_INVALID_SURFACE;
+            entry.flags = crate::ffi::va::VA_PICTURE_H264_INVALID;
+        }
+        if let (false, Some(reference)) = (plan.refresh, self.reference) {
+            if let Some(entry) = slice.RefPicList0.first_mut() {
+                entry.picture_id = reference.surface;
+                entry.frame_idx = reference.frame_num;
+                entry.TopFieldOrderCnt = i32::try_from(reference.poc).unwrap_or(0);
+                entry.BottomFieldOrderCnt = entry.TopFieldOrderCnt;
+                entry.flags = crate::ffi::va::VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+            }
+        }
+        push(self.buffer(crate::ffi::va::VAEncSliceParameterBufferType, &slice)?);
+
+        // **The driver expects one of these per picture once packed headers
+        // are in use.** Without it there is no slice header to emit and the
+        // stream cannot be assembled, which is a fault inside the driver
+        // rather than a status.
+        let mut header = [0u8; 64];
+        let kind = if plan.refresh {
+            crate::h264::Picture::Refresh {
+                idr_pic_id: u32::from(self.idr_pic_id),
+            }
+        } else {
+            crate::h264::Picture::Predicted {
+                frame_num: plan.frame_num,
+                poc_lsb: plan.poc,
+            }
+        };
+        let written =
+            crate::h264::slice_header(params, kind, &mut header).ok_or(Error::NoEncoder)?;
+        let (head, data) = self.packed(
+            crate::ffi::va::VAEncPackedHeaderSlice,
+            &header[..written.bytes_written],
+            written.bit_length,
+        )?;
+        push(head);
+        push(data);
+        Ok(())
+    }
+
+    /// Build one picture's buffers for the second codec.
+    ///
+    /// **Every tool flag set here has a counterpart in the parameter sets**
+    /// ([`crate::h265`]), because this side codes the slice data and those
+    /// bytes describe it. The two are written from the same values on purpose;
+    /// a disagreement is not caught before the decoder.
+    fn picture_h265(
+        &self,
+        params: &crate::h265::Params,
+        plan: Plan,
+        push: &mut impl FnMut(VABufferID),
+    ) -> Result<()> {
+        let (coded_width, coded_height) = params.coded();
+        // The picture as this device codes it: a predicted one goes out as
+        // low-delay B where the device codes no predicted slices.
+        let picture = if self.low_delay_b {
+            plan.hevc_picture().low_delay_b()
+        } else {
+            plan.hevc_picture()
+        };
+
+        let mut seq =
+            unsafe { core::mem::zeroed::<crate::ffi::va::VAEncSequenceParameterBufferHEVC>() };
+        seq.general_profile_idc = u8::try_from(params.profile()).unwrap_or(1);
+        seq.general_level_idc = u8::try_from(params.level_idc).unwrap_or(123);
+        seq.general_tier_flag = 0;
+        // As for the other codec: no period, and one picture between predicted
+        // ones because there are no bidirectional ones.
+        seq.intra_period = 0;
+        seq.intra_idr_period = 0;
+        seq.ip_period = 1;
+        seq.bits_per_second = self.bitrate_bps;
+        // **The coded size, not the visible one.** The sets crop the
+        // difference with a conformance window and the device is told what it
+        // actually codes.
+        seq.pic_width_in_luma_samples = u16::try_from(coded_width).unwrap_or(0);
+        seq.pic_height_in_luma_samples = u16::try_from(coded_height).unwrap_or(0);
+        let byte = |value: u32| u8::try_from(value).unwrap_or(0);
+        seq.log2_min_luma_coding_block_size_minus3 = byte(crate::h265::LOG2_MIN_CB - 3);
+        seq.log2_diff_max_min_luma_coding_block_size =
+            byte(crate::h265::LOG2_CTB - crate::h265::LOG2_MIN_CB);
+        seq.log2_min_transform_block_size_minus2 = byte(crate::h265::LOG2_MIN_TB - 2);
+        seq.log2_diff_max_min_transform_block_size =
+            byte(crate::h265::LOG2_MAX_TB - crate::h265::LOG2_MIN_TB);
+        seq.max_transform_hierarchy_depth_inter = byte(params.transform_depth);
+        seq.max_transform_hierarchy_depth_intra = byte(params.transform_depth);
+        // SAFETY: a union of a bitfield view and a plain word over a zeroed
+        // structure, so either view is a valid value of it, and only the
+        // bitfield view is used.
+        unsafe {
+            let bits = &mut seq.seq_fields.bits;
+            // **Told, never assumed, for the same reason the depth is.** A
+            // device that codes half-resolution colour into a stream whose
+            // set promises full resolution writes slices a decoder reads with
+            // the wrong syntax, and it reports a decode failure rather than a
+            // mismatch.
+            bits.set_chroma_format_idc(if params.chroma_444 { 3 } else { 1 });
+            bits.set_bit_depth_luma_minus8(params.bit_depth_minus8);
+            bits.set_bit_depth_chroma_minus8(params.bit_depth_minus8);
+            // **Told, never left at zero.** Zero here is eight bits, and the
+            // device believes it over anything the parameter sets say: the
+            // pictures carry eight bits of residual while the header promises
+            // ten, which is an intra picture that looks nearly right and a
+            // predicted one that walks away from it.
+            bits.set_amp_enabled_flag(1);
+            bits.set_sample_adaptive_offset_enabled_flag(1);
+            bits.set_strong_intra_smoothing_enabled_flag(0);
+            // No temporal motion vector prediction, which is what lets the
+            // slice header omit the collocated picture entirely.
+            bits.set_sps_temporal_mvp_enabled_flag(0);
+        }
+        push(self.buffer(crate::ffi::va::VAEncSequenceParameterBufferType, &seq)?);
+
+        let (rate_buffer, fps_buffer) = self.rate_buffers(params.fps)?;
+        push(rate_buffer);
+        push(fps_buffer);
+        if let Some(quality) = self.quality_buffer()? {
+            push(quality);
+        }
+
+        // **Three sets on this codec, and all three in one sequence header.**
+        // The interface names a type for the picture set too, and the other
+        // codec's path found that sending it is what the driver faults on. A
+        // decoder that never receives the video set has nothing to attach the
+        // sequence set to, so it leads.
+        if plan.refresh {
+            let mut sets = [0u8; 384];
+            let vps_len =
+                crate::h265::video_parameter_set(params, &mut sets).ok_or(Error::NoEncoder)?;
+            let sps_len = crate::h265::sequence_parameter_set(
+                params,
+                sets.get_mut(vps_len..).ok_or(Error::NoEncoder)?,
+            )
+            .ok_or(Error::NoEncoder)?;
+            let pps_len = crate::h265::picture_parameter_set(
+                sets.get_mut(vps_len + sps_len..).ok_or(Error::NoEncoder)?,
+            )
+            .ok_or(Error::NoEncoder)?;
+            let sets_len = vps_len + sps_len + pps_len;
+            let (head, data) = self.packed(
+                crate::ffi::va::VAEncPackedHeaderSequence,
+                &sets[..sets_len],
+                sets_len * 8,
+            )?;
+            push(head);
+            push(data);
+        }
+
+        let mut pic =
+            unsafe { core::mem::zeroed::<crate::ffi::va::VAEncPictureParameterBufferHEVC>() };
+        pic.decoded_curr_pic.picture_id = plan.recon;
+        pic.decoded_curr_pic.pic_order_cnt = i32::try_from(plan.poc).unwrap_or(0);
+        // Unused entries must be marked invalid, not left zero: zero is a
+        // valid surface identifier and the driver would follow it.
+        for entry in &mut pic.reference_frames {
+            entry.picture_id = crate::ffi::va::VA_INVALID_SURFACE;
+            entry.flags = crate::ffi::va::VA_PICTURE_HEVC_INVALID;
+        }
+        // The one picture a predicted picture points at, and it is always the
+        // one immediately before, which is what makes the reference set in the
+        // slice header a single entry one picture back.
+        if let (false, Some(reference)) = (plan.refresh, self.reference) {
+            if let Some(entry) = pic.reference_frames.first_mut() {
+                entry.picture_id = reference.surface;
+                entry.pic_order_cnt = i32::try_from(reference.poc).unwrap_or(0);
+                entry.flags = crate::ffi::va::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+            }
+        }
+        pic.coded_buf = plan.coded;
+        // No collocated picture, which this value is the interface's way of
+        // saying. Zero would name the first reference instead.
+        pic.collocated_ref_pic_index = NO_COLLOCATED_PICTURE;
+        // The quantiser delta is carried at the device's own granularity,
+        // which the picture set declares the same way.
+        pic.diff_cu_qp_delta_depth = byte(crate::h265::LOG2_CTB - crate::h265::LOG2_MIN_CB);
+        pic.pic_init_qp = INITIAL_QP;
+        pic.nal_unit_type = picture.unit_type();
+        // SAFETY: as above, a zeroed union accessed only through one view.
+        unsafe {
+            let bits = &mut pic.pic_fields.bits;
+            bits.set_idr_pic_flag(u32::from(plan.refresh));
+            bits.set_coding_type(if plan.refresh { 1 } else { 2 });
+            bits.set_reference_pic_flag(1);
+            bits.set_transform_skip_enabled_flag(1);
+            // **Rate control has no other handle on this codec**: without a
+            // per-block quantiser delta the whole picture is stuck at the
+            // slice quantiser and the configured bitrate does nothing.
+            bits.set_cu_qp_delta_enabled_flag(1);
+            bits.set_pps_loop_filter_across_slices_enabled_flag(1);
+        }
+        push(self.buffer(crate::ffi::va::VAEncPictureParameterBufferType, &pic)?);
+
+        let mut slice =
+            unsafe { core::mem::zeroed::<crate::ffi::va::VAEncSliceParameterBufferHEVC>() };
+        slice.num_ctu_in_slice = params.ctus();
+        slice.slice_type = picture.slice_type();
+        slice.max_num_merge_cand = u8::try_from(crate::h265::MAX_NUM_MERGE_CAND).unwrap_or(5);
+        for entry in slice
+            .ref_pic_list0
+            .iter_mut()
+            .chain(slice.ref_pic_list1.iter_mut())
+        {
+            entry.picture_id = crate::ffi::va::VA_INVALID_SURFACE;
+            entry.flags = crate::ffi::va::VA_PICTURE_HEVC_INVALID;
+        }
+        if let (false, Some(reference)) = (plan.refresh, self.reference) {
+            if let Some(entry) = slice.ref_pic_list0.first_mut() {
+                entry.picture_id = reference.surface;
+                entry.pic_order_cnt = i32::try_from(reference.poc).unwrap_or(0);
+                entry.flags = crate::ffi::va::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
+            }
+        }
+        // **Both lists name the one reference** in a low-delay B slice: the
+        // second is the copy the device insists on, and it is what a decoder
+        // builds from the same reference set anyway.
+        if let crate::h265::Picture::LowDelayB { .. } = picture {
+            slice.ref_pic_list1 = slice.ref_pic_list0;
+        }
+        // SAFETY: as above, a zeroed union accessed only through one view.
+        unsafe {
+            let bits = &mut slice.slice_fields.bits;
+            bits.set_last_slice_of_pic_flag(1);
+            bits.set_slice_sao_luma_flag(1);
+            bits.set_slice_sao_chroma_flag(1);
+            bits.set_slice_loop_filter_across_slices_enabled_flag(1);
+        }
+        push(self.buffer(crate::ffi::va::VAEncSliceParameterBufferType, &slice)?);
+
+        let mut header = [0u8; 64];
+        let written =
+            crate::h265::slice_header(params, picture, &mut header).ok_or(Error::NoEncoder)?;
+        let (head, data) = self.packed(
+            crate::ffi::va::VAEncPackedHeaderSlice,
+            &header[..written.bytes_written],
+            written.bit_length,
+        )?;
+        push(head);
+        push(data);
+        Ok(())
+    }
+
+    /// Encode one picture. Returns as soon as it is queued.
+    ///
+    /// Every picture here is a keyframe for now: the reference-picture
+    /// bookkeeping a predicted picture needs is the next piece, and shipping a
+    /// half-correct reference list would produce a stream that decodes into
+    /// progressively wrong output rather than failing.
+    pub fn submit(
+        &mut self,
+        frame: &lowlat_capture::Frame<'_>,
+        force_keyframe: bool,
+    ) -> Result<()> {
+        self.submit_from(Source::Bytes(frame), force_keyframe)
+    }
+
+    /// Encode a picture that is already on this device.
+    ///
+    /// **No upload, and that is the whole difference.** The surface was
+    /// imported from the allocation the conversion wrote into, so the encoder
+    /// reads those very bytes.
+    pub fn submit_registered(&mut self, input: VASurfaceID, force_keyframe: bool) -> Result<()> {
+        self.submit_from(Source::Surface(input), force_keyframe)
+    }
+
+    fn submit_from(&mut self, source: Source<'_>, force_keyframe: bool) -> Result<()> {
+        if self.pending.len() >= self.coded.len() {
+            return Err(Error::QueueFull);
+        }
+        // **A refresh when asked for, and whenever there is nothing to predict
+        // from.** The second half is not a special case for the first picture:
+        // it is the same rule, because a reference we do not hold is one we
+        // cannot point at.
+        let refresh = force_keyframe || self.reference.is_none();
+        let slot = self.next;
+        self.next = (self.next + 1) % self.coded.len();
+        let recon = *self.context.recon.get(slot).ok_or(Error::NoEncoder)?;
+        let coded = self.coded[slot];
+
+        // **One input surface per slot, so this cannot overwrite a picture
+        // that is still being encoded.** The slot is only reused once its
+        // picture has been collected, which is what the queue-full check
+        // above enforces. A picture already on the device brings its own
+        // surface and the pool is not touched at all.
+        let input = match source {
+            Source::Bytes(frame) => {
+                let input = *self.context.surfaces.get(slot).ok_or(Error::NoEncoder)?;
+                self.upload(input, frame)?;
+                input
+            }
+            Source::Surface(input) => input,
+        };
+
+        // The picture is read from the input surface and reconstructed into
+        // its counterpart. The two are never the same surface.
+        // SAFETY: the display and context are live for the call.
+        let status =
+            unsafe { (self.va().begin_picture)(self.display(), self.context.context, input) };
+        self.va().check(status)?;
+
+        // **A refresh restarts the counters by definition**, and what advances
+        // for a predicted picture depends on the codec: one carries a frame
+        // number the order count is derived from, the other carries only the
+        // order count.
+        let (frame_num, poc) = if refresh {
+            (0, 0)
+        } else {
+            match self.params {
+                Params::H264(params) => {
+                    let next = (self.frame_num + 1) % (1 << (params.log2_max_frame_num_minus4 + 4));
+                    (next, (next * 2) % self.params.poc_period())
+                }
+                Params::H265(_) => (
+                    0,
+                    (self.reference.map_or(0, |reference| reference.poc) + 1)
+                        % self.params.poc_period(),
+                ),
+            }
+        };
+        let plan = Plan {
+            refresh,
+            recon,
+            coded,
+            frame_num,
+            poc,
+        };
+
+        // **Sized by a refresh, which is the picture that needs the most.** In
+        // order: the sequence parameters, the rate, the frame rate, the effort
+        // level, the packed parameter sets as a header and its payload, the
+        // picture parameters, the slice parameters, and the packed slice
+        // header as a header and its payload. A predicted picture drops the
+        // two set buffers and needs eight.
+        let mut buffers = [0 as VABufferID; 10];
+        // **Counted past the end rather than stopped at it.** Silently
+        // dropping the last buffer is how a stream goes out with keyframes
+        // that carry no slice header, which decodes as nothing on the far side
+        // and points at everything except the array that was one too short.
+        let mut used = 0usize;
+        {
+            let mut push = |id: VABufferID| {
+                if let Some(slot) = buffers.get_mut(used) {
+                    *slot = id;
+                }
+                used += 1;
+            };
+            match self.params {
+                Params::H264(params) => self.picture_h264(&params, plan, &mut push)?,
+                Params::H265(params) => self.picture_h265(&params, plan, &mut push)?,
+            }
+        }
+        if used > buffers.len() {
+            return Err(Error::TooManyBuffers);
+        }
+        {}
+        let buffers = buffers.get_mut(..used).ok_or(Error::NoEncoder)?;
+
+        // SAFETY: the list is readable for its length.
+        let status = unsafe {
+            (self.va().render_picture)(
+                self.display(),
+                self.context.context,
+                buffers.as_mut_ptr(),
+                c_int::try_from(buffers.len()).unwrap_or(0),
+            )
+        };
+        let rendered = self.va().check(status);
+
+        // SAFETY: the picture began above.
+        let status = unsafe { (self.va().end_picture)(self.display(), self.context.context) };
+        let ended = self.va().check(status);
+
+        // **These come back to us once the picture is closed.** The interface
+        // reads them during the render and does not take them; left alone they
+        // accumulate for the life of the context, eight per picture. Released
+        // on the failing paths too, because a render that got as far as a
+        // status still consumed them.
+        for id in buffers.iter() {
+            // SAFETY: each came from a successful create above and is
+            // destroyed once.
+            unsafe { (self.va().destroy_buffer)(self.display(), *id) };
+        }
+        rendered?;
+        ended?;
+
+        // **Every picture here is an instantaneous refresh, so neither
+        // counter advances.** A refresh resets both by definition: it carries
+        // frame number zero and restarts the picture order. Incrementing them
+        // while still flagging each picture as a refresh states two
+        // contradictory things, and the driver acts on the contradiction
+        // rather than rejecting it. Both counters start moving when predicted
+        // pictures do.
+        if refresh {
+            self.idr_pic_id ^= 1;
+        }
+        self.frame_num = frame_num;
+        // The picture just submitted becomes what the next one predicts from.
+        // Only one is kept, which is what the sequence parameters declared and
+        // what the sliding-window marking in the slice header implements.
+        self.reference = Some(Reference {
+            surface: recon,
+            frame_num,
+            poc,
+        });
+        self.pending.push_back(InFlight {
+            surface: input,
+            coded,
+            keyframe: refresh,
+        });
+        Ok(())
+    }
+
+    /// Collect a finished picture, or report that none is ready.
+    ///
+    /// **Waits on the surface, not on the coded buffer.** The coded-buffer
+    /// synchronise reads as the obvious way to ask rather than wait, but its
+    /// completion signal lags the encode by milliseconds on every open-stack
+    /// driver measured here, so a probe built on it reports a picture finished
+    /// long after the surface one does. The surface synchronise blocks, and
+    /// that is the point: it returns the moment the encode is actually done,
+    /// which is what a latency figure is supposed to be. A picture still in
+    /// flight costs the wait; there is nothing the loop could usefully do
+    /// against a busy encoder in that time anyway.
+    pub fn poll(&mut self) -> Result<Poll<'_>> {
+        let Some(head) = self.pending.front() else {
+            return Ok(Poll::Pending);
+        };
+        let (surface, coded, keyframe) = (head.surface, head.coded, head.keyframe);
+
+        // SAFETY: the surface is live. Blocking by design; see the note.
+        let status = unsafe { (self.va().sync_surface)(self.display(), surface) };
+        self.va().check(status)?;
+
+        let mut mapped: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: the buffer is live and the out pointer is a live local.
+        let status = unsafe { (self.va().map_buffer)(self.display(), coded, &raw mut mapped) };
+        self.va().check(status)?;
+
+        self.collected.clear();
+        let mut segment = mapped.cast::<crate::ffi::va::VACodedBufferSegment>();
+        // The output is a chain, not one block. Reading only the first segment
+        // truncates a picture that happened to span two, which shows up on
+        // large frames alone.
+        while !segment.is_null() {
+            // SAFETY: the interface guarantees the chain while mapped.
+            let entry = unsafe { &*segment };
+            if !entry.buf.is_null() {
+                // SAFETY: the segment reports `size` readable bytes at `buf`.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(entry.buf.cast::<u8>(), entry.size as usize)
+                };
+                self.collected.extend_from_slice(bytes);
+            }
+            segment = entry.next.cast();
+        }
+
+        // SAFETY: balances the map above.
+        unsafe { (self.va().unmap_buffer)(self.display(), coded) };
+        self.pending.pop_front();
+
+        Ok(Poll::Ready {
+            bitstream: &self.collected,
+            keyframe,
+        })
+    }
+
+    /// Change the rate every picture from the next one onward is encoded at.
+    ///
+    /// **Neither reinitialises the encoder nor forces a refresh**, and cannot
+    /// fail, because the rate is not encoder state here: it travels with each
+    /// picture, so changing it is only a question of what the next picture
+    /// carries. The congestion controller moves this many times a minute, and
+    /// a reinitialisation at that cadence would be visible as a stutter every
+    /// time the network hiccuped.
+    pub fn reconfigure(&mut self, bitrate_bps: u32) {
+        self.bitrate_bps = bitrate_bps;
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// What effort this encoder is asking the device for.
+    #[must_use]
+    pub fn quality(&self) -> u32 {
+        self.quality
+    }
+
+    /// Put a quality setting into the two levers it names.
+    ///
+    /// **The effort half is clamped to what the device advertised**, and a
+    /// device that advertised nothing is left alone: a level it never offered
+    /// is a configuration it did not agree to. Nothing here reports back
+    /// whether the device acted on either -- one driver measured takes the
+    /// floor on one codec and ignores it on the other, and there is no
+    /// capability that says which, so a host logs what it asked for.
+    pub fn set_quality_setting(&mut self, quality: crate::Quality) {
+        self.min_qp = quality.min_qp();
+        let range = self.context.caps.quality_range;
+        self.quality = if range <= 1 {
+            0
+        } else if quality.thorough() {
+            1
+        } else {
+            range
+        };
+    }
+
+    /// The quantiser floor in force.
+    #[must_use]
+    pub fn min_qp(&self) -> u32 {
+        self.min_qp
+    }
+
+    /// Move the quantiser floor. Zero removes it.
+    pub fn set_min_qp(&mut self, min_qp: u32) {
+        self.min_qp = min_qp;
+    }
+
+    /// Ask for a different effort level, for a measurement that sweeps it.
+    ///
+    /// **Not clamped to the device's range here.** A probe naming a level the
+    /// device never offered is asking what it does with one, and the answer
+    /// is worth seeing rather than hiding behind a clamp.
+    pub fn set_quality(&mut self, level: u32) {
+        self.quality = level;
+    }
+}
+
+impl EncoderTrait for Encoder<'_> {
+    type Error = Error;
+
+    fn submit(&mut self, frame: &lowlat_capture::Frame<'_>, force_keyframe: bool) -> Result<()> {
+        Encoder::submit(self, frame, force_keyframe)
+    }
+
+    fn poll(&mut self) -> Result<Poll<'_>> {
+        Encoder::poll(self)
+    }
+
+    /// Cannot fail here: the rate travels with each picture rather than being
+    /// encoder state, so there is no call to make and nothing to refuse.
+    fn reconfigure(&mut self, bitrate_bps: u32) -> Result<()> {
+        Encoder::reconfigure(self, bitrate_bps);
+        Ok(())
+    }
+}
+
+impl Drop for Encoder<'_> {
+    fn drop(&mut self) {
+        let va = self.context.display.va;
+        let display = self.context.display.raw;
+        for id in &self.coded {
+            // SAFETY: each came from a successful create.
+            unsafe { (va.destroy_buffer)(display, *id) };
+        }
+    }
+}

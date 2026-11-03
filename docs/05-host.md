@@ -1,0 +1,1743 @@
+# 05 - Host pipeline
+
+**Status:** locked 2026-08-15. Implemented by `lowlat-capture`, `lowlat-encode`,
+`lowlat-audio`, `lowlat-inject`, and the orchestration in `lowlat-host`.
+
+Capture and audio land at Gate B on bare metal ([00-overview.md](00-overview.md) D9). The
+traits, the pipeline shape, and every rule below are fixed now, because they are what the
+synthetic path is built against and what the real backends must satisfy without renegotiation.
+
+## §1 Threads
+
+| Thread | Owns | Count |
+|---|---|---|
+| capture and encode | acquire, convert, submit, collect, hand to packetizers | one |
+| audio | capture, encode, fan out | one |
+| network | one session's shell loop | one per guest |
+| admission | attempts, candidates, setup, teardown | one |
+
+Input injection rides the delivering network thread. Injection is cheap and fire and forget,
+and a dedicated thread would add a hop to the one budget with a human in it.
+
+**Single encode, broadcast fan-out.** One capture and one encode serve every guest. Per-guest
+work begins at packetization, where sequence spaces and rings are already separate.
+
+No thread here raises its own priority ([02 §1](02-io-shell.md)).
+
+## §2 Capture
+
+The capture trait is a source of GPU frames plus cursor state. Backends are selected at
+startup, never mid-session.
+
+```
+trait FrameSource:
+    acquire(timeout) -> Frame | Timeout | Recoverable | Lost
+    cursor_state()   -> position, visibility, shape-if-changed
+```
+
+Rules:
+
+- **A frame is a GPU handle, never bytes.** The variant is platform and backend specific: a
+  device texture, or an imported buffer handle. Nothing in the pipeline copies pixels to
+  system memory unless §4 explicitly selected a software encoder.
+- **Capture is timestamped at acquire**, and that timestamp travels with the frame through
+  conversion, encode, and packetization. It is the origin of every latency measurement in
+  §10.
+- **`Lost` triggers backend reinitialization, not session teardown.** Display mode changes,
+  resolution changes, and compositor restarts are normal events. Guests see at most a brief
+  freeze and a keyframe.
+  *Added 2026-10-14:* so is a device lost under the stream -- the GPU reset, its driver
+  restarted -- which is a rebuild on the device as it comes back; an encoder failing because
+  its device went away is never read as refusing what the guests asked for. On Windows the
+  restart also renumbers every output while the monitors stay, so an output asked for by name
+  is followed by the monitor it showed. A program taking the display in exclusive fullscreen at
+  another mode is a resolution change, and is followed both ways. *Amended 2026-10-21, at W3.11:*
+  on the host's own display too, which is held against the system's restore alone, so a program's
+  own mode stands ([11 §1.5](11-drivers.md)).
+  *Added 2026-10-16, at W3.5's review:* **a display listed under a GPU without the encoder is
+  waited for**, within the wait for a display, rather than refused at once: while a GPU's driver
+  restarts, Windows lists a virtual display under another GPU for about a second and a half, and
+  the panels under its software renderer, which is just when a stream that saw its device lost
+  rebuilds. And **the host's own display is plugged again while the stream waits** for a
+  display, so its driver updated, restarted or ended under a stream costs a rebuild rather than
+  the guests ([11 §1.8](11-drivers.md)).
+  *Amended 2026-10-24, at W3's gate:* **a display that does not come back within the wait ends
+  the guests and takes none of their preferences off.** The wait's deadline is not a
+  configuration the device refused: an output a guest asked for that never lit goes back to the
+  one before it, and otherwise every guest is ended with the capture's reason; the second codec,
+  ten-bit colour and full chroma stay what the guests asked for, for them and every guest after.
+  *Added 2026-10-19, at W2.7's gate:* **AMD's encoder is let go without being ended once its
+  device is gone.** Ending it then copies on the device, and AMD's driver faults the process
+  rather than refusing; what the encoder holds stays held for the process's life, once per
+  loss. The rebuild after a restart of the GPU's driver measured 2.1 s, the guest kept.
+- The acquire timeout is one frame interval. A timeout is not an error; it means the screen
+  did not change, and the correct response is to skip the iteration rather than to encode a
+  duplicate.
+- **The display's own present paces the tick.** Where the device delivers vblank events, the
+  frame clock caps the rate and the event sets the phase, so the picture read is the one just
+  presented rather than one taken at an arbitrary moment inside a refresh. It is not
+  universal, and it is probed rather than assumed: measured 2026-08-25, the open stack
+  delivers the events and the proprietary NVIDIA driver refuses the request outright, so a
+  stream asks once at start and falls back to the timer when the answer is no.
+  *Added 2026-10-14:* on Windows the present is desktop duplication's own wait, which answers
+  only when the image or the pointer changed. A new image is a present; a wait past the
+  frame's deadline that sees no composition for a refresh is a present of the same picture, so
+  a still desktop still ticks once a refresh; and a frame that carries only the pointer is no
+  present at all -- the pointer moves a thousand times a second, and ending the wait on it
+  would make a composition a millisecond behind it wait a whole frame interval.
+  *Changed 2026-10-15:* **on Windows the deadline takes its phase from the compositions.** Each
+  picture says when the system composed it, and compositions land only on the display's
+  refreshes, so the next deadline is the refresh nearest a grid that advances one interval per
+  picture taken: just before that refresh when none lies between it and the last picture, so
+  its composition is taken as it lands, and just after it when refreshes between are skipped,
+  so it supersedes one left pending from a skipped refresh. The grid keeps the rate exact
+  whatever the refresh -- ninety a second on a 120 Hz display alternates one refresh and two --
+  and starts again on the picture that ends a stall. A wait that saw nothing composed is
+  followed by another at once, not by a sleep to the next deadline, and a picture still being
+  encoded is polled for every millisecond of it, so it is collected as it finishes rather than
+  when the wait ends; a desktop out of reach keeps the clock's own pace, which is what asks for
+  it again. Before, a deadline anchored once
+  and kept made a composition landing between a tick and the next deadline wait for it: up to
+  a refresh, on about half of all desktop updates and on every frame of content whose phase
+  fell that way. Linux keeps the clock's own phase until the vblank event's own time is read.
+  *Amended 2026-10-25, at W2.8's build ([impl-plan-windows.md](impl-plan-windows.md)):* **while
+  Intel's encoder holds a picture, the duplication's wait is not entered**; the loop sleeps a
+  millisecond at a time instead. With that wait back to back a picture took 11.0 ms from submit
+  to collected at the median, against 3.8 with the loop polling, and the loop ran at half the
+  refresh -- most likely because Intel's runtime finishes each picture on the device the wait
+  holds. Waiting on every encoder instead cost NVIDIA's leg a fifth of its rate, so the guard
+  is Intel's alone; the host's own display read from its driver waits on an event of its own and
+  needs none.
+- **The rate is read from the display, not only bounded by it.** The mode the lit controller is
+  running carries how often it presents, so the frame clock is set from `min(asked, refresh)` and
+  from the refresh alone when nothing was asked. Bounding without reading is not enough: the
+  configured rate is what the encoder's per-frame budget is divided by, so a stream asking for
+  twice the frames the display can present halves what each frame may spend and reaches the
+  display's rate anyway. Zero from the device -- a mode it will not describe -- leaves the
+  request standing, and a default stands when there is no request either.
+  *Amended 2026-10-16:* **on Windows a mode can overstate how often its display presents.** The
+  desktop is composed on the compositor's one clock, which on Windows 10 is the primary
+  display's: a virtual display at 144 or 240 under a 120 Hz primary was handed 120 compositions
+  a second, measured. So the rate is the lowest of the request, the mode and the clock the
+  compositor reports, read again at every change of the captured display's mode -- its refresh
+  included -- and the refresh the deadlines take their phase from is that clock too. With the
+  mode's period there instead, a ceiling of 60 or 90 took each picture 4.6 to 6.2 ms after its
+  composition at the median, where a panel whose mode is its clock takes it within a
+  millisecond.
+  *Amended 2026-10-21 ([impl-plan-windows.md](impl-plan-windows.md) W3.12):* **read from the
+  display's driver, the deadlines take their phase from the slower of that clock and the mode.**
+  The driver is handed the first composition after each refresh of its own -- at most the mode's
+  rate, 60 a second at 60 under 120, measured -- and its refreshes and the compositor's drift
+  past each other a composition at a time. On the compositor's period, once the two had drifted a
+  composition apart, every deadline landed just after a composition that carried no picture and
+  the loop took the one before it, a composition old, at every tick: 9.3 ms from the driver's
+  acquire to the conversion at the median, live. The duplication sees every composition, and its
+  deadlines stay on the clock.
+  *Found 2026-10-22:* **a panel slower than the primary is not composed on the clock, and its
+  pictures can be taken a composition old for seconds at a time.** A monitor at 60 beside a 120 Hz
+  primary -- 59.885 Hz in fact -- was handed 100 to 112 compositions a second by the duplication,
+  their timing moved by the beat of the two refreshes: on the clock for a while, then alternately
+  up to 2 ms after it, then merged into one every 16.65 ms. Where the composition a deadline waits
+  past lands later than the margin, or not at all, the loop takes the one before it, and the grid,
+  kept for that as for one left from a skipped refresh, puts the next deadline the same way: up to
+  155 pictures in a row a composition old, measured with a copy of the loop, where the system hands
+  each over within 0.15 ms; at the monitor's 120 it streams clean. Left as it is
+  ([impl-plan-windows.md](impl-plan-windows.md), W2's pacing decision): the host streams the
+  primary, its own display or a headless machine, each composed on the clock.
+- **The host's own display can be read straight from its driver** (*added 2026-10-16*,
+  [11 §1.6](11-drivers.md), [impl-plan-windows.md](impl-plan-windows.md) W3.3), the system's
+  own buffers converted as they are, with no duplication between: a second Windows source behind
+  the same names, the host's own display's from W3.4 and the duplication's until then. Its
+  present is a picture the driver published and this host has not taken; a refresh past the
+  deadline with none is a present of the same picture, as the duplication's wait has it, but only
+  once there is a picture to be the same as -- before the first, the wait is for it. A picture's
+  time is the driver's acquire. Its mode's refresh comes with each of the driver's swapchains and
+  is read with each picture, so a refresh changed alone settles the rate again, as the rule above
+  has it. **The latest picture is always taken**, and it is never the same
+  as the last unless its frame number is the last one taken: a still desktop's marker repeats the
+  frame number in another buffer and is the only way left to a picture taken too late. After the
+  conversion is queued the host checks that the driver has not acquired as many newer pictures as
+  the swapchain has buffers, less one -- the system writes a buffer again only then -- and
+  converts the latest instead when it has, counted.
+  *Amended 2026-10-19, at W2.7:* where the encoder reads the picture itself -- an AMD GPU, §3 --
+  the check follows the picture's collect, when the encoder has read it, and a buffer found
+  written again then is already encoded: it is counted and the next picture is a keyframe, since
+  an encoded picture is never dropped. A buffer stays intact for three refreshes and the encode
+  takes about 5 ms at 2560x1440, so it is not expected to fire.
+  *Amended 2026-10-19, at W2.7's build:* the buffer goes to the encoder once the system's write of
+  it has finished, waited for on the processor, since the device's queue does not order the
+  encoder's own engine; and the check counts a picture only where the newest picture was acquired
+  before the encoder's last came out, so a read in time never is -- none under a load at 120
+  refreshes, 19 of 20 with each picture handed over 30 ms late ([11 §1.6](11-drivers.md)).
+  *Corrected 2026-10-16, at W3.5's build:* **the refresh bounds the wait before the first
+  picture too.** Unbounded, a stream built while its display had no picture yet -- the host's own
+  display plugged again a moment before, after its driver was updated, or asleep -- found no
+  present in the start's probe, was paced by the clock alone, and spun there: a tick that took
+  nothing new is followed by another at once, which is right only where a wait paces the loop.
+  Measured on an update mid-stream, a report of 600 frames every 2 to 4 ms, the guest's pictures
+  falling from 18 a second to 6 and their latency from 1.5 ms to up to 9. And **a driver whose
+  process ended answers nothing**: its wait runs to the refresh, as a still desktop's does, until
+  the output's departure rebuilds the stream; answering at once spun the loop meanwhile.
+  *Amended 2026-10-20, at W3.8:* **any monitor of the host's display driver is read so**, not
+  its own display alone -- one plugged through `lowlatd display`, the controller's own program or
+  another program's handle -- its slot found in the driver's list by the output's name as the
+  display opens; one the driver does not list, or whose frames cannot be taken, is duplicated as
+  before. **And only while it stands upright.** The driver is told nothing of a turn, so the
+  pictures of a turned monitor say nothing of one: a turned output is duplicated, its turn
+  declared as any display's is, and a turn under a read from the driver -- the host's own
+  display's included -- is seen by the output's once-a-second look and rebuilt onto the
+  duplication, until a turned picture read from the driver has been checked.
+  *Checked 2026-10-20, at W3.9:* **a turned monitor stays on the duplication.** Its driver's
+  picture is the duplication's to the sample, both at the panel's sides, but the pointer's shape
+  the driver hands over is turned for the panel -- every hotspot moved -- where the duplication's
+  is upright, as the pointer a guest is sent must be. **And a turned output's duplication no
+  longer asks for a rebuild as it opens**: the duplication describes its mode at the desktop's
+  sides and hands its picture over at the panel's, and compared as the picture's, every open of a
+  turned output -- a panel's as much as a virtual display's -- asked for another, a stream
+  turning over and over.
+- **On Windows the lock screen and the secure attention screen are drawn on the primary display
+  alone** (*found 2026-10-16, at W3.5's checks*). A guest watching another display -- the host's
+  own beside a lit panel -- sees black while they are up, though the stream goes on, follows the
+  input onto them, and the guest's keys reach them; with the host's own display the only one, or
+  the primary, the guest sees them and unlocks the machine by typing. An elevation prompt is
+  drawn the same way, its dialog on the primary alone, though every other display shows its
+  dimmed backdrop rather than black.
+- **On Windows a display asleep is woken by input, not by the stream** (*added 2026-10-16, at
+  W3.5's review*). A stream holds the display on while it lives, but a display that slept before
+  a guest arrived stays asleep under that request and gives no pictures -- a virtual one loses
+  its driver's swapchain meanwhile, its output staying on the desktop, so nothing is rebuilt --
+  until input wakes it, measured. A guest's first input does; a setting, off by default, has the
+  stream wake it as it starts with one injected pointer move of no distance, which woke it in
+  170 ms.
+- **Dirty-rectangle awareness is deferred.** It is a real optimization for desktop work and it
+  interacts with the reference chain in ways that need measurement first.
+
+The **synthetic source** implements the same trait and is not a test double. It generates
+frames with known content and controlled motion, and it is how everything up to Gate A is
+built and verified. It remains in the tree afterward as the deterministic input for
+performance work, since a real desktop is not reproducible.
+
+Backend selection, privilege requirements, and the display-stack decision are in
+[07-platforms.md](07-platforms.md).
+
+## §3 Colour conversion
+
+Encoders want a planar format. Captures deliver packed. The conversion is ours.
+
+- **Never let the encoder convert internally.** Doing so cost roughly 3 ms per frame on
+  contemporary hardware, which at 120 fps is more than a third of the entire frame budget.
+  *Corrected 2026-10-14:* on the vendor's 2025 hardware (an RTX 5060, D3D11) it measured no
+  dearer than this conversion: at 2560x1440 and 120 a second, one pass at the fastest preset,
+  3.1 against 3.2 ms p50 for H.264 and 6.2-6.5 against 5.8-6.0 for HEVC, the encode included,
+  in long alternating blocks at the same power state. The rule stands for the rest of this
+  section -- the matrix, the range and the colour description are ours to state, the layouts
+  are ours to choose, and one conversion serves every encoder -- not for that cost.
+  *Amended 2026-10-19, at W2.7 ([impl-plan-windows.md](impl-plan-windows.md)):* **AMD's encoder
+  on Windows converts, in its own hardware.** Its runtime takes the captured BGRA as it is and
+  converts it in the video engine at no cost to the encode measured -- 2.97 ms at 1920x1080 and
+  4.90 at 2560x1440, as for its NV12 input -- where this conversion took 0.55 and 0.97 ms of an
+  integrated GPU that also composes the desktop, and 1.4 to 1.8 ms from queued to output. The
+  matrix, the range and the colour description stay ours, stated to the encoder as BT.709 in the
+  video range, and its result lands on the same values except at sharp colour edges, where its
+  chroma filter differs. Every other encoder takes this conversion.
+  *Amended 2026-10-19, at W2.7's build:* **at eight bits only.** Into ten bits its conversion
+  writes every level at the eight-bit scale, without an error, so a ten-bit stream on an AMD GPU
+  takes this conversion into P010, which the encoder codes as its source. And its matrix is BT.709
+  whatever profile it is told -- at 1280x720 and below 720 lines alike -- only the range following
+  the statement, so the colour description stated is the picture's.
+- **Planes are written by a compute shader**, addressing each plane as a separate view.
+  Copying between subresources to move plane data drops chroma on more than one vendor's
+  driver, produces green or smeared output, and looks like an encoder bug for as long as it
+  takes to find.
+  *Amended 2026-10-25, at W2.8 ([impl-plan-windows.md](impl-plan-windows.md)):* **on Intel's GPUs
+  the planes are drawn instead**, one draw a plane into a render target and one into the packed
+  word, the same arithmetic. The bytes are identical on all three makers' GPUs, and on Intel's
+  the compute pass's typed stores cost 2.8 to 5.6 times the draw -- 0.90 against 0.32 ms for
+  NV12 at 1920x1080 back to back, 1.43 against 0.35 for P010. Every other GPU keeps the compute
+  pass: NVIDIA's measured the two alike and cannot draw Y410, and AMD's integrated GPU computes
+  faster and has no packed render targets. Intel's encoder takes this conversion as NVIDIA's
+  does: its runtime's own conversion of the captured picture added 0.8 to 2.8 ms inside the
+  encode and took its matrix from the stated colour description the wrong way round.
+- **One conversion target per in-flight slot.** A ring of four. Frames in flight must not share
+  a destination, or the encoder reads a surface that the next iteration is already
+  overwriting.
+- Conversion runs on the same device as capture and encode. A cross-device path means a
+  readback, which §4 forbids implicitly.
+- **Raised, the conversion runs beside the graphics queue** (*2026-10-28*). Where the device
+  grants its queue a high global priority -- the kernel asks for `CAP_SYS_NICE`
+  ([07 §6.1](07-platforms.md)) -- the conversion takes a family that computes without drawing,
+  at that priority, so a game holding the graphics queue no longer holds the stream on its last
+  picture: on an AMD APU under a game, 265 held pictures in 80 s became none, the conversion
+  0.6 ms. Refused, the device is made as before, on the first family that computes, and the
+  refusal is said once: at normal priority the compute-only family measured no better.
+- **An integrated device powers its compute block down between frames, and the first
+  conversion after the gap pays the wakeup.** Measured on the open stack: 0.4 ms warm
+  against 1.3 ms after a few milliseconds of idle, with no encoder and no display activity
+  involved. The stream sends a partial-conversion poke two milliseconds before the display's
+  next present, where vblank events exist, so the conversion lands warm; the poke's size is a
+  named constant chosen by measurement, not a guess.
+
+### §3.1 The colour matrix is fixed
+
+**Coefficients are BT.709 and are not negotiable.** `kr = 0.2126`, `kb = 0.0722`, so
+`kg = 0.7152`. The forward transform the conversion owes is:
+
+```
+y = kr*r + kg*g + kb*b
+u = (b - y) / (2 - 2*kb)      // 1.8556
+v = (r - y) / (2 - 2*kr)      // 1.5748
+```
+
+followed by the range encoding below.
+
+**A receiver applies the inverse unconditionally**, with no signal in either direction saying
+which matrix was used and no path that selects a different one. Emitting BT.601 therefore
+produces a stream that decodes perfectly and renders with the wrong colour: shifted skin tones
+and greens, on every platform at once. There is nothing to notice it, so it presents as a
+complaint about picture quality and gets attributed to the encoder or the bitrate.
+
+**Range is limited, measured from a recorded stream.** The parameter set of a real 1080p60
+session declares `yuv420p`, limited range, BT.709 primaries, matrix and transfer. So the far
+side's renderer supporting a full-range path says only that it can be told to use one, not
+that anything asks it to. *Corrected 2026-09-24: something does ask. Another established
+host sends the full range at every codec and depth, declared in its parameter set and true of
+its samples, so a receiver reads the range from the stream ([10 §4](10-client.md)); the
+recorded session was one host, not the protocol. This host stays at the limited range and
+says so.* Limited range is:
+
+```
+y = y * (219/255) + 16/255
+u = u * (224/255) + 128/255
+v = v * (224/255) + 128/255
+```
+
+with `64/1023`, `876/1023` and `512/1023`, `896/1023` for the 10-bit form. Full range applies
+the chroma offset alone and leaves luma untouched. **Getting the range wrong is a subtler fault
+than getting the matrix wrong** -- black lifts to dark grey and white clips, which reads as a
+washed-out picture rather than as a colour error, so it is easy to mistake for a contrast
+setting.
+
+**Say all of it in the bitstream as well.** The recorded stream carries a complete video signal
+type and colour description in its parameter set, so the encoder must emit the same: signal
+type present, full range clear, and primaries, matrix and transfer all BT.709. Doing the
+conversion correctly and then leaving the description absent produces a stream that any
+decoder is entitled to interpret with a different matrix, and some do.
+
+**And say that it reorders nothing.** The H.264 sequence set carries the bitstream restriction
+with `max_num_reorder_frames` zero. A set silent about the reorder depth leaves a decoder that
+cannot know to hold pictures back to the level's worst case, and one hardware decoder measured
+a hundred milliseconds of decode on a stream with no reordering in it; with the depth stated it
+measured ten (2026-09-12). The HEVC set states the same in its own field. Every writer here
+carries it: the vendor interface's usability block, the hand-written set, and since
+2026-09-13 the Vulkan Video set, which until then carried no usability information at all --
+no reorder depth and no colour description -- and now carries both, traced on the device's
+own output and decoded by an independent decoder as BT.709.
+
+**8-bit is the default and 10-bit is what a guest may ask for** (D7, from 2026-08-30). A
+recorded reference session is `yuv420p` throughout and a stream runs at eight bits until a
+seated guest declares otherwise, so nothing changes for a peer that says nothing.
+
+**The ten-bit capture path was always required** ([07 §3.1](07-platforms.md)) because that is
+what the display hands us; what changed is that it is no longer converted down on the way out.
+The conversion reads through a sampler, which normalises any depth to float, so **the loss was
+happening at the write and nowhere else**.
+
+**The depth is settled by negotiation, not by configuration.** It is the intersection across
+seated guests, exactly as the codec is (§6.1), and a request to change it rebuilds the
+encoder. There is no host setting for it: one encode serves every seat, and a person choosing
+a depth on behalf of guests whose decoders they cannot see would be choosing wrong for some of
+them. What a host owes instead is the truth about what it is producing, which is why the live
+codec, chroma and depth are on `lowlat_host_status` ([06 §status](06-api.md)) rather than only
+in the configuration that was asked for.
+
+**Ten-bit is HEVC only**, and that is the hardware's constraint rather than a policy: no
+encoder on any of the three interfaces offers an H.264 profile above eight bits, and one of
+them cannot express one at all. A peer that asks for depth without asking for HEVC is asking
+for something nothing can produce.
+
+**4:4:4 is out of v1 and the reason is coverage, not cost** (D7). It measures at 0.22 ms a
+picture and 1.39x the bytes at eight bits, and 1.86x the bytes at ten on the same content:
+the encode time is nearly free and the bandwidth is not. What rules it out is that one of the
+three encoders produces none of it at any depth, and the encoder follows the display. **When
+it returns, the conversion is one body per layout, not per depth**: the vendor interface takes
+three planar planes and the open stack one packed plane (AYUV or XYUV at eight bits, Y410 at
+ten), each body keeping the depth uniform and the colour rules shared
+([the plan, Phase 11.6](impl-plan.md)).
+*Added 2026-10-14:* on Windows the vendor interface takes the packed words as well, AYUV at
+eight bits and Y410 at ten, which a D3D11 device writes through one typed view and the encoder
+reads by the texture's own format; no planar full-chroma layout is taken there. Both came back
+through the library's own decoder carrying colour that changes every pixel.
+
+**Chroma is averaged over each 2x2 block on the way out.** This is worth stating because the
+reverse direction is free and invites the assumption that this one is too: a decoder samples
+the chroma plane at the luma coordinate and gets its upsample from the hardware sampler at no
+cost. Writing subsampled data has no such shortcut. The two output planes are different
+resolutions and the average is ours to compute.
+
+## §4 Encode
+
+```
+trait Encoder:
+    submit(frame, force_keyframe) -> ()
+    poll() -> Bitstream | Pending
+    reconfigure(bitrate) -> ()
+    accepts() -> [FrameVariant]
+```
+
+**Submit and poll are separate.** A blocking `encode(frame) -> bitstream` is the single
+biggest structural mistake available here: a serialized acquire, convert, encode loop capped at
+70 to 80 fps against a 120 fps target. Encode must overlap the next acquire, so the trait
+cannot express the serialized form.
+
+- **The quantiser floor is a latency control, not a picture setting**, and it reads backwards
+  until the chain is spelled out. A lower floor lets the encoder spend more bits refining a
+  frame; more bits is a larger frame; a larger frame is more packets; more packets is longer on
+  the wire and longer in every queue between here and the far side. Below about **5** the extra
+  bits buy nothing the eye resolves, so they are spent purely on delay. **5 is therefore the
+  lowest-latency setting rather than the lowest-quality one**, and it is the default for a
+  product whose first goal is latency. Raising it trades visible sharpness for smaller frames.
+- **`reconfigure` changes bitrate live.** It never reinitializes the encoder and never emits a
+  keyframe. Congestion response happens many times a minute (§5); an encoder reinitialization
+  at that cadence would be visible as a stutter every time the network hiccuped.
+- **`force_keyframe` is cheap and is used freely.** Recovery policy in §6 depends on it.
+- **`accepts` drives pipeline construction.** The backend declares which frame variants it can
+  take. Construction selects a compatible capture, conversion, and encode triple. A mismatch
+  is a hard error, logged with both sides named. **A readback is never inserted automatically**
+  to resolve one; it must be requested by selecting a software encoder. Otherwise a driver
+  quirk turns into a silent per-frame cost that survives to production.
+
+Backends:
+
+| Backend | Status | Notes |
+|---|---|---|
+| hardware, NVIDIA | shipped | H.264 and HEVC; low-latency preset, variable rate with a one-frame buffer, non-reference frames enabled |
+| hardware, AMD on Windows | shipped (*2026-10-20*) | H.264 and HEVC, HEVC at ten bits from the host's conversion, no full chroma; the low-latency usage, a latency-constrained variable rate with the largest picture bounded by the buffer; at eight bits the captured picture read in place and converted in the encoder's own hardware (§3) |
+| hardware, Intel on Windows | shipped (*2026-10-25*) | H.264 and HEVC, HEVC at ten bits and full chroma at both depths, all from the host's conversion; the current runtime alone; a variable rate, the buffer at six pictures of the session's ceiling and each picture bounded by the encoder's own largest-picture limit, moved with every live change; the runtime's remote-gaming tuning in both codecs; HEVC's predicted pictures the runtime's low-delay bidirectional slices; one picture in the engine at a time |
+| hardware, open stack | shipped | AMD and Intel parts, reached through the display interface; HEVC's predicted pictures as low-delay bidirectional slices where a device requires the second list (*2026-10-28*: Intel's low-power encoder, which otherwise hangs after the first picture on the integrated parts) |
+| hardware, Vulkan Video | explicit choice | H.264 and HEVC at either depth, half-resolution chroma only; conversion and encode on one interface, where the conversion may write the encoder's picture |
+| software | later | dynamically loaded, resolved by codec name; the path for machines without hardware encode, and the path continuous integration runs |
+
+**Selection policy, settled 2026-08-25.** The default follows the display: the encoder for
+the device the captured output is on, which is the NVIDIA backend on that vendor's cards and
+the open stack elsewhere. **The device is resolved from the captured output, never from a
+node number**: numbering is the order the kernel probed the cards in and changes when one is
+added or moved, so a machine with two video-capable cards would otherwise encode on the one
+that did not draw the picture. That pair is the coverage floor -- roughly a decade of hardware --
+and it stays the default. The Vulkan Video backend is offered as an explicit third choice
+and is never inferred: it is newer and covers less hardware. It carries both codecs,
+predicted pictures and a live session now, so what remains is the coverage question rather
+than a missing piece. A device that cannot serve it -- no encode interface, or a device
+where a copy would have to stand between the conversion and the encode -- says so once and
+the stream follows the display exactly as before; a device that can serve it and then fails
+while building keeps its refusal rather than being quietly given something else. **Full
+chroma is one of the things it cannot serve, on any part**, so its capabilities say so and a
+stream that has settled on full chroma passes over it before a device is asked -- refused
+that late instead, the pairing fails where a target is allocated and ends every guest on the
+stream, where passing over costs nobody anything. The conversion
+runs on the compute interface by default and falls back to the GL interface on devices
+without it, which keeps old parts capturable; the GL interface cannot feed the NVIDIA
+encoder, and machines old enough to need it are served by the open stack anyway.
+*Added 2026-10-20, at W2.7's gate:* **on Windows the encoder is the captured output's GPU's
+own** -- NVIDIA's or AMD's, chosen by the vendor of the GPU that renders the output, and moved
+with it when a guest switches outputs. An output another GPU renders is refused rather than
+copied across, since a copy between GPUs would be measured in place of the encoder; there is no
+open stack there, so that kind is refused by name. Measured against an established host on the
+same monitor, the same client and content, AMD's encode is below it at p50 and p95 on both AMD
+parts it ran on ([09 §8](09-compatibility.md)).
+*Amended 2026-10-25, at W2.8:* **or Intel's**, on a GPU whose driver carries Intel's current
+runtime; a GPU only the older runtime reaches is refused, as a GPU with no encoder here is.
+Against an established host on the same monitor, Intel's H.264 encode took about half its time
+at p50, p95 and p99, and that host served no HEVC from that monitor ([09 §8](09-compatibility.md)).
+H.264 on the part measured is no wider than 4096 and no faster than 165 pictures a second, so a
+guest that decodes nothing else is ended past those, as one is past NVIDIA's 4096 (§6.1).
+
+Codec and colour scope is [00-overview.md](00-overview.md) D7: H.264 and HEVC, 4:2:0, eight
+bits by default and ten when the seated guests ask for it. **A backend that cannot code what
+was asked says so and is named**, rather than the pipeline asserting a fixed answer: what a
+device will emit is a capability it reports, not a constant.
+
+### §4.1 Where a host sits between delay and picture
+
+**One setting, three points, and everything else stays a default.** An encoder has a dozen knobs
+and almost none of them are a person's business; what a person actually wants to say is whether
+they would rather wait less or look at more. That is `lowlat_quality`
+([06 §quality](06-api.md)), **moved while a host runs** (*amended 2026-11-01*, minor 37; it was
+settled when hosting started), and it moves two levers underneath.
+
+| | Quantiser floor | Search effort |
+|---|---|---|
+| lowest latency, the default | 5 | the least a device offers |
+| balanced | none | the least a device offers |
+| highest | none | the most, and a second pass where the encoder has one |
+
+(*Corrected 2026-11-01*: the effort column had the two ends swapped, against the paragraph
+below and against what the host does.)
+
+**The floor is a latency control, not a quality one**, and it reads backwards until the chain is
+laid out: a lower floor lets the encoder spend more bits refining a picture, more bits is a larger
+frame, a larger frame is more packets, and more packets is longer on the wire and longer in every
+queue between here and the far side. Below about five those bits refine nothing the eye resolves,
+so they are spent purely on delay. Left off entirely the effect is not subtle: an unbounded
+encoder handed a flat picture emitted 2.5 MB for it, four fifths of what that frame occupies
+uncompressed, where a bounded one spent half a kilobyte on the same content. The floor applies to
+every picture kind, refreshes included -- a refresh is the largest frame in the stream and the one
+that matters most for delay, so bounding only the predicted pictures leaves the important one
+unbounded.
+
+**Search effort is a different lever and is not fidelity.** It says how far the encoder looks --
+motion range, sub-pixel refinement, how many modes it tries -- not how coarsely it quantises. At a
+fixed rate more effort spends fewer bits on the same picture, and it takes longer: measured at
+1080p on a discrete part offering seven levels, the fastest codes in 1.5 ms and the most thorough
+in 3.3. The rate is already what holds fidelity up, so effort the bitrate will not let the encoder
+spend is delay with nothing to show for it -- which is why the fastest level is what the first two
+settings ask for, and why the third carries a warning rather than being the default.
+
+**Ask for the top of a device's own range, never a tuned number.** Ranges are the device's and do
+not compare: one part here offers seven levels and another thirty-two, and the second's timings
+track none of them -- its own default is already as quick as anything it offers, and the middle of
+its range is slower than sending nothing at all. Asking for the top serves both without any
+knowledge of which device is which, and a device advertising no range is sent nothing, because a
+level it never offered is a configuration it did not agree to.
+
+**A move while the host runs is the encoder's to make** (*added 2026-11-01*), asked of it only
+when the setting differs from the one it runs at, and answered three ways: taken as it runs, taken
+at a keyframe of its own, or not taken, which rebuilds it at the new setting. The floor alone
+moves on every encoder as it runs. The effort is where they differ:
+
+- **NVIDIA's moves as it runs, in both codecs**, its preset and its second pass with it, in one
+  reconfiguration of under 5 ms. Left to its presets, its H.265 codes one reference at the
+  fastest and four at the most thorough, the sequence and picture sets say so, and a
+  reconfiguration resends neither: moved that way, the decoder refused the first picture after
+  the move into the highest setting, and decoded every picture after the move out of it wrong
+  with no error at all. **It codes one reference at every setting**, as every other encoder here
+  does, and the sets are then the same at all three.
+- **AMD's takes its preset as it runs and its second pass only at a re-initialisation.** Both
+  are read back as written, but the second pass's cost never arrives until the encoder is
+  initialised again. So a move that keeps the pass is taken as it runs, and one in or out of the
+  highest setting re-initialises before the next picture, once the encoder holds none -- 1.4 to
+  2.4 ms -- and that picture is a keyframe with its sets.
+- **Intel's takes the effort with a reset** of under half a millisecond, made before the next
+  picture goes in, after the runtime's own check of the parameters that corrects the floor --
+  several milliseconds in H.265, once. In H.264 the reset continues the sequence; in H.265 a
+  change of effort is refused unless it starts a new one, so there it costs a keyframe. A reset
+  the runtime refuses leaves the encoder as it was, coding on at the setting it had.
+- **VA-API and Vulkan Video are rebuilt** at the new setting: neither has been shown to move as
+  it runs.
+
+**What a device does not implement, a host does not pretend it did -- and it cannot tell.** No
+interface here reports whether a driver acted on either lever, and the drivers differ: one takes
+the quantiser floor on H.264 and ignores it on H.265, on the same part. So a host logs the setting
+and the two levers it derived, once per stream, and reports that setting back unchanged. Finding
+out what a device really did means measuring coded bytes.
+
+### §4.2 The GPU's memory clock while a stream runs
+
+*Added 2026-10-24.* **On an NVIDIA GPU a stream holds the memory clock at a floor for as long as
+it runs** (Windows; `hold_memory_clock`, [06 §3](06-api.md), on in `lowlatd`). The driver picks its
+power state from the GPU's load, and a stream's load -- a conversion and an encode a picture, a few
+percent of the GPU -- is light enough for its middle state, whose memory clock is a seventeenth of
+the top. **There the encoder and the conversion are bounded by memory, not by their own clocks**:
+on the development machine's GPU, a 1080p stream at 120 a second encoded a picture in 4.3 to 5.3
+ms in the middle state against 1.0 to 1.1 a state up, at graphics and video clocks higher in the
+middle state than above it, and converted it in 0.62 ms against 0.08. **Which state the driver
+picks is not the content's doing**: any burst of work -- a window dragged across displays, an
+encoder rebuilt -- lifts it a state, and it comes back down seconds or minutes later, so one
+stream of one video ran minutes at each with no input between. Held alone, the graphics clock left
+free, the memory clock took an encode at 1080p sixty a second from 5.1 to 5.9 ms at the median and
+10 to 11 ms at the 99th percentile to 2.11 and 2.16, and given back it went back; what was left was
+the video clock, which the driver had let fall to its own floor. Live, at 1080p sixty a second with
+a video playing on the captured display, a held stream encoded in 1.74 to 1.87 ms at the median
+and the same stream with the hold taken off in 4.4 to 4.9, its middle state back within fifteen
+seconds.
+
+**The floor is the lowest memory clock the GPU lists at or above half its top, and the ceiling its
+top**: the driver still chooses between the two, and the states below half are the light-load
+ones. Holding is the vendor's management library's and needs the administrator -- the service
+runs the host so -- and **a hold outlives the process that took it**: a stream gives the clock
+back as it ends, and a host asked to hold gives back every NVIDIA GPU's as it starts, in case a
+host before it ended without its stream's end. A host that cannot hold -- no library, no
+administrator, a GPU it cannot match -- says why as each stream starts and streams on. The GPU is
+matched by its maker's, device's and board's numbers, so two identical boards are left to the
+driver. The cost measured is 1 to 2.4 W while a stream runs. Linux is not measured, and its host
+does not hold.
+
+## §5 Congestion and the frame gate
+
+Two actuators, driven entirely by host-local signals ([01 §10](01-protocol.md)). There is no
+feedback message and none may be added.
+
+**1. The frame gate, instant.** Before each acquire: if **every** active guest lacks window
+for an estimated frame, skip the acquire entirely. No capture, no conversion, no encode, no
+wasted power, and no damage to the reference chain because nothing was encoded to damage it.
+It recovers the moment any guest drains.
+
+**2. Bitrate, slow.** The controller from [01 §10](01-protocol.md) multiplies down on
+sustained congestion and creeps back up, applied through `reconfigure`. Its interval
+measurement needs fractional-millisecond resolution ([02 §2](02-io-shell.md)).
+
+Policy, exposed as host configuration:
+
+| Mode | Behavior |
+|---|---|
+| latency (default) | yield frame rate early, hold bitrate; smallest queues |
+| quality | hold frame rate, cut bitrate first; for desktop and cinematic work |
+
+The two actuators aggregate differently, and the difference is not an inconsistency.
+
+**The frame gate requires every guest to be pressured.** Skipping the acquire helps nobody if
+one guest can still take the frame, so it fires on unanimity.
+
+**The configured bitrate is a ceiling, not a rate, and not a quality setting.** It bounds what
+the controller may climb to; the controller's own answer is what the encoder is actually told to
+target. On a healthy path the controller sits at the ceiling and the picture is as good as the
+ceiling allows, which is why raising it improves quality. On a congested path the controller sits
+well below it and raising it changes nothing. Both are the same mechanism seen from either side
+of the constraint.
+
+It is also a budget for the host's uplink rather than a per-guest allowance. Every guest receives
+the same encoded stream, so N guests cost N times the encoded rate on the way out. **The ceiling
+handed to each guest's controller is the configured rate divided by the number of guests
+receiving that stream.** Skipping that division does not oversubscribe one guest; it
+oversubscribes the host by a factor of the guest count, and the loss lands on all of them at
+once.
+
+So the two aggregations compose: **each guest's ceiling is the configured rate divided by the
+count of guests on its stream, and the rate actually applied is the minimum of what the guests'
+controllers return.** One term bounds what the host can send in total, the other bounds what the
+slowest path can carry.
+
+**A live change to the ceiling is application protocol, not SDK protocol.** Peers exist that
+ask their host to change the rate mid-session, and to switch which output is captured, by
+sending user data with a sub-identifier and a body the SDK never looks inside
+([01 §11.1](01-protocol.md) calls user data an opaque pass through). That is the right layer for
+it: the SDK hands the payload up and the application decides, because the request is a policy
+question about what the operator permits rather than a protocol one. What the SDK owes is that
+the change applies **live** -- `reconfigure` with no reinitialization and no forced refresh --
+which is already required of it here and in [01 §10](01-protocol.md). Nothing about this is a
+congestion feedback message, and none may be invented (§5 opening).
+
+**Raising the ceiling costs latency, and the chain is the same one the quantiser floor runs.**
+More bits is a larger frame, a larger frame is more packets, and more packets is longer on the
+wire and longer in every queue between here and the far side. So the setting trades picture
+against delay in both directions, and a host whose first goal is latency defaults it low.
+
+**The bitrate is the minimum across guests**, applied only when it moves by more than 0.01
+Mbps so noise does not produce a reconfigure per frame. Which means a chronically slow guest
+*does* pull everyone's rate down, and that is the intended behaviour rather than a flaw in the
+aggregation: the rate is what the transport can actually carry, and sending a guest more than
+that produces loss, not quality. What the slow guest must not do is break the others' streams,
+and it cannot, because delivery is decided per guest in §6.
+
+Stating it as "follow the healthy majority" was wrong on both counts. A majority rule leaves
+the minority receiving a rate its path cannot carry, and there is no majority at all in the
+single-guest case that v1 actually ships.
+
+**On the browser pipe the same controller reads the same figures, synthesized.** The
+association owns retransmission there ([01 §14](01-protocol.md)), so nothing in the host
+sees an acknowledgement; what the controller and the gate read is derived from what the
+association reports, per channel:
+
+| Figure | Native source | Browser source |
+|---|---|---|
+| window | fragments sent and not yet acknowledged | fragments of every message queued and not yet delivered |
+| stale | fragments unsent or unacknowledged past the level's threshold | fragments fully handed to the association longer ago than the threshold and not yet delivered, plus what a message that has waited in the association longer than the threshold has still not put on the wire; a message the association is still releasing is fresh until then, because its window grows only while it is kept full and the pacing that follows is not congestion (*corrected 2026-10-19: the unsent remainder counted at once, as the native scan counts a fragment the shell left in the ring, and there the shell empties the ring within the pass*) |
+| bytes and packets sent | counted at the send | the bytes offered per stream, with the association's retransmitted bytes charged to the video channel |
+| acknowledged bytes | from the group acknowledgement | from the association's delivery notification per message |
+| resends by negative acknowledgement | counted at the retransmit | the association's retransmitted packet count, charged to video |
+| resends by timeout | counted at the retransmit | **always zero**: the association's timers are its own and are not distinguished |
+| round trip | from the acknowledgement | the association's smoothed estimate, zero until a message has been delivered; the smallest recent sample is the smallest estimate over the last 64 deliveries |
+
+The mapping is the reason the controller, the gate and the multi-guest arithmetic above run
+unchanged on both pipes. Two observations from the loopback runs of 2026-09-13 are kept as
+open items rather than tuned away: with no loss and a round trip under a millisecond, the
+stale count still reads a large share of the window whenever a picture exceeds about seventy
+fragments, and the rate the controller settles at is then the picture size times the frame
+rate -- 21 Mbit/s at 30 frames a second, 85 at 120 -- well under the ceiling the page asked
+for. Whether that is the threshold, the association's acknowledgement cadence or the
+delivery notification is not yet established. *2026-10-19: a fourth cause was found and
+removed, and it fits the figures. The association grows its window only while the window is
+kept full, so a sender offering one picture per frame interval settles at about one
+picture's worth, and every larger picture was mostly unsent, and read as stale, at the
+instant the host sampled it. The unsent remainder counts only once its message has waited
+past the threshold now; whether the rate then reaches the page's ceiling on loopback, which
+would close this item, is still to be measured.*
+
+## §6 Multi-guest delivery
+
+v1 policy is single-guest simple, but the data model is multi-guest from the first line
+([00-overview.md](00-overview.md) D10).
+
+### §6.1 What the stream codes, when a guest asks for something else
+
+A guest declares what it can decode in two places, and a host reads both
+([01 §11.5](01-protocol.md)): session initialization declares it, and every encoder
+configuration message restates it. **The later one wins.** A peer may send only the first, so a
+host that required both would leave every such peer declaring nothing at all; a peer that sends
+the second is changing its mind, and a host that kept the first would never hear it.
+
+An encoder configuration message asking for reinitialization is a **request to code
+differently**, not merely a request for a keyframe. It is answered against every seated guest
+at once:
+
+```
+on reinitialization requested by any guest:
+    asked = intersection of every seated guest's declared flags
+    report any bit of `asked` this pipeline does not emit
+    wanted = codec named by `asked`
+    if wanted != running codec:
+        build a new encoder for `wanted`
+        latch every guest, and move the generation so each peer is told
+    else:
+        force one keyframe, which is what the request is owed
+```
+
+*Amended 2026-10-26:* **ten-bit colour or full chroma names the second codec as its own bit
+does.** Both exist on it alone, and an established client asks for ten bits with its
+second-codec preference off, which an established host answers on the second codec; this host
+chose the codec from that bit alone and sent such a client eight-bit H.264. A codec refused
+takes neither with it, since both are dropped before it is.
+
+**The intersection, not the last request.** One encode serves every seat, so a capability only
+some of them declared is one none of them can be sent: granting it would hand the others a
+stream their decoders were not built for, and they report that as a decode failure rather than
+as a mismatch. With a single seat the intersection is exactly what that seat asked for, which
+is the ordinary case. No seats is no capability rather than every capability, because an empty
+intersection is vacuously everything and acting on it would configure a stream from nobody's
+declaration.
+
+**Joining is not asking.** A guest that arrives declaring less than the running stream produces
+does not move it; D11 settles that case by refusing the seat, and only an explicit request
+moves the codec. The refusal is the other half of this and is not built yet, so until it lands
+such a guest is sent a stream it cannot decode.
+
+**The guests outlive the encoder.** A seat is announced exactly once, when the guest claims it,
+so the seated set has to be owned above the encoder rather than rebuilt with it. A loop that
+rebuilt it would find no guests and publish to nobody while every seat still read as streaming.
+
+**What a guest declares is a preference, and one the host cannot meet ends nobody.** A client
+offers the codec and both colour axes as "prefer this if the host has it" and follows what the
+stream turns out to be, so none of them decides whether a guest can be served. A configuration
+that will not build has its axes taken off one at a time and the stream carries on:
+
+```
+on a configuration that will not build:
+    drop the highest preference still set -- ten-bit colour, then full chroma,
+      then the second codec -- and try again on the same output
+    remember what was dropped, so the consensus stops asking for it
+    once nothing is left to drop:
+        put back the output, if a request for one is what brought us here
+        otherwise nothing encodes here at all, and every guest is told (6.2)
+```
+
+**Highest first, and the order is not arbitrary.** Depth costs the most bytes for the least
+visible difference, full chroma the next, and the codec is last because dropping it doubles the
+rate for the same picture.
+
+**What was dropped is remembered against the device, not against the guests.** They go on
+declaring what they prefer, so a preference the pipeline just dropped is wanted again on the
+very next pass: the encoder is rebuilt, fails the same way, drops it again, and the stream
+spends itself rebuilding. The memory clears when the captured output moves, because what one
+card refused says nothing about the next.
+
+**A preference is dropped before a screen is.** A guest that asks to look at another output and
+lands on hardware that cannot code the running colour keeps the output and loses the colour.
+Putting the output back instead leaves it on the screen it asked to leave, over a preference,
+and from the guest's side the request simply appears to have done nothing. The screen is what
+was asked for; the colour is what was preferred.
+
+### §6.1a What each guest is told about a keyframe
+
+One encode serves every seat, but the video header is written per guest, so what travels
+with a keyframe is decided per guest and not for the room (*added 2026-09-16*). A guest that
+declared the video protocol in its initialization ([01 §11.5](01-protocol.md)) is sent the
+pair of [01 §11.3](01-protocol.md): a keyframe-metadata message ahead of every keyframe, and
+the announced bit on the keyframe itself. A guest that did not is sent the older framing
+exactly, and so is every guest over the browser pipe whatever it declared, because that pipe
+carries no video header at all.
+
+```
+per guest, on a frame the stream published:
+    if the guest reads the protocol and the frame is a keyframe:
+        send the metadata message first, whole; a refusal is the frame's refusal
+    send the picture, its announced bit set iff the metadata went ahead of it
+    a keyframe that went out clears the guest's "rebuilt" latch
+```
+
+**The rebuilt bit is a latch per guest, set at seating and at every reinitialisation and
+cleared by the first keyframe that reaches the peer.** It is what a peer tears its decoder
+down on, so it has to describe what the peer has rather than what the encoder did: a
+keyframe refused by the transport never reached the peer, and the next one still has to say
+the parameter sets are new. The older host rule -- every parameter-set-led unit rebuilds --
+stays in force for a peer that reads the bit as absent, which is why a peer that got the
+picture without its announcement loses nothing but a rebuild.
+
+**A guest joining a running stream is described by what the stream codes, not by what the
+guest was admitted with.** The header a peer builds its decoder from carries the codec and
+the depth, and a guest seated after another moved the stream to ten bits sees no
+reinitialisation to follow; its header is filled from the running encoder at seating and
+again at every reinitialisation.
+
+### §6.2 Ending a session, and saying why
+
+Two mechanisms, and which one applies is fixed by when the host learns it cannot serve the
+guest.
+
+**Before a media path exists**, the host declines the offer in signalling
+([04](04-signaling.md)). The peer never receives credentials and never punches, and its API
+reports the refusal.
+
+**After a media path exists**, the only thing that can end a session is a disconnect on the
+control channel ([01 §11.2](01-protocol.md)), because signalling carries nothing once a peer is
+streaming. Everything below is that message with a different reason:
+
+| Reason | When |
+|---|---|
+| no room | every seat is taken when the guest becomes streamable |
+| no encoder | nothing could be built for what was asked of it |
+| encoder capabilities | the device would not say what it can encode |
+| encode failed | the encoder stopped answering mid-stream |
+
+**A peer that cannot decode what it is sent is not on this list.** It is the one party that can
+tell, it raises a decode error of its own, and it reports that through its own API. A host
+cannot detect it and must not pretend to: what a host owes a peer is the truth about what the
+*host* could not do.
+
+**The reason is left where the guest can find it, not sent by whoever decided.** The encode loop
+owns no session and cannot write to any peer; each guest owns its own and is the only thing that
+can. So a failure marks the seat and the guest turns it into a message.
+
+**And the message needs time to arrive.** It rides a reliable channel, so it is retransmitted if
+lost, but a session torn down on the pass that queued it throws the reason away with the ring it
+is sitting in. The session stays up briefly after the decision for exactly that reason.
+
+**A stopped encoder is a run of failures, not one.** A device can refuse a single collect and
+answer the next; ending every guest over that turns a hiccup into a disconnection.
+
+**And a failure does not end the loop.** It goes back to waiting: the seats free as their guests
+read the reason, and the next arrival is owed its own attempt, because a device busy a moment
+ago may not be. The wait has to retire the seats it is waiting on -- only this thread may empty
+one -- or the loop sees a guest that has already left, calls it occupied, and rebuilds the
+encoder that just failed at whatever rate the device refuses it.
+
+```
+on encoded frame F, fragment count N, keyframe K:
+    largest = max(largest, N)                   // recent high-water mark, not this frame
+    want_keyframe = false
+    for each guest G:
+        if G.pending_keyframe:
+            if not K:
+                // Ask for one once the window could hold the biggest frame yet seen.
+                want_keyframe |= G.outstanding + largest <= ceiling(G.rate)
+                continue
+            if G.outstanding + N > ceiling(G.rate):  continue
+            G.packetize(F)
+            G.pending_keyframe = false          // the only place this clears
+            continue
+        if G.outstanding + N > ceiling(G.rate):
+            G.mark_skipping()                   // latches pending_keyframe
+            continue
+        G.packetize(F)
+    if want_keyframe and the throttle allows:
+        encoder.force_keyframe_next()
+```
+
+**The room test is an absolute ceiling on outstanding fragments, not a proportional margin.**
+
+| Configured rate | Ceiling, fragments |
+|---|---|
+| below 20 Mbps | 1500 |
+| 20 to under 30 Mbps | 2500 |
+| 30 Mbps and above | 4000 |
+
+The top step is the peer's ring depth ([01 §7](01-protocol.md)), so the highest rate is allowed
+to fill the peer's ring and no rate is allowed past it. A proportional margin such as "free
+slots must exceed twice the frame" is the shape this section carried before it was measured,
+and it is wrong in both directions: it refuses frames at low occupancy on a deep window, and it
+admits them when the window is nearly full because the remaining room still happens to be twice
+a small frame.
+
+**A skipping guest is retested against the largest frame the recent stream has produced**, not
+against the frame in hand. Testing against the current frame lets a guest out of the cascade on
+a small predicted frame, whereupon the keyframe it needs does not fit, the keyframe grant is
+spent, and every guest pays the bitrate spike for a recovery that did not happen. The
+high-water mark costs two integers and a timestamp and removes the whole failure.
+
+**Correction (2026-08-28).** This section previously called the mark a session high-water
+mark. It decays: the mark is kept over two rolling two-second windows and read as the larger
+of the pair, so it spans at least two seconds of stream and at most four. Held for the whole
+session it only ever grows, and one frame larger than a guest's ceiling then locks every
+skipping guest out of readmission -- and out of asking for the keyframe it needs -- for as
+long as the stream lives. The window is measured in time rather than frames because the frame
+rate is not a constant: a still desktop sends one picture a second, and a window counted in
+frames would hold a spike for minutes on exactly the stream a guest is most likely to join.
+
+**The cascade is the invariant.** A guest that misses one frame must miss every frame until
+the next keyframe. Dropping a single dependent frame breaks the reference chain silently: the
+decoder keeps going and produces progressively wrong output rather than failing. That is the
+gray-frame failure, and it is why `mark_skipping` latches rather than the caller being trusted
+to remember.
+
+**The API must make the wrong thing unsayable.** There is no operation that skips one frame
+without setting the pending-keyframe state. If the ring exposed one, it would eventually be
+called.
+
+Other rules:
+
+- Skipping is per guest. Sequence spaces stay contiguous, so the transport never sees a gap
+  and never retransmits a frame that guest was never sent.
+- The recovery keyframe is global, since encode is shared. That costs a bounded bitrate spike
+  for everyone, which is acceptable because our keyframe is cheap. Throttled to roughly twice
+  a second.
+- A guest that cannot keep up cycles through skip and resync and emits a degraded event.
+  **Disconnecting it is application policy, never SDK policy.**
+- Default limit four guests, compile-time cap sixteen. Ring memory scales per guest.
+
+## §7 Input injection
+
+Injection goes through the kernel input layer, below the display server. That is what makes it
+work identically on X11, on Wayland, and at the login screen, and it is the capability that
+display-server-level injection cannot match. *On Windows* (*2026-10-15*) it is the system's
+batch input call, made by a process of the system account on the session's input desktop,
+which reaches the lock screen and an elevation prompt the same way; the expansion below is
+shared and only the last step differs. *Amended 2026-10-22, planned as W4:* where the
+application switches it on (`virtual_input`, [06 §3](06-api.md)), a guest's keys and pointer go
+instead to a keyboard and a mouse of the host's own HID driver ([11 §2](11-drivers.md)), whose
+input the system takes as a device's: a low-level hook sees no injected flag on it, raw input
+names the device, it reaches the input desktop with no thread attached to it, and the system's own
+keyboard driver gives the keys whose form changes their forms. The batch input call stays the
+default and the fallback where the driver cannot carry the input. *Built 2026-10-26 for the
+keyboard (W4.1):* a guest's keyboard is made as the switch goes on or the guest is admitted
+under it, in the first of the driver's slots free, and its keys wait until the system lists it --
+milliseconds, half a second where it comes back on a name just let go -- which is when what is
+written to it starts reaching the system; where that has not happened within five seconds, where
+the driver gives no keyboard, and after it refuses a report, the keys go through the batch input
+call. *Built the same day for the pointer (W4.2):* a guest's mouse is made beside its keyboard
+and waits as it does. Every button, wheel and motion rides its relative collection, whichever
+pointer the expansion sent it to, the wheels in the units the peer counted; a position on the
+primary display rides its absolute collection, at the pixel the batch input call would have
+named, and **a position on any other display goes through the batch input call**, the absolute
+collection spanning the primary alone ([11 §2.3](11-drivers.md)). A switch either way first
+releases the keys and the buttons held on the old way.
+
+- **Batches are expanded and injected as a unit.** The wire delivers input batches; expansion
+  to device events is a pure, unit-tested function with no device dependency, so the mapping
+  is testable everywhere and only the final write needs hardware.
+- **Keyboard arrives as usage codes** and maps to kernel key codes through a static table.
+  Layout is the far side's concern; we inject physical keys. On Windows the table gives the
+  scancode the system's own translation gives the key on a USB keyboard, and is generated from
+  that translation; the few keys a scancode cannot carry -- Pause, Break, SysRq -- go as the
+  system's keyboard driver reports them, and **the power key is not mapped**, so a guest cannot
+  put the host to sleep or turn it off (*2026-10-15*).
+- **While a peer's mask holds Command -- the GUI bits, Windows or Super elsewhere -- none of its
+  other keys stays held** (*2026-10-26*). An established macOS peer's window never hears a key
+  let go while Command is down, so it never sends that release (this project's client has sent
+  it since M1.4, [10 §8](10-client.md)), and a key left held is typed again by the
+  host's own repeat -- the HID keyboard's, Linux's display server's -- until its next press (on
+  the batch input call it stays down unseen). The mask says Command whatever the key codes say: a
+  peer that swaps Command for Control swaps the codes alone (measured, a macOS client). So a key
+  down as Command arrives comes up then, and one pressed under it goes down and up at once -- a
+  keystroke per press or repeat the peer sends, which is all a shortcut is. The modifiers are
+  held as ever, and a release that does come finds nothing held and is dropped.
+- **Absolute coordinates arrive in stream space** and are mapped to the output's geometry at
+  injection, accounting for rotation. Relative deltas pass through.
+- **The mapping is a normalisation at both ends, and that is why a stream smaller than the
+  display still lands on the right pixel.** A peer scales its window position into the stream's
+  dimensions; the host scales that into the absolute axis, which the input stack then spreads
+  across the desktop. Neither side needs to know the other's pixel count, only its shape.
+
+  **What that hides is the offset, and it does not survive a second display.** The axis is
+  spread over the *whole* desktop, so with one output it lands where it should and with two the
+  stream is stretched across both: a 2560-wide picture on a 4480-wide desktop reaches its own
+  right edge 57 percent of the way across, and the rest of the picture cannot be reached at
+  all. **The failure is per axis**, which is the cheapest check on any fix: two outputs of the
+  same height leave the vertical scale at one, so the vertical is already correct and a fix
+  applied to the pair rather than to each axis breaks it.
+
+  So the point is expressed in whole-desktop coordinates **including the captured output's own
+  position**, rather than handing the input stack a bare fraction and letting it choose. Three
+  steps: clamp into the picture, convert into the captured output's rectangle, place that
+  rectangle within the desktop. With one output the rectangle is the desktop and the two
+  conversions cancel, which is why this is one multiplication rather than a special case.
+
+  **The value names the centre of its pixel** (*2026-10-15*). The input stack takes the axis
+  back to a pixel as `value * desktop / 65536`, truncated -- measured on Windows, and the Linux
+  input library computes the same -- so a value at a pixel's near edge lands on the pixel
+  before it. Measured before the change: every position a pixel up and to the left, and an
+  output's first column on the neighbouring output's last; after it, every position on its
+  pixel on both displays of the development machine, one of them scaled. The peer's far edge,
+  the extent itself, is the output's last pixel.
+
+  **The clamp is load bearing and is not merely tidiness.** A coordinate past the picture would
+  otherwise put the pointer on the neighbouring output, where the hardware pointer plane this
+  host reads goes empty -- indistinguishable from an application hiding the pointer, so the peer
+  is told to switch to relative motion, its cursor vanishes, and it has to be walked back by
+  hand ([§8.1](#81-three-states-never-conflated)).
+
+  **The rectangle and the desktop come from the session, which is the only thing that knows
+  them.** A display device reports a controller's position inside its own framebuffer, which is
+  the corner whatever the desktop looks like, and an output a compositor invented has no
+  controller at all. So the layout is asked for once, when the display opens, and matched to the
+  captured output by the name both sides know it by. **A session that does not answer is not a
+  degraded case**: with one output the picture is the desktop, which is exactly what the axis
+  already spans ([07-platforms.md](07-platforms.md)).
+
+  *Amended 2026-10-26:* once is not enough. **The desktop moves around an output whose picture
+  stays** -- another display resized, added or taken away -- and nothing rebuilds for that, so a
+  place read only as the display opened spreads every position over a desktop that is not there
+  any more. Measured on Windows: a game leaving exclusive fullscreen put every display back at its
+  saved mode, the host's own display among them, and a 6400x1440 desktop still described as
+  7900x2148 squeezed every position by those ratios into the top left, a reconnect keeping it. So
+  the place follows the layout: on Linux lowlatd's session side tells it again as it changes; on
+  Windows the stream reads the system's listing again once a second -- the adapters left
+  undescribed, 0.17 ms a read -- and takes a rectangle the picture's size agrees with. One of
+  another size is the output's own mode moving, which its rebuild places, or a listing behind the
+  picture, which a later read finds caught up.
+
+  **It also assumes the stream and the display are the same size**, which they are in the
+  established model because a host changes the display mode rather than scaling a copy of it. A
+  host that ever encodes a scaled or cropped view of a larger desktop has to say so here, not
+  discover it through a pointer that drifts.
+
+  **The size a peer is told and the extents its coordinates are scaled by MUST come from one
+  place, and that place is the picture the stream really produces.** A display decides its own
+  size; a configured size is a request. Describing the stream with one number and scaling input
+  by another puts every absolute position through the ratio between them, and the failure is
+  quiet and proportional rather than obviously broken: a 2560-wide display described as 1920
+  reaches the right edge of the screen three quarters of the way across the picture. The size
+  is therefore read from the stream, not from configuration, and re-read while the session runs
+  rather than once, because a guest is seated before the stream has opened a display and a
+  display can change size afterwards.
+
+  **Both ends of the ratio MUST be in one coordinate space, and a display scale factor is the
+  usual way they stop being.** Capture reports the real framebuffer; a windowing system asked
+  about screen geometry may answer in scaled units instead, and at 125 or 150 percent the two
+  disagree by exactly that factor. Where a platform makes that a per-process property, the
+  process MUST declare the aware mode, and it is a **packaging requirement rather than a code
+  one**: nothing in the source shows why an undeclared host is wrong, and it is wrong only on
+  machines that are scaled. Where the platform has no such split, there is nothing to convert.
+  *Amended 2026-10-14:* on Windows it is a code requirement too. The desktop duplication call
+  this host uses refuses a thread that is not per-monitor aware, at any scale, so an
+  undeclared host captures nothing rather than drifting; and the mode can be set per thread,
+  so the library sets its own capture and input threads to it, and `lowlatd` declares it in
+  its manifest as well ([impl-plan-windows.md](impl-plan-windows.md) W2).
+
+  This stops being free when a captured *sub-rectangle* has to be placed within a larger
+  desktop, because then the offset and the range must also be in the same space -- which is the
+  second-display case above.
+- **One injector per guest**, holding that guest's pressed-key state. On disconnect it
+  releases everything it is holding. Without this, a guest that vanishes mid-keystroke leaves
+  a key held down on a machine nobody is sitting at. (*Corrected 2026-10-26:* on Windows nothing
+  did. A device's end releases what it held, so on Linux the guest's devices going was the
+  release; the batch input call has no device, and a key a guest held as its loop ended stayed
+  down. The release now goes out as the guest's input does, whichever way its loop ends.)
+- **A lock the peer changed is brought into step before its next key.** A peer reports its
+  locks on every keystroke, and a lock it toggled while looking elsewhere reaches the host no
+  other way. Below a display server the host's own state cannot be read, so the first message
+  is the baseline and a change taps the lock. *On Windows* (*2026-10-15*) the host's state is
+  read, and a lock is tapped only where the host's differs from the peer's. The first message
+  counts for a lock the peer has on and not for one it has off, since a peer whose keyboard has
+  no such key reports it off and would turn the host's off. **A lock key is the peer's lock
+  state there, never a keystroke**: a peer whose platform reports a lock as a modifier sends
+  the key down as the lock goes on and up as it goes off, so a key passed through toggled the
+  host once every two presses (measured, a macOS client); each lock key message brings the host
+  to the state it reports instead, whichever way round the peer sends it. **A release taps no
+  lock** (*2026-10-31*): a guest that leaves, loses the keyboard or loses focus leaves the host's
+  locks as they are -- nothing tells a lock it turned on from one it found on -- and its next
+  message, if one comes, counts as its first.
+- *On Windows* (*2026-10-15*) **each guest's input follows the input desktop.** The batch input
+  call refuses a thread on any desktop but the one receiving input, which the lock screen and
+  an elevation prompt replace with their own; the guest's thread is attached to it as its
+  devices are made, and again when the call refuses, and the refused input goes again at once.
+  **Pause and PrintScreen take the form the guest's own keyboard gives them**: Break while that
+  keyboard holds Ctrl, SysRq while it holds Alt, each released as it went down. A key held on
+  another guest's keyboard, or the desk's, changes neither, as the system's keyboard driver keeps
+  the modifiers of each keyboard apart.
+- **While an application holds the pointer, absolute motion converts to relative deltas at
+  injection.** This is a safety net for a peer that ignores the mode signal, so aiming works
+  regardless. *Corrected 2026-10-15, read from an established Windows host:* this said "while
+  the host cursor is hidden". The trigger is the intent (`relative`,
+  [§8.1](#81-three-states-never-conflated)) -- the show state, or a picture of one value --
+  read as each motion arrives, not the overlay.
+- **Pen and touch are deferred** (*2026-10-31*), as in the opcode catalog
+  ([01 §11.1](01-protocol.md)) and on the client ([10 §8](10-client.md)): their message is dropped
+  on both platforms, so a guest's pen moves nothing here.
+- **Three permissions gate dispatch -- keyboard, pointer, gamepad -- and the gate lives in the
+  injector.** The SDK invents no permission model beyond them; they arrive from signaling
+  ([04 §3](04-signaling.md)). The gate belongs next to the pressed state rather than in the
+  message loop because **it is not a filter**: revoking a permission releases everything that
+  permission is holding, which is the same guard as a disconnect and needs the same state. A
+  gate placed in the loop would have to detect the transition and reach into the injector to
+  service it, splitting one invariant across two places, and it would need a second switch over
+  the same opcodes.
+- Injection tests are labeled and excluded by default. The default suite must never move the
+  developer's pointer.
+
+### §7.1 One pointer, shared
+
+**Every guest has its own devices and they still contend for one cursor.** The display stack
+merges every pointer device on a seat into a single cursor, so two guests moving at once fight
+over it and neither can aim. Keyboards do not conflict that way -- two people typing produce two
+streams of keystrokes into whatever has focus, which is what a shared desktop is for -- and pads
+do not conflict at all, because each guest's are its own devices. So **only the pointer is
+arbitrated**, and arbitrating the rest would stop two people using one session for no gain.
+
+**Off by default.** One person driving at a time is a room's decision, not a host's.
+
+When it is on, the pointer belongs to whoever last moved it and lapses a fixed time after they
+stop. Asking for it is the same act as using it: there is no separate claim, because moving
+something is the only evidence that a guest wants it. An **owner** takes it from whoever has it
+rather than waiting; everybody else waits for the lapse.
+
+**The hold is the whole behaviour.** Too short and the pointer is taken away mid-gesture, because
+there is a still moment inside any drag or held aim. Too long and taking over reads as the
+session having stopped responding.
+
+**A guest that loses the pointer releases the buttons it was holding, at once.** This is the part
+that is easy to get wrong, and getting it wrong is not subtle. A guest loses the pointer by going
+quiet, so it will never send a release of its own; the release it eventually does send arrives
+after somebody else has taken over and is dropped along with the rest of that guest's pointer
+input. The button then stays down on a machine that guest is no longer driving. So the loss is
+noticed on the host's own timer rather than waiting for a message, and it releases immediately.
+
+**A guest without the pointer is shown that it does not have it.** Otherwise it finds out by
+nothing happening, which is indistinguishable from a session that has stopped responding. The
+guest that does not have the pointer is sent a refused shape and gets the real cursor back when
+its turn comes. It needs no new mechanism, because cursor updates are already per guest
+([§8](#8-cursor)) -- it is one guest being sent a different image.
+
+**The shape is loaded from the desktop's own theme, not drawn.** Theme files carry a picture and
+its hotspot together, and that is the part that matters: a backend that derives a hotspot from
+where the display drew a pointer ([§8](#8-cursor)) has no way to derive one for a shape the
+display never draws, so a hand-drawn glyph would need a hotspot invented for it. It also looks
+like the pointer somebody at the desk would see. A machine with no theme shows no shape, which
+is the state that existed before rather than a failure.
+
+**A change of turn owes an update even when the pointer has not moved**, or a guest that stops
+moving keeps whichever shape it had at the moment its turn changed. Only the picture is
+substituted: the position stays the display's to report, so a guest that cannot drive still
+knows where the pointer is.
+
+**The hold and that feedback are related, and the figure is still the one chosen without it.**
+Without feedback it has to stay short enough that being ignored is over before anybody wonders;
+with it, a longer hold is comfortable because the guest can see whose turn it is. **It is a
+judgement made by feel with two guests and it must be settled that way**, in the same run that
+checks the feedback works, rather than reasoned to a number.
+
+The local user taking the pointer back from every guest needs a source of local input activity,
+which is the same "observe the interactive session" problem as the hidden-pointer signal
+([§8.2](#82-source-of-the-hidden-signal-per-backend)) and lands with it.
+
+### §7.2 Gamepads
+
+A peer's pad is a virtual device like its keyboard, with three differences that all follow from
+one fact: **a host does not know how many pads a guest has until it sends one.**
+
+- **A pad is created on the first message bearing a new identifier**, so unlike the keyboard and
+  pointer it cannot be created at admission and its device-readiness delay
+  ([07 §4.1](07-platforms.md)) sits in front of a stick somebody is already pushing. The same
+  queue-until-usable rule applies, and here it is load bearing rather than a nicety.
+- **The identifier is the peer's and is not an index** ([01 §11.1](01-protocol.md)). It maps to
+  a slot, and the number of slots one guest may hold is capped.
+- **Destroying the device is the release.** A pad that vanishes holds nothing, so unplug and
+  disconnect need no held-button walk -- but only if the device is genuinely destroyed, which
+  makes it something to test rather than something to assume.
+
+**A withdrawn pad permission lets go of every pad the guest holds** (*2026-10-31*), as a withdrawn
+keyboard lets go of its keys ([§7](#7-input-injection)): a sixteen-button pad is centred and stays
+plugged in, and a pad sent as its reports is unplugged, since its reports are refused from then on
+and its device has nothing but the last of them to say. An unplug needs no permission: it lets go
+and presses nothing.
+
+**Guide is the owner's alone** (*2026-10-31*). On the Xbox pad it raises the host's own overlay --
+the system's game bar, a launcher's -- which reaches past whatever a guest was given to play, so
+for a guest that does not own the host a press of Guide alone is dropped and a whole state is
+taken without it, the rest of the state intact; on Windows a pad played on the bus from its own
+reports loses it the same way. A pad presented as its product keeps its own button, which is the
+product's.
+
+**Force feedback travels back to the peer.** A local application raising a rumble effect on the
+virtual pad reaches the guest that owns it as a rumble message. Only the simple magnitude effect
+is offered: it is what the common controller libraries raise, and the shaped effects would
+require carrying an envelope simulation for a peer that can express two motor strengths and
+nothing else.
+
+**A pad sent as its own report is presented as that product, on the HID layer** (*Phase 14,
+2026-09-20*; the wire is [01 §11.1](01-protocol.md), the layer choice
+[07 §4.2](07-platforms.md)). The first message that can create a pad fixes what it is: a
+whole state or a single button or axis makes the sixteen-button pad above; a report naming a
+DualShock 4 or a DualSense makes a device of that model, with the device's own descriptor,
+identity and name, which the kernel's own driver then claims -- so the touchpad, the motion
+sensors, the lights and the hidraw node exist as they do for the real thing, and every
+consumer that recognises the real thing recognises this one. From then on the pad takes only
+its reports; the sixteen-button messages a peer sends beside them are dropped as the fallback
+they are. Nothing on the host chooses the family: the peer decides by what it sends, and a
+guest who wants the plain pad for a game that ignores the other kind sends the plain pad.
+
+Three things the host owes such a device, all decided at the report's arrival:
+
+- **The driver's questions are answered from the peer.** The kernel's driver reads
+  calibration and firmware reports from a new device and will not attach to one that does
+  not answer; a peer sends its pad's own answers ahead of the first report, and the host
+  keeps a plausible default for whatever a peer did not send. The pairing report is the
+  host's alone: the driver refuses a second device with an address it already has, and the
+  same physical pad can be present on the host beside its own passthrough, so the virtual
+  pad carries an address the host makes up, unique per guest and pad.
+- **What an application writes to the device travels back whole**, as the report it wrote,
+  and never folded into the rumble message: the lightbar, the player lights and a DualSense's
+  trigger effects are in that report and have no other road. So a report pad is never
+  rumbled by opcode 20, whose answer on the peer's side would repaint the lightbar.
+  *Amended 2026-10-26 (W4.3's review, the maintainer's decisions):* **that is the output
+  report; a feature write stays on the host**, on Linux and Windows alike: the device answers
+  it and nothing of it travels, and an application holding its own device (below) gives back
+  output reports alone. A pad's features carry its pairing, test commands and, on a
+  DualSense, its firmware update -- none a game needs -- and the peer applying one would
+  change the guest's own controller.
+- **An application may take the reports itself instead.** A host built with the sink set to
+  the application creates no device for report pads; the reports are handed out through a
+  poll of their own, feature reports first, and the application gives back what its own
+  device emits. The permission gate, the per-guest cap and the destroy-on-unplug rule apply
+  in both modes, so an application only ever sees a pad the guest is allowed to have -- and
+  **the pad's end reaches the application through the same poll, after the pad's last
+  report**, on the guest's unplug and on its leaving, so the application's device is
+  destroyed on the rule the library's own is and never ahead of a report still queued for
+  it. The poll parks on the same wake the microphone's does: one cross-thread wake, no
+  interval (measured from the guest thread's push to the parked poll's return: 13 us at the
+  median, 26 us at the ninety-ninth percentile). It is the shape a host on another operating
+  system uses with its own virtual-device driver, and it is why that driver is the
+  application's and not this library's.
+
+*On Windows* (*2026-10-15*) **a pad is an Xbox 360 pad on the ViGEm bus**, plugged in by the
+first message for it, through one bus handle per guest, so the handle closing with the guest
+takes every pad it plugged in. **The bus says when a pad is ready**, so nothing waits on a
+clock: until it does, the pad's latest whole state is held, which is all a pad owes since each
+report is the whole pad, and it goes in as the bus answers. What an application asks the pad to
+vibrate at is the bus's answer to a request kept outstanding for each pad, polled by the
+guest's own loop and asked again at once, so no change falls between two.
+
+**A host with no device for a pad's own report does not take the report** (*2026-10-15*;
+Windows, until a HID device of the host's own exists). The pad is made from its whole states,
+which a peer sends beside its reports, as the sixteen-button pad, as an established host in
+its Xbox mode plays it; an application that takes the reports itself still gets them. Taken,
+the report would fix the pad as one that drops the states, and the peer's controller would do
+nothing at all.
+
+*Amended 2026-10-22, planned as W4:* **the host's own HID driver is that device where the owner
+sets `virtual_pads`** ([06 §3](06-api.md)), off by default. On, a DualShock 4 or a DualSense sent
+as its reports is presented as that product, as on Linux: its feature questions answered from
+what the peer sent, with a real pad's answers for what it did not and a pairing address the host
+makes up, and what is written to it sent back whole ([11 §2.3](11-drivers.md)). Off, the report
+is not taken, as above. **On Windows the owner chooses, not the peer** ([00 §D12](00-overview.md)):
+a HID pad never reaches a game that reads only the Xbox pad's interface, and an established client
+holding a DualSense always sends its reports, so with the peer deciding every such guest would
+lose every such game. The Xbox 360 pad stays the bus's either way.
+
+*Amended 2026-10-26, at W4.3's review:* **switching `virtual_pads` on with no driver is refused**,
+as `virtual_input` is ([06 §3](06-api.md)). A pad presented as its product keeps its reports when
+the setting goes off, which decides a new pad's family alone; and **a pad whose device never
+comes, or goes, plays on as the Xbox pad from its own reports** -- the sixteen-button state each
+one carries -- rumbled by opcode 20 as any pad on the bus, since nothing on opcode 33 speaks for
+it then, so no pad does nothing. An established client's wireless DualSense sends its wireless
+reports, which a host takes from no peer ([01 §11.1](01-protocol.md)), so it plays as the Xbox pad,
+as on an established host; on a cable it is presented as its product.
+
+*Built 2026-10-26 (W4.3):* as amended. A pad's latest report is held until the system lists its
+device -- a few milliseconds, every collection under a handle of its own
+([11 §2.4](11-drivers.md)) -- and a pad not listed within five seconds plays on as the Xbox pad.
+Checked live with an established macOS client's DualSense on a cable: every button, the
+touchpad, both motion sensors, the lightbar, the player lights and the microphone's light, the
+trigger effects and the rumble.
+
+### §7.3 The attention chord
+
+**A guest asks for `Ctrl+Alt+Del` rather than typing it**, because the operating system the
+guest is running on takes that combination before any application sees it. The request arrives
+as an application message ([01 §11.1](01-protocol.md) opcode 17, sub-identifier 14) with an
+empty body, and the host types the chord on that guest's own virtual keyboard.
+
+Three things make it a host action rather than an ordinary keystroke:
+
+- **It is typed, not passed through.** Both modifiers go down, the third key goes down, and all
+  three come up in reverse, in one report. Whatever the guest was holding of those three ends up
+  released, which is what pressing the chord on a real keyboard would leave behind as well.
+- **The keyboard permission gates it**, because it is keystrokes. A guest that may not type may
+  not type these.
+- **A text console must be refused.** In front of a graphical session the combination reaches
+  the compositor and produces its leave dialog, which is the useful analogue of what the
+  requesting client means by it. In front of a text console it reaches nothing of the sort: the
+  terminal translates the combination itself and the machine restarts. The foreground terminal's
+  keyboard mode says which, and the request is refused and logged in the second case. A machine
+  with no virtual terminal subsystem at all has nothing that could run the combination and is
+  not the dangerous case.
+
+**On Windows the chord cannot be typed** (*2026-10-15*): the system raises its secure screen
+for the keys only from the keyboard, and for software only through its own call for it, which a
+machine's policy has to allow and which answers a service alone. So the host asks its service
+to make the call ([impl-plan-windows.md](impl-plan-windows.md) W2.5), through an event it alone
+holds. The keyboard permission gates it there as here, read by the host before it asks.
+*Reviewed 2026-10-17:* the host asks through an event it alone holds, and **the service allows
+its own call in the machine's policy for the length of each call**, putting back the value it
+found -- so installing the service changes no policy, and nothing is left set by a program
+removed without its uninstall.
+*Amended 2026-10-22, planned as W4:* **the host's own HID keyboard never types it.** A hardware
+keyboard's Ctrl+Alt+Del raises the secure screen, so on that keyboard a guest's ordinary key
+messages would, past the policy the service honours for its own call. A Delete -- the main key or
+the keypad's -- going down while Ctrl and Alt are held, on that guest's keyboard or by the
+system's own key state, goes through the batch input call instead, in that form until it comes
+up: applications see the keys as before, and the secure screen comes from the service's call
+alone. *Built 2026-10-26 (W4.1):* **a Delete already held on that keyboard when Ctrl and Alt come
+together over it is let go of there first**: at once where the guest's own Ctrl or Alt completes
+them, the report that goes next holding neither the Delete nor that key; at the guest's next pass
+where another keyboard's do, ahead of the keyboard's own repeat, which would type the Delete again
+under them. Its repeats then go through the batch input call. The system's key state is read on
+the desktop that takes input, and where it cannot be read both count as held.
+
+There is no general "inject these keys" call behind this. Input comes from guests; this is the
+one chord a guest is unable to send for itself.
+
+## §8 Cursor
+
+The cursor travels out of band, not composited into the frame. That is a protocol property and
+it is the right one: the far side renders it at its own frame rate, so pointer motion feels
+local even when video stutters.
+
+- **Shape changes are sent when they change**, encoded as an image, with the classified
+  standard shape and hotspot alongside so the far side can use a native cursor where it can.
+  One last-sent hash per guest, so a late joiner receives the image on its first update by
+  construction.
+- Positions are stream space and need the inverse of the far side's fit transform, including a
+  width and height swap on rotated outputs. *Added 2026-10-14:* a position is where the
+  pointer points -- its hotspot -- not the corner of its picture; it is where the far side
+  warps its own pointer when it leaves relative motion.
+
+### §8.1 Three states, never conflated
+
+This is the part with the most history behind it, and the three states below are genuinely
+distinct. Folding any two together produces a specific, known bug.
+
+| State | Means | On the wire |
+|---|---|---|
+| **intent** | an application asked for the pointer not to be drawn, or set one whose picture is a single value throughout | `relative` |
+| **overlay** | the pointer is not on a hardware overlay this frame: drawn into the picture, or not drawn at all | `hidden` |
+| **suppressed** | the pointer was suppressed by touch input | `suppressed`, and neither of the others |
+
+*Corrected 2026-10-14, read from an established Windows host:* this table had `hidden` carry
+the intent and gave the overlay no bit ("whether the far side must draw it"). On the wire it is
+the other way round, and **a far side treats either bit as relative motion** (its test is
+`relative || hidden`, [§8.4](#84-deriving-hidden-from-plane-presence)): `hidden` tells it to
+draw no pointer of its own, which it does by taking the pointer over. So an established host
+puts a guest into relative motion while the system draws the pointer into the picture -- as it
+does while a window is dragged -- as well as for an application that took the pointer.
+
+**Relative intent comes from the show state, and from a pointer with nothing to show.** When an
+application takes over the pointer for mouselook it hides it, or sets a pointer whose picture
+is one value -- blank, or a solid block. Either is its own visible statement of intent, and
+together they are the whole class.
+
+**Never infer relative mode from pointer clipping geometry.** Clipping the pointer to a tiny
+rectangle is how a *client* enforces relative capture after being told to, so reading it on the
+host inverts the data flow. It also misses every application that hides without clipping,
+which is most of them, and it silently fails on applications that clip to a rectangle slightly
+larger than the threshold. This trap has been implemented and removed once already; it must
+not come back.
+
+**Plane presence is not intent.** A compositor that scales, rotates, or exceeds the plane's
+size limit will composite the pointer into the primary plane instead, so the plane is absent
+while the pointer is plainly visible. On a scanout capture that is the common case rather than
+an edge case. Plane presence answers only one question: did the captured frame already contain
+the pointer, in which case the far side must not draw it again. *Corrected 2026-10-14:* that
+question is the overlay state, which is what `hidden` carries; so the plane is the right source
+for `hidden` and the wrong one for `relative`.
+
+**Suppressed is its own signal.** A pointer suppressed by touch input is not a mouselook grab
+and must never be folded into relative.
+
+### §8.2 Source of each signal per backend
+
+Windows exposes the requested show-state directly as a global flag. Linux has no single
+equivalent, so it is per backend, and this is an open item for Gate B. *Corrected 2026-10-14:*
+the table listed the sources of intent as "the hidden signal"; intent is `relative` and the
+overlay is `hidden` ([§8.1](#81-three-states-never-conflated)):
+
+| Backend | intent (`relative`) | overlay (`hidden`) |
+|---|---|---|
+| Windows desktop duplication | the show state, or a pointer whose picture is one value throughout | the duplication's own visibility of the pointer, kept from the last frame that carried a pointer update |
+| Windows, the host's own display read from its driver | the show state, or a pointer whose picture is one value throughout | the driver's report of its hardware cursor: not visible -- drawn by the system, or not drawn at all -- and so with no hardware cursor |
+| X11 | cursor visibility notifications from the fixes extension | not built |
+| compositor-mediated | the cursor mode reported alongside the stream | not built |
+| scanout | no direct source; the session's ([07 §2.1](07-platforms.md)) | plane presence, debounced ([§8.4](#84-deriving-hidden-from-plane-presence)) |
+
+The scanout row is the problem case, because it is the one backend where the two states
+collapse and the false-positive rate is highest. It is flagged in
+[07-platforms.md](07-platforms.md) as a backend selection input, not something to paper over
+here. *Corrected 2026-10-14:* what scanout lacks is intent; its plane is the overlay state,
+which a far side is meant to read as relative motion.
+
+*Added 2026-10-16, at W3.4's review:* **the host's own display read from its driver**
+([11 §1.7](11-drivers.md)) takes the shape and the hotspot from the driver as well, and a
+masked colour shape made only of black, white, clear and inverting pixels is drawn as the
+monochrome shape it is -- the system hands a driver every monochrome pointer in that form -- so
+both Windows sources draw the text cursor alike. Its position and show state are read as for any
+display, on the input desktop; the frames need no desktop, so the reading thread follows the
+input desktop itself whenever a read fails, at the duplication's retry pace. A pointer larger
+than the 256 the wire carries is drawn by the system into the pictures and reported not visible,
+so it reads as `hidden`; the duplication, whose pictures never carry the pointer, keeps the last
+shape it could send. *Corrected at the build, the same day:* the duplication of that display says
+the same, measured -- it keeps its last shape and reports the pointer not visible, the system
+drawing it -- so both sources send a guest to relative motion while the pointer is that large.
+
+### §8.4 Deriving hidden from plane presence
+
+Where a backend has no direct source, the plane is the only observable and it **can** carry the
+signal, but only with the rules below. Every one of them exists because its absence shipped.
+
+**The far side derives relative mode from `hidden` as well as from `relative`** -- its test is
+either bit, not both. So this is not a drawing instruction that can be set freely: setting it
+takes the guest's pointer away and turns its motion into deltas.
+
+- **Debounce before believing it.** The plane empties for an application taking the pointer,
+  which is meant, and for a pointer that merely outgrew what the plane can carry, and for the
+  moment a display mode change is being rebuilt, which are not. The transients pass; an
+  application holding the pointer does not. **Slow to hide, immediate to show**: a quarter
+  second before a pointer disappears on entering a game is imperceptible, and a quarter second
+  of a guest unable to see its own pointer is not.
+- **Nothing drawn means nothing until something has been.** A stream can open onto an idle
+  desktop whose compositor is not using the plane at all, and asserting from that tells a guest
+  its pointer was taken over before it has been shown one.
+- **Only a read that examined the pixels may speak for the pointer.** Where the picture is read
+  on a cadence, the reads in between report the picture already held; counting those as a
+  pointer still being present clears the wait every time, so it never expires.
+
+### §8.3 The state machine
+
+*Corrected 2026-10-14, read from an established Windows host:* the first two items said
+`relative` is an echo of `hidden` and that the debounce is on `hidden`. Each bit has its own
+source ([§8.1](#81-three-states-never-conflated)), and the debounce is on the whole state:
+
+- `relative` is **latched from intent**: set while the show state says hidden or the pointer's
+  picture is one value, cleared when neither holds. `hidden` follows the overlay, kept from the
+  last frame that said anything about the pointer.
+- **A message goes out once the whole state has held for more than 18 ms** with a change
+  pending -- an absolute figure and not a frame count -- so a pointer that blinks hidden for one
+  frame does not flap the far side between modes, and a change undone inside the window sends
+  nothing. A new picture inside the window travels with the message that ends it. **A move
+  alone is not a change**: in absolute mode the far side draws its own pointer where its own
+  input puts it, and reads the position only when it leaves relative motion.
+- **Both `hidden` and `relative` are sent as separate flags**, since the far side needs the
+  raw state as well as the decision.
+- **On the falling edge, the message carries the pointer's current position**, so the far side
+  warps its pointer to where the host's actually is rather than leaving it wherever capture
+  released it. Leaving a drag and leaving mouselook then behave identically.
+- **Poll the cursor state from the same context as capture.** It is a property of the
+  interactive session, and a daemon thread outside that session either sees nothing or sees
+  the wrong seat.
+
+**Known false positive, accepted:** a fullscreen video player or idle interface that hides the
+pointer reads as relative. It self-corrects on the next genuine pointer motion, and the
+debounce keeps the transient invisible. A stricter form would gate the hidden arm on the
+foreground application being fullscreen, but that is extra state for a case the self-correction
+already handles. Start without it.
+
+### §8.5 A cached picture keeps the offset it arrived with
+
+**A peer that keeps pictures is sent a name instead of a picture, and a name carries no
+hotspot.** The far side applies the offset when a picture arrives and has no way to be told a
+new one for a picture it already holds.
+
+**That makes the offset part of what the peer holds, not a property of the update.** The record
+of what a peer has is therefore the picture *and* the offset it was sent with, and only both
+together are a name; a corrected offset sends the picture again.
+
+**This is the ordinary case rather than a corner**, on any backend that derives the hotspot
+rather than being told it ([§8](#8-cursor)). The derivation needs a guest to command a position,
+so every shape necessarily travels once before its hotspot is known, carrying none at all.
+Naming it from then on freezes that: an I-beam draws half its own height low, while an arrow
+looks correct because an arrow's offset really is near nothing, which is what makes the fault
+easy to miss.
+
+**Replace the record rather than adding one.** A shape whose offset is re-learned would
+otherwise fill the peer's cache and force it to forget every picture it holds.
+
+## §9 Audio
+
+**48 kHz stereo, 20 ms a packet, one encode fanned out to every guest**, on the audio channel
+with the framing in [01 §11.4](01-protocol.md). One encode serves the room exactly as one
+picture does, and a guest is handed the packet rather than a copy of its own.
+
+**Two codecs, because a guest chooses.** Opus by default; uncompressed sixteen-bit stereo for a
+guest that asks for it in its initialization and a host that permits it. The choice is per guest
+and per packet, so a room may hold both at once, and the second encoding costs nothing to
+produce because it is what capture already delivered.
+
+**Uncompressed is not free on the wire and must be paid for.** A packet is 3840 bytes against
+Opus's few hundred: four fragments instead of one, 200 a second instead of 50, and 1.54 Mbit/s
+per guest against 0.14. That is five percent of a thirty megabit session, taken from a budget
+the video rate controller cannot see, so **it is subtracted from the video ceiling for that
+guest** rather than spent on top of it.
+
+### §9.1 The sound source is the clock
+
+**Capture is paced by the source and never by a timer.** A read returns when the sound server
+has a fragment, and the host encodes and sends what it got; a host that pulled on its own clock
+would drift against the sound device for as long as the session lasted and would have to
+resample to hide it. Measured over five minutes, the source's own rate and the host's sample
+accounting agree to within a constant offset.
+
+**The cadence is not the fragment.** A sound server delivers on its graph's own period, which
+need not be the frame the host asked for, so fragments arrive a little early or a little late
+and occasionally two at once. The rate is exact even when the spacing is not, which is the
+property that matters: a packet declares how many samples it carries and a receiver plays them
+in order.
+
+**Silence is not what it looked like, and the measurement decides the policy.** A source with
+nothing playing delivers zeros rather than stopping (*amended 2026-10-14*: a Linux monitor
+source does; a Windows loopback delivers nothing at all while nothing plays, so the host keeps
+a silent stream open on the captured endpoint and the source delivers zeros there too --
+[impl-plan-windows.md](impl-plan-windows.md) W2), so a host has to choose what to do with
+them -- but the compressed path collapses digital silence on its own: measured on this pipeline,
+400 silent frames cost **1.2 kbit/s**, against the 128 the same stream carries when something is
+playing. So skipping silence saves almost nothing on the compressed path and **the whole 1.54
+Mbit/s on the uncompressed one**, which is where the decision actually lives.
+
+The other half is behaviour rather than cost. A host that goes quiet is ordinary and every
+established client handles it, but a peer whose buffer drains has to prime it again when sound
+returns, which is audible at the start of the first word. **So the policy belongs where packets
+are sent, per guest**, and not in the encoder: the encoder says whether a frame is silent and the
+sender decides what that is worth to the guest in front of it.
+
+**On Windows the zeros have to be made, and both halves were measured** (*added 2026-10-15*,
+[impl-plan-windows.md](impl-plan-windows.md) W2.4). The silent stream that keeps the loopback
+running is started once and never fed, and the packets the loopback then delivers come flagged
+as silent: a flagged packet counts as zeros of its length, never skipped, or the clock is lost
+again. And a program that plays digital silence does not reach the loopback as zeros -- the
+system's engine adds a floor some 177 dB down, and its own conversion to sixteen bits dithers
+that into the lowest bit -- so the host asks for floating point and rounds to sixteen bits
+itself, and silence is exact zeros again, which is what this policy recognises. The engine
+limits the mix below full scale before the loopback, so the rounding never clips real sound.
+
+### §9.2 Losing a packet, and never leaving a hole
+
+The audio channel is reliable and ordered like every other, so **a packet cannot be dropped once
+it is sent**: the gap would stall the receiver until retransmission filled it, and a
+retransmitted packet arrives long after it was due. The drop therefore happens **before the
+sequence number is assigned** -- if the send window cannot take the whole message, the packet is
+discarded and the next one takes its place. Nothing is retransmitted late because nothing late
+was ever numbered.
+
+That also makes the size question a correctness question: a message is enqueued whole or not at
+all, so an uncompressed packet's four fragments never half-arrive.
+
+### §9.3 The source may change under the session
+
+**A host follows the sound device rather than pinning it.** Three things move it: the person
+changes their default output, the application names a device, or something else in the session
+moves this host's stream. All three end in the same place -- resolve the wanted source again,
+move the stream, and **publish the source the host is actually on rather than the one it asked
+for**.
+
+**A source change is silent on the wire.** A receiver rebuilds its decoder only for a codec,
+channel-count or mask change ([01 §11.4](01-protocol.md)), and a device switch changes none of
+them: the host keeps asking for 48 kHz stereo and the sound server converts. So unlike an output
+switch on the video side there is no refresh owed, nothing is renegotiated, and the audible cost
+is the few tens of milliseconds the move itself takes.
+
+**A device that is not there is substituted, not refused.** A sound server hands out something
+plausible rather than failing, so a requested device is checked against the enumeration before it
+is opened -- the same rule a requested output follows in §7. **A switch that will not open keeps
+the device that is working**: the name may have gone away between the enumeration and the
+request, and taking the sound from every guest to honour a change that failed is the worse of the
+two answers.
+
+**A source can also go away entirely, and nothing announces that either.** A sound server that
+restarts takes every capture with it, and a capture ends on its own thread: whether it is still
+delivering is therefore asked on the same pass that decides whether the room wants sound at all,
+rather than assumed from having opened it once. A device that was held and stopped is taken
+again a couple of seconds later, and the session is silent for exactly that long.
+
+**A device that never opened is asked for again, but rarely.** It may be a machine with no sound
+server, or one whose sound server is not up yet: a service that starts at boot meets its first
+guest before any session exists, and the sound server arrives with the login, minutes later.
+Each ask is a connection attempt that blocks the loop trying to encode, so a device that was
+never held is asked for every ten seconds rather than every couple. *Corrected 2026-10-15: this
+said a device that never opened is not asked for again; a guest seated before the login showed
+that the answer changes.*
+
+**On Windows the system says when the default changes** (*added 2026-10-15*,
+[impl-plan-windows.md](impl-plan-windows.md) W2.4): the host follows the output the system's
+sound settings name as the default device through the system's own device notifications, and
+reopens on it as on a requested switch. A named output that goes away is replaced by the
+default and the log says so, which is where the Linux sound server leaves a stream it moved.
+**A program that takes the output in exclusive mode wins**: both of the host's streams are lost
+the moment it opens -- measured -- and stay lost after it lets go, so exclusive use is a device
+that went away, taken again a couple of seconds later; while the program holds the output there
+is no mix to hear. (*Built 2026-10-15*: a lost output is opened again at once where it can be,
+so a default that is unplugged is followed to the system's next without the wait; only an
+output that cannot be opened -- a program holds it, or nothing is there -- waits for the next
+ask.)
+
+### §9.4 Silencing the speakers at the desk
+
+**A person hosting their own machine usually does not want to hear what they are sending.** The
+tap is ahead of the mute on a device that applies its own -- measured -- so the speakers can be
+silenced while a guest keeps hearing the full-scale mix.
+
+**Whether that is true is a property of the device, not of the system.** A device with its own
+mixer applies mute and volume in the device; the mix that reaches the monitor is untouched, and
+a capture is unaffected by either. A device without one has both applied by the sound server to
+the mix itself, and that is the same mix the monitor is fed from: muting silences every listener,
+and the volume control scales what they hear. Measured both ways on one machine -- a capture of a
+hardware output is unchanged across a mute, and a capture of a virtual one goes to digital
+silence for exactly as long as the mute lasts.
+
+Two things follow, and only one of them is ours to fix. **The local mute is refused on a device
+of the second kind** and says so in the log, because silencing every guest is the opposite of
+what it asks for. **The volume is not refusable**: on such a device the person's own volume
+control is upstream of the capture, so it scales what a guest hears, and nothing on this host can
+separate the two. An output being of the second kind is not exotic -- a virtual output is always
+one, and so is any device the system mixes for.
+
+**It rides the capture's lifetime, which is the guests' presence.** The sound device is opened
+when the first guest arrives and closed when the last one leaves: nothing should hold a capture
+nobody is listening to, and the mute then needs no trigger of its own.
+
+**Restore, never unmute.** The device's state is read before anything is changed, and it is
+changed back only when all three hold: it is muted now, it was not muted when the host took it,
+and the setting is still on. A host that simply unmutes on the way out switches on the speakers of
+somebody who had muted them for their own reasons, and that is a worse failure than not muting at
+all -- it happens in their absence and the sound is the first they know of it.
+
+**Read from the live configuration at every open**, so a session with two guests in a row behaves
+the same on the second as on the first. A flag consumed once is a setting that describes something
+it does not do.
+
+**The local volume is not a level control for the stream, on a device that applies its own.**
+The tap is ahead of that too, so turning the speakers down does not turn a guest down and turning
+them up cannot clip one. Nothing in this path reads it. On a device whose volume the server
+applies, the opposite is true and it is the device's doing rather than this host's: see above.
+
+**Windows reports the property, per control** (*added 2026-10-15*,
+[impl-plan-windows.md](impl-plan-windows.md) W2.4). Its loopback hears what the system's engine
+applies and nothing the device applies itself, and the system says for each output whether its
+mute and its volume are the device's. Measured on one machine both ways: an output whose mute is
+the device's and whose volume is the engine's -- the loopback unchanged by the mute and scaled
+by the volume -- and one whose mute and volume are both the device's, unchanged by either. So
+the local mute is performed only on an output that mutes itself and refused with a line
+otherwise, exactly as above, and the volume half stands as written.
+
+### §9.5 What this host does not do
+
+**No per-application exclusion.** An established host on another platform can capture everything
+except one named program, which is what keeps a voice call from echoing back to the person on the
+other end of it. That call has no equivalent here, and imitating it means tapping each program's
+own output and re-linking as programs come and go -- a mechanism with a lifetime problem, whose
+failures are silent and whose symptom is somebody hearing themselves. **A person mutes the
+application instead**, which is a control they already have and which works whatever sound server
+is running.
+*Corrected 2026-10-15, at W2.4's review:* "here" is Linux. Windows has the call -- a capture of
+everything but one program's process tree -- so there the exclusion is a feature to build rather
+than a mechanism to imitate, and it is deferred to a step of its own
+([impl-plan-windows.md](impl-plan-windows.md) W2.6). Until then, on either platform, a person can
+also send that program to an output the host does not capture, which keeps it audible to them:
+the system's per-application output setting on Windows, the sound server's own on Linux.
+
+**No echo cancellation of the guest's own sound**, which the section below is about instead.
+
+### §9.6 The guest microphone, which is the other direction
+
+**Taken only when a host says it will**, off by default. Two things follow from that one
+setting, and they are the same decision: this host decodes what arrives, and it tells the peer
+whether it will -- a peer with a microphone sends it until it is told no, so a host that is not
+taking one says so rather than being sent a packet every ten milliseconds for nothing
+([01 §11.4b](01-protocol.md)). *Corrected 2026-10-12: this said a peer sends nothing until it is
+told; the message only ever turns a microphone off.*
+
+**It is not on the audio channel.** It arrives on the control channel, which makes it reliable
+and ordered and puts it head-of-line with the guest list, the cursor and the latency reports: a
+packet every ten milliseconds, about 193 kB/s in two fragments each. That cost is the reason the
+setting exists rather than the feature simply being on.
+
+**The application receives samples, never a codec.** A guest chooses how it encodes and this
+host decodes whichever it chose, so what crosses the boundary is sixteen-bit mono at 48 kHz and
+an application that wants a microphone does not have to learn a codec or link one
+([06 §13](06-api.md)).
+
+**What a host does with it is not this library's business.** Creating a capture device in
+somebody's session is an application's decision -- it owns the session, the naming and the
+lifetime -- so the samples are handed over and the story ends here.
+
+**The decoder is the first thing here to read bytes a peer chose, and it is treated that way.**
+What it may produce is bounded before it runs, from a constant rather than from the packet's own
+length; a packet that ends in a panic is caught, counted, and the state it unwound through is
+thrown away rather than decoded against again. That is not precautionary: sweeping random
+payloads, seventeen in forty thousand ended in a panic rather than an error, and the failure is
+a property of the decoder's accumulated state rather than of any one packet -- the same bytes
+handed to a fresh decoder decode cleanly.
+
+**One decoder per guest**, because a codec carries state between packets and two guests' packets
+through one decoder produce sound that is neither guest's.
+
+**A queue of its own, and it drops the oldest.** A hundred packets a second sharing the event
+queue would evict the events; and sound that arrives late is worth less than the sound behind
+it, which is the same reason the downlink never retransmits. What was dropped travels with the
+next delivery.
+
+## §10 Latency budget and instrumentation
+
+The capture timestamp from §2 travels with the frame, and each stage stamps its completion.
+Every measurement below is per frame, reported as p50, p95, and p99, never as an average.
+
+| Stage | Measured from |
+|---|---|
+| acquire | previous present to frame available, the submission half: display read, import, conversion submit |
+| convert | the wait for the conversion the acquire submitted |
+| encode | submit to bitstream collected |
+| packetize | bitstream to last packet enqueued |
+| wire | first packet sent to acknowledgement |
+
+The convert stage exists because the two halves used to be one figure: the conversion's
+fence wait sat inside the acquire, so a machine whose conversion waited on a shared device
+read as a slow capture rather than as the wait it was. The split is not only accounting; the
+conversion is submitted before the loop collects the previous picture, so the wait is
+normally already over when the convert stage asks.
+
+Stages are instrumented from the start, not added when something feels slow. A budget that
+cannot be attributed to a stage produces guesses, and every optimization in this pipeline that
+was based on a guess was wrong.
+
+**A stage's percentiles are over its last thousand samples, not over the last few seconds,
+and on an idle stream that is minutes of history.** Duplicate suppression means a still
+desktop encodes about one frame a second, so a window sized for sixty covers three orders of
+magnitude more time than it appears to, and a figure can describe a state the machine left
+long ago. Two consequences for anyone reading a report. **The p50 lags and then moves in a
+step**, because it does not shift until the composition of the samples crosses half: a stage
+that has begun costing more shows it in the p99 first, sometimes for minutes, before the p50
+acknowledges it. And **a figure taken shortly after the pipeline was rebuilt describes the
+refill**, since the samples begin again with it. Read the two together, and read which
+pipeline was live at that timestamp before attributing a number to a backend.
+
+Counters the pipeline owns: frames captured, skipped by the gate, skipped per guest, keyframes
+forced and why, reconfigures applied, encoder queue depth, conversion ring occupancy.
+
+## §11 Verification status
+
+**Fixed by protocol, confirmed:** cursor is out of band and image-encoded; congestion is host
+local and actuates encoder bitrate through a live reconfigure; input arrives as usage codes and
+stream-space coordinates.
+
+**Measured, and previously misdescribed here:** the delivery rules in §6 -- the ceiling table,
+the high-water retest, and the latch -- and the aggregation in §5. All four were written as
+design choices and two of them were wrong. They are now stated as the constants they are.
+
+**Ours by design:** the capture and encoder trait shapes, the conversion strategy, the frame
+gate's unanimity rule, the choice of a forced keyframe over an encoder restart for recovery,
+and everything in §10.
+
+**A note on that last one**, because it is a deliberate divergence rather than an omission. The
+invariant -- a guest resuming after a gap never receives a dependent frame -- can be satisfied
+either by forcing a keyframe or by restarting the encoder, since a restart emits one anyway. A
+restart also costs orders of magnitude more, and it self-throttles only because it is slow. We
+force the keyframe and throttle it explicitly at roughly twice a second, which reaches the same
+invariant at a cost that does not have to be hidden.
+
+**Pending, and deliberately not yet decided:** whether dirty rectangles earn their complexity.
+The capture backend and the concrete frame variant were settled at Gate B against real hardware
+([impl-plan §Phase 9](impl-plan.md)); the audio capture surface is settled in §9 above.

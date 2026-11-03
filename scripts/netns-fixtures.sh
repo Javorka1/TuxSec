@@ -1,0 +1,741 @@
+#!/bin/bash
+# Network namespace fixtures: the punch against a real kernel.
+#
+# The simulator proves the state machine against translation we described. This
+# proves it against translation somebody else implemented, which is the only
+# thing that checks the description. Each topology states the outcome it
+# expects, and several expect failure. The relay's pair runs a real relay
+# server, the machine's own turnserver, and is skipped where there is none; the
+# mapped pair runs a real mapping daemon, the machine's own miniupnpd, likewise.
+#
+# Requires root, and skips rather than fails when it cannot have it.
+#
+#   sudo scripts/netns-fixtures.sh [topology]
+#
+# Build the endpoints first:
+#   CARGO_TARGET_DIR=/tmp/lowlat-target cargo build -p lowlat-sim \
+#       --bin punch --bin shell-punch --release
+#
+# PUNCH answers reflexive requests and PEER runs the two endpoints. They are
+# separate so the peers can be the real shell while the stand-in server, which
+# no shell provides, stays what it always was. Point PEER at `punch` to run the
+# hand-rolled fixture loop instead, which is how the two are compared.
+
+set -uo pipefail
+
+PUNCH=${PUNCH:-/tmp/lowlat-target/release/punch}
+PEER=${PEER:-/tmp/lowlat-target/release/shell-punch}
+RUN=${RUN:-/tmp/lowlat-netns}
+TIMEOUT_MS=12000
+VERBOSE=${VERBOSE:-}
+
+# One namespace per role. Named so a leaked one is obvious in `ip netns list`.
+NAMESPACES="llnet llr2 llr3 llgwa llgwb llcgn llha llhb"
+
+LEFT_PORT=5000
+RIGHT_PORT=6000
+LEFT_PUBLIC=203.0.113.1
+RIGHT_PUBLIC=203.0.113.5
+SERVER=203.0.113.254
+# A second reflexive server at a second address: one is where a translator
+# put the port, two say whether that place is the same for every destination.
+SERVER2=203.0.113.253
+SERVER_PORT=3478
+
+LEFT_UFRAG=aaaa
+LEFT_PWD=passwordforaaaa
+RIGHT_UFRAG=bbbb
+RIGHT_PWD=passwordforbbbb
+
+# The relay on the host's machine: the one port its router forwards, and the
+# credential the relay attempt carries.
+RELAY_PORT=3478
+RELAY_USER=user
+RELAY_PASS=password
+
+pass=0
+fail=0
+
+log() { printf '%s\n' "$*"; }
+
+cleanup() {
+    for ns in $NAMESPACES; do
+        ip netns del "$ns" 2>/dev/null
+    done
+    # KEEP leaves the endpoint output behind, which is the only way to see what
+    # a topology actually did when it did the wrong thing.
+    [[ -n ${KEEP:-} ]] || rm -rf "$RUN"
+    return 0
+}
+
+# ns... -> create each with loopback up
+mkns() {
+    for ns in "$@"; do
+        ip netns add "$ns" || return 1
+        ip -n "$ns" link set lo up || return 1
+    done
+}
+
+# ns_a if_a cidr_a ns_b if_b cidr_b
+wire() {
+    ip link add "$2" type veth peer name "$5" || return 1
+    ip link set "$2" netns "$1" || return 1
+    ip link set "$5" netns "$4" || return 1
+    ip -n "$1" addr add "$3" dev "$2" || return 1
+    ip -n "$1" link set "$2" up || return 1
+    ip -n "$4" addr add "$6" dev "$5" || return 1
+    ip -n "$4" link set "$5" up || return 1
+}
+
+forward() { ip netns exec "$1" sysctl -qw net.ipv4.ip_forward=1; }
+
+# ns -> an empty nat table with both hooks
+nat_table() {
+    ip netns exec "$1" nft add table ip nat || return 1
+    ip netns exec "$1" nft add chain ip nat pre '{ type nat hook prerouting priority -100 ; }' || return 1
+    ip netns exec "$1" nft add chain ip nat post '{ type nat hook postrouting priority 100 ; }' || return 1
+}
+
+# ns ext_if port -> conntrack does the filtering, address and port dependent.
+#
+# The explicit port is not decoration. A bare masquerade reallocates the source
+# port per destination, which is address-and-port-dependent mapping: the kernel
+# default is a symmetric translator, not a cone. A fixture built on it looks
+# like a port restricted cone, fails to punch, and confirms the opposite of what
+# it was written to check. Pinning the external port is what makes the mapping
+# endpoint independent, and with one socket behind the translator that is
+# exactly what a cone does.
+#
+# Unsolicited inbound is dropped before conntrack can commit anything for it,
+# which is the second thing pinning the port makes necessary. A peer check that
+# arrives before the inside has punched outward creates an UNREPLIED entry whose
+# reply tuple is exactly the one the outbound punch then needs, and with the
+# external port pinned the translator has no second choice, so it drops the
+# punch for as long as the peer keeps retrying. That is not a cone filtering its
+# inbound; it is a translator poisoned by traffic it was supposed to ignore, and
+# it makes the fixture depend on which side happens to transmit first. Dropping
+# at prerouting before the nat hook leaves the entry unconfirmed, so it never
+# reaches the table.
+nat_port_restricted() {
+    nat_table "$1" || return 1
+    nat_guard "$1" || return 1
+    ip netns exec "$1" nft add rule ip nat guard iifname "$2" ct state new drop || return 1
+    ip netns exec "$1" nft add rule ip nat post oifname "$2" meta l4proto udp masquerade to ":$3"
+}
+
+# ns -> the chain unsolicited inbound is dropped from.
+#
+# Priority sits after conntrack, so the state match works, and before the nat
+# hook, so a dropped packet never reaches translation and its entry is never
+# confirmed.
+nat_guard() {
+    ip netns exec "$1" nft add chain ip nat guard \
+        '{ type filter hook prerouting priority -150 ; policy accept ; }'
+}
+
+# ns ext_if -> a fresh mapping per destination, which makes the advertised
+# address useless to the peer. This is the kernel default plus explicit
+# randomisation, so it is the one topology that needs no special arrangement.
+nat_symmetric() {
+    nat_table "$1" || return 1
+    ip netns exec "$1" nft add rule ip nat post oifname "$2" masquerade random
+}
+
+# ns ext_if inner_ip port -> anyone may use the mapping once it exists.
+nat_full_cone() {
+    nat_table "$1" || return 1
+    ip netns exec "$1" nft add rule ip nat post oifname "$2" meta l4proto udp masquerade to ":$4" || return 1
+    ip netns exec "$1" nft add rule ip nat pre iifname "$2" udp dport "$4" dnat to "$3:$4"
+}
+
+# ns ext_if inner_ip port -> only addresses the inside has sent to, on any port.
+# The dynamic set is what expresses address-dependent filtering; conntrack alone
+# cannot, because it keys on the port as well.
+#
+# The same drop as the port restricted case, qualified by the set: an address
+# the inside has contacted is admitted and translated, anything else is dropped
+# before conntrack commits an entry that would block the outbound punch.
+nat_restricted_cone() {
+    nat_table "$1" || return 1
+    ip netns exec "$1" nft add set ip nat contacted \
+        '{ type ipv4_addr ; flags dynamic,timeout ; timeout 120s ; }' || return 1
+    nat_guard "$1" || return 1
+    ip netns exec "$1" nft add rule ip nat guard iifname "$2" \
+        ip saddr != @contacted ct state new drop || return 1
+    ip netns exec "$1" nft add rule ip nat post oifname "$2" \
+        meta l4proto udp update @contacted "{ ip daddr }" masquerade to ":$4" || return 1
+    ip netns exec "$1" nft add rule ip nat pre iifname "$2" ip saddr @contacted \
+        udp dport "$4" dnat to "$3:$4"
+}
+
+# ns ext_if inner_ip port relay_ip -> port restricted as above, with the
+# relay's one port forwarded to the machine inside: the only hole a relay on
+# the host's own machine needs, and the only inbound the guard lets through.
+nat_forwarded() {
+    nat_table "$1" || return 1
+    nat_guard "$1" || return 1
+    ip netns exec "$1" nft add rule ip nat guard iifname "$2" udp dport $RELAY_PORT accept || return 1
+    ip netns exec "$1" nft add rule ip nat guard iifname "$2" ct state new drop || return 1
+    ip netns exec "$1" nft add rule ip nat pre iifname "$2" udp dport $RELAY_PORT \
+        dnat to "$5:$RELAY_PORT" || return 1
+    ip netns exec "$1" nft add rule ip nat post oifname "$2" meta l4proto udp masquerade to ":$4"
+}
+
+# ns ext_if lan_if lan_cidr -> a symmetric translator with a mapping daemon on
+# its LAN side. The translation is nat_symmetric's; new inbound is forwarded
+# only through the daemon's own chain, and the daemon's chains are hooked in as
+# its nftables backend expects them by default. It answers PCP, NAT-PMP and
+# UPnP's gateway device. The documentation addresses are reserved ones, so it is
+# told to map behind them all the same.
+nat_mapped() {
+    ip netns exec "$1" nft -f - <<NFT || return 1
+table inet filter {
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname "$3" oifname "$2" accept
+        jump miniupnpd
+    }
+    chain miniupnpd {
+    }
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+        jump prerouting_miniupnpd
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        jump postrouting_miniupnpd
+        oifname "$2" masquerade random
+    }
+    chain prerouting_miniupnpd {
+    }
+    chain postrouting_miniupnpd {
+    }
+}
+NFT
+    cat >"$RUN/miniupnpd.conf" <<CONF
+ext_ifname=$2
+listening_ip=$3
+http_port=0
+enable_upnp=yes
+enable_pcp_pmp=yes
+ext_allow_private_ipv4=yes
+ipv6_disable=yes
+secure_mode=yes
+system_uptime=yes
+min_lifetime=120
+max_lifetime=86400
+lease_file=$RUN/upnp.leases
+uuid=3e5d1a6c-15a0-4c0f-9a51-000000000015
+allow 1024-65535 $4 1024-65535
+deny 0-65535 0.0.0.0/0 0-65535
+CONF
+    ip netns exec "$1" miniupnpd -d -f "$RUN/miniupnpd.conf" -P "$RUN/miniupnpd.daemon.pid" \
+        >"$RUN/miniupnpd.out" 2>&1 &
+    echo $! >"$RUN/mapper.pid"
+    for _ in $(seq 50); do
+        ip netns exec "$1" ss -lnu | grep -q ':5351 ' && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# ns ip -> a real relay on that machine, configured as the deployment is: its
+# relayed addresses are the machine's own, with no external address, so the
+# relay range never needs the router.
+start_relay() {
+    cat >"$RUN/turnserver.conf" <<CONF
+listening-ip=$2
+listening-port=$RELAY_PORT
+relay-ip=$2
+min-port=49152
+max-port=49252
+lt-cred-mech
+user=$RELAY_USER:$RELAY_PASS
+realm=relay.example
+userdb=$RUN/turndb
+no-tls
+no-dtls
+no-cli
+verbose
+simple-log
+no-stdout-log
+log-file=$RUN/turn.log
+pidfile=$RUN/turn.pid
+CONF
+    ip netns exec "$1" turnserver -c "$RUN/turnserver.conf" >"$RUN/turn.out" 2>&1 &
+    echo $! >"$RUN/relay.pid"
+    sleep 1
+}
+
+# Start the reflexive servers. They only ever report the address they saw.
+start_server() {
+    ip netns exec llnet "$PUNCH" server --bind "$SERVER:$SERVER_PORT" \
+        >"$RUN/server.out" 2>&1 &
+    echo $! >"$RUN/server.pid"
+    ip netns exec llnet "$PUNCH" server --bind "$SERVER2:$SERVER_PORT" \
+        >"$RUN/server2.out" 2>&1 &
+    echo $! >"$RUN/server2.pid"
+    sleep 0.3
+}
+
+# ns bind_addr publish await ufrag pwd peer_ufrag peer_pwd seed out [flag]
+start_peer() {
+    ip netns exec "$1" "$PEER" peer \
+        --bind "$2" \
+        --server "$SERVER:$SERVER_PORT" \
+        --nat-server "$SERVER:$SERVER_PORT" --nat-server "$SERVER2:$SERVER_PORT" \
+        --publish "$3" --await "$4" \
+        --local-ufrag "$5" --local-pwd "$6" \
+        --remote-ufrag "$7" --remote-pwd "$8" \
+        --seed "$9" --timeout-ms "$TIMEOUT_MS" $VERBOSE ${11:-} \
+        >"${10}" 2>&1 &
+}
+
+# left_bind right_bind -> run both endpoints and wait
+run_pair() {
+    start_peer llha "$1" "$RUN/a.cand" "$RUN/b.cand" \
+        "$LEFT_UFRAG" "$LEFT_PWD" "$RIGHT_UFRAG" "$RIGHT_PWD" 161 "$RUN/a.out"
+    local a=$!
+    start_peer llhb "$2" "$RUN/b.cand" "$RUN/a.cand" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 "$RUN/b.out"
+    local b=$!
+    wait "$a" 2>/dev/null
+    wait "$b" 2>/dev/null
+}
+
+# name expected -> compare both outcomes against "established" or "failed"
+judge() {
+    local name=$1 expected=$2
+    local a b
+    a=$(grep -Eo '^(established|failed|timeout).*' "$RUN/a.out" | tail -1)
+    b=$(grep -Eo '^(established|failed|timeout).*' "$RUN/b.out" | tail -1)
+
+    local ok=1
+    case $expected in
+        established)
+            [[ $a == established* && $b == established* ]] || ok=0 ;;
+        failed)
+            [[ $a == failed* && $b == failed* ]] || ok=0 ;;
+    esac
+
+    if [[ $ok == 1 ]]; then
+        pass=$((pass + 1))
+        log "  PASS $name: expected $expected, left [$a] right [$b]"
+    else
+        fail=$((fail + 1))
+        log "  FAIL $name: expected $expected, left [$a] right [$b]"
+        log "    reflexive: $(grep -h '^reflexive' "$RUN/a.out" "$RUN/b.out" | tr '\n' ' ')"
+    fi
+}
+
+# name expected -> the left side's translation, as its probe numbered it
+# before the punch: the console numbering, the mapping alone deciding it, a
+# confirmed mapping on the gateway numbering 2.
+judge_nat() {
+    local name=$1 expected=$2
+    local nat
+    nat=$(grep -Eo '^nat .*' "$RUN/a.out" | head -1)
+    if [[ $nat == "nat type=$expected "* ]]; then
+        pass=$((pass + 1))
+        log "  PASS $name nat: expected type $expected, [$nat]"
+    else
+        fail=$((fail + 1))
+        log "  FAIL $name nat: expected type $expected, [$nat]"
+    fi
+}
+
+# Two hosts, each behind its own gateway, with three routers between them.
+#
+# The router count is load bearing, not scenery. A mapping probe is emitted at a
+# TTL chosen so it dies inside the local network, and the whole point is that it
+# opens our own mapping without the peer's gateway ever seeing it. On a short
+# path the probe crosses the entire fabric, arrives at the far gateway before
+# that side has sent anything, and creates a translation entry in the inbound
+# direction; the far side's own outbound then matches that entry as a reply, so
+# no inward path is ever established and both sides time out. Real distance is
+# what stops it, so the fixture has to have some.
+#
+# The same length makes this the real form of the TTL regression: media crosses
+# more hops than a probe can, so a socket left at the probe value carries
+# nothing.
+build_two_sided() {
+    mkns llnet llr2 llr3 llgwa llgwb llha llhb || return 1
+    # Each link is its own point to point subnet. Two links sharing one prefix
+    # give a router two connected routes for it and the second is never used,
+    # which presents as a punch that times out for no visible reason.
+    wire llgwa exta "$LEFT_PUBLIC/30" llnet neta 203.0.113.2/30 || return 1
+    wire llnet mid1 10.0.1.1/30 llr2 r2a 10.0.1.2/30 || return 1
+    wire llr2 r2b 10.0.2.1/30 llr3 r3a 10.0.2.2/30 || return 1
+    wire llr3 r3b 203.0.113.6/30 llgwb extb "$RIGHT_PUBLIC/30" || return 1
+    wire llha inta 192.168.10.2/24 llgwa lana 192.168.10.1/24 || return 1
+    wire llhb intb 192.168.20.2/24 llgwb lanb 192.168.20.1/24 || return 1
+
+    for ns in llgwa llgwb llnet llr2 llr3; do
+        forward "$ns" || return 1
+    done
+
+    ip -n llnet addr add "$SERVER/32" dev lo || return 1
+    ip -n llnet addr add "$SERVER2/32" dev lo || return 1
+    ip -n llha route add default via 192.168.10.1 || return 1
+    ip -n llhb route add default via 192.168.20.1 || return 1
+    ip -n llgwa route add default via 203.0.113.2 || return 1
+    ip -n llgwb route add default via 203.0.113.6 || return 1
+    ip -n llnet route add 203.0.113.4/30 via 10.0.1.2 || return 1
+    ip -n llr2 route add default via 10.0.1.1 || return 1
+    ip -n llr2 route add 203.0.113.4/30 via 10.0.2.2 || return 1
+    ip -n llr3 route add default via 10.0.2.1 || return 1
+}
+
+topology_port_restricted() {
+    build_two_sided || return 1
+    nat_port_restricted llgwa exta $LEFT_PORT || return 1
+    nat_port_restricted llgwb extb $RIGHT_PORT || return 1
+    start_server
+    run_pair 192.168.10.2:$LEFT_PORT 192.168.20.2:$RIGHT_PORT
+    judge "port-restricted" established
+    judge_nat "port-restricted" 2
+}
+
+topology_full_cone() {
+    build_two_sided || return 1
+    nat_full_cone llgwa exta 192.168.10.2 $LEFT_PORT || return 1
+    nat_full_cone llgwb extb 192.168.20.2 $RIGHT_PORT || return 1
+    start_server
+    run_pair 192.168.10.2:$LEFT_PORT 192.168.20.2:$RIGHT_PORT
+    judge "full-cone" established
+    judge_nat "full-cone" 2
+}
+
+topology_restricted_cone() {
+    build_two_sided || return 1
+    nat_restricted_cone llgwa exta 192.168.10.2 $LEFT_PORT || return 1
+    nat_restricted_cone llgwb extb 192.168.20.2 $RIGHT_PORT || return 1
+    start_server
+    run_pair 192.168.10.2:$LEFT_PORT 192.168.20.2:$RIGHT_PORT
+    judge "restricted-cone" established
+    judge_nat "restricted-cone" 2
+}
+
+topology_symmetric() {
+    build_two_sided || return 1
+    nat_symmetric llgwa exta || return 1
+    nat_symmetric llgwb extb || return 1
+    start_server
+    run_pair 192.168.10.2:$LEFT_PORT 192.168.20.2:$RIGHT_PORT
+    judge "symmetric" failed
+    judge_nat "symmetric" 3
+}
+
+# Two layers on the left: a customer translator behind a carrier one. Both keep
+# mappings endpoint independent, so the punch must still work.
+topology_carrier_grade() {
+    # One more hop than the two-sided build. A probe must die before reaching
+    # any of the far side's translators, and this side has two of them, so the
+    # carrier translator is one hop further from the peer than a plain gateway
+    # would be.
+    mkns llnet llr2 llr3 llgwa llcgn llgwb llha llhb || return 1
+    wire llgwa exta 100.64.0.2/30 llcgn cgni 100.64.0.1/30 || return 1
+    wire llcgn cgne "$LEFT_PUBLIC/30" llnet neta 203.0.113.2/30 || return 1
+    wire llnet mid1 10.0.1.1/30 llr2 r2a 10.0.1.2/30 || return 1
+    wire llr2 r2b 10.0.2.1/30 llr3 r3a 10.0.2.2/30 || return 1
+    wire llr3 r3b 203.0.113.6/30 llgwb extb "$RIGHT_PUBLIC/30" || return 1
+    wire llha inta 192.168.10.2/24 llgwa lana 192.168.10.1/24 || return 1
+    wire llhb intb 192.168.20.2/24 llgwb lanb 192.168.20.1/24 || return 1
+
+    for ns in llgwa llcgn llgwb llnet llr2 llr3; do
+        forward "$ns" || return 1
+    done
+
+    ip -n llnet addr add "$SERVER/32" dev lo || return 1
+    ip -n llnet addr add "$SERVER2/32" dev lo || return 1
+    ip -n llha route add default via 192.168.10.1 || return 1
+    ip -n llhb route add default via 192.168.20.1 || return 1
+    ip -n llgwa route add default via 100.64.0.1 || return 1
+    ip -n llcgn route add default via 203.0.113.2 || return 1
+    ip -n llgwb route add default via 203.0.113.6 || return 1
+    ip -n llnet route add 203.0.113.4/30 via 10.0.1.2 || return 1
+    ip -n llr2 route add default via 10.0.1.1 || return 1
+    ip -n llr2 route add 203.0.113.4/30 via 10.0.2.2 || return 1
+    ip -n llr3 route add default via 10.0.2.1 || return 1
+
+    nat_port_restricted llgwa exta $LEFT_PORT || return 1
+    nat_port_restricted llcgn cgne $LEFT_PORT || return 1
+    nat_port_restricted llgwb extb $RIGHT_PORT || return 1
+
+    start_server
+    run_pair 192.168.10.2:$LEFT_PORT 192.168.20.2:$RIGHT_PORT
+    judge "carrier-grade" established
+    judge_nat "carrier-grade" 2
+}
+
+# A multihomed host answers from the address it was probed at.
+#
+# The left host carries two public addresses on one interface and the right
+# host, behind a port restricted translator, is handed only the secondary.
+# Its checks open its translator for exactly (secondary, port), so the
+# binding response must leave from the secondary: the kernel's own source
+# selection picks the primary, the translator sees a source the inside never
+# contacted, and the answer dies there. The translator is the assertion --
+# no packet capture, the guard either passes the right source or the check
+# is never answered.
+#
+# Neither side establishes, and that is the topology's artifice rather than a
+# defect: the left is never probed at its primary, so its own checks (unpinned
+# until a path is proven) leave from an address the right side's translator
+# never admitted, and a path needs the checks of both sides through. A real
+# peer is handed both candidates and opens the filter for each; this fixture
+# withholds one to force the response path it exists to check, so the probing
+# side is judged on its check being answered rather than on a path.
+topology_multihome() {
+    mkns llnet llgwb llha llhb || return 1
+    wire llha inta 203.0.113.9/29 llnet neta 203.0.113.14/29 || return 1
+    # The second address on the same interface. Added second, so the kernel
+    # marks it secondary and source selection prefers the primary -- which is
+    # exactly the wrong answer the response pin exists to override.
+    ip -n llha addr add 203.0.113.10/29 dev inta || return 1
+    wire llgwb extb "$RIGHT_PUBLIC/30" llnet netb 203.0.113.6/30 || return 1
+    wire llhb intb 192.168.20.2/24 llgwb lanb 192.168.20.1/24 || return 1
+
+    forward llnet || return 1
+    forward llgwb || return 1
+    ip -n llnet addr add "$SERVER/32" dev lo || return 1
+    ip -n llnet addr add "$SERVER2/32" dev lo || return 1
+    ip -n llha route add default via 203.0.113.14 || return 1
+    ip -n llhb route add default via 192.168.20.1 || return 1
+    ip -n llgwb route add default via 203.0.113.6 || return 1
+
+    nat_port_restricted llgwb extb $RIGHT_PORT || return 1
+
+    start_server
+
+    # The right side is not told what the left publishes; it is handed the
+    # secondary address alone, which is what "the peer probes the secondary"
+    # means concretely.
+    echo "203.0.113.10:$LEFT_PORT" >"$RUN/forced.cand"
+    start_peer llha "203.0.113.9:$LEFT_PORT" "$RUN/a.cand" "$RUN/b.cand" \
+        "$LEFT_UFRAG" "$LEFT_PWD" "$RIGHT_UFRAG" "$RIGHT_PWD" 161 "$RUN/a.out"
+    local a=$!
+    start_peer llhb "192.168.20.2:$RIGHT_PORT" "$RUN/b.cand" "$RUN/forced.cand" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 "$RUN/b.out"
+    local b=$!
+    wait "$a" 2>/dev/null
+    wait "$b" 2>/dev/null
+
+    # Judged on the probing side alone: its check must be answered at the
+    # secondary, which its translator only lets happen when the answer came
+    # from it.
+    local left right
+    left=$(grep -Eo '^(established|failed|timeout).*' "$RUN/a.out" | tail -1)
+    right=$(grep -Eo '^(established|failed|timeout).*' "$RUN/b.out" | tail -1)
+    if grep -qx "reachable 203.0.113.10:$LEFT_PORT" "$RUN/b.out"; then
+        pass=$((pass + 1))
+        log "  PASS multihome: probed at the secondary and answered from it, right [$right] left [$left]"
+    else
+        fail=$((fail + 1))
+        log "  FAIL multihome: the answer did not come from the probed address, right [$right] left [$left]"
+    fi
+    # Nothing translates in front of the probing side.
+    judge_nat "multihome" 1
+}
+
+# Both hosts behind one translator, reaching each other by its public address.
+topology_hairpin() {
+    mkns llnet llgwa llha llhb || return 1
+    wire llgwa exta "$LEFT_PUBLIC/30" llnet neta 203.0.113.2/30 || return 1
+    # Separate inside subnets for the same reason the uplinks are separate: two
+    # interfaces on one prefix give the gateway an unusable second route.
+    wire llha inta 192.168.10.2/30 llgwa lana 192.168.10.1/30 || return 1
+    wire llhb intb 192.168.11.2/30 llgwa lanb 192.168.11.1/30 || return 1
+
+    forward llgwa || return 1
+    forward llnet || return 1
+    ip -n llnet addr add "$SERVER/32" dev lo || return 1
+    ip -n llnet addr add "$SERVER2/32" dev lo || return 1
+    ip -n llha route add default via 192.168.10.1 || return 1
+    ip -n llhb route add default via 192.168.11.1 || return 1
+    ip -n llgwa route add default via 203.0.113.2 || return 1
+
+    nat_table llgwa || return 1
+    # One rule per inside host: each keeps its own external port, which is what
+    # endpoint-independent mapping means when two sockets share a translator.
+    ip netns exec llgwa nft add rule ip nat post oifname exta         ip saddr 192.168.10.2 meta l4proto udp masquerade to ":$LEFT_PORT" || return 1
+    ip netns exec llgwa nft add rule ip nat post oifname exta         ip saddr 192.168.11.2 meta l4proto udp masquerade to ":$RIGHT_PORT" || return 1
+    # Loopback: the public address, arriving from inside, is turned back inward.
+    ip netns exec llgwa nft add rule ip nat pre ip daddr "$LEFT_PUBLIC" \
+        udp dport $LEFT_PORT dnat to "192.168.10.2:$LEFT_PORT" || return 1
+    ip netns exec llgwa nft add rule ip nat pre ip daddr "$LEFT_PUBLIC" \
+        udp dport $RIGHT_PORT dnat to "192.168.11.2:$RIGHT_PORT" || return 1
+    # And the source is rewritten so the reply returns through the translator.
+    # Without this the far side answers directly and the datagram arrives from
+    # an address the asker never sent to, which is a filtering drop.
+    ip netns exec llgwa nft add rule ip nat post ip saddr 192.168.0.0/16 \
+        ip daddr 192.168.0.0/16 masquerade || return 1
+
+    start_server
+    run_pair 192.168.10.2:$LEFT_PORT 192.168.11.2:$RIGHT_PORT
+    judge "hairpin" established
+    judge_nat "hairpin" 2
+}
+
+# The deployment of docs/03-connectivity.md 7.1 against a real relay: the relay
+# and the host on one machine behind a router that forwards the relay's one
+# port, the client behind a symmetric translator no punch crosses. The host
+# offers its own address and nothing else; the client makes a relay attempt,
+# publishes the relayed address, and must reach the host through the relay.
+# The host is judged too: its path must be the relayed address.
+topology_relay_host_box() {
+    build_two_sided || return 1
+    nat_symmetric llgwa exta || return 1
+    nat_forwarded llgwb extb 192.168.20.2 $RIGHT_PORT 192.168.20.2 || return 1
+    start_server
+    start_relay llhb 192.168.20.2
+    echo "192.168.20.2:$RIGHT_PORT" >"$RUN/b.cand"
+    ip netns exec llha "$PEER" peer --bind "192.168.10.2:$LEFT_PORT" \
+        --relay "$RIGHT_PUBLIC:$RELAY_PORT" --relay-user "$RELAY_USER" --relay-pass "$RELAY_PASS" \
+        --publish "$RUN/a.cand" --await "$RUN/b.cand" \
+        --local-ufrag "$LEFT_UFRAG" --local-pwd "$LEFT_PWD" \
+        --remote-ufrag "$RIGHT_UFRAG" --remote-pwd "$RIGHT_PWD" \
+        --seed 161 --timeout-ms "$TIMEOUT_MS" $VERBOSE >"$RUN/a.out" 2>&1 &
+    local a=$!
+    start_peer llhb "192.168.20.2:$RIGHT_PORT" "$RUN/b.unused" "$RUN/a.cand" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 "$RUN/b.out"
+    local b=$!
+    wait "$a" 2>/dev/null
+    wait "$b" 2>/dev/null
+
+    local relayed left right
+    relayed=$(grep -Eo '^relayed .*' "$RUN/a.out" | head -1 | cut -d' ' -f2)
+    left=$(grep -Eo '^(established|failed|timeout).*' "$RUN/a.out" | tail -1)
+    right=$(grep -Eo '^(established|failed|timeout).*' "$RUN/b.out" | tail -1)
+    if [[ $relayed == 192.168.20.2:* && $left == "established 192.168.20.2:$RIGHT_PORT" \
+        && $right == "established $relayed" ]]; then
+        pass=$((pass + 1))
+        log "  PASS relay-host-box: relayed at $relayed, left [$left] right [$right]"
+    else
+        fail=$((fail + 1))
+        log "  FAIL relay-host-box: relayed [$relayed], left [$left] right [$right]"
+    fi
+}
+
+# The same topology with the client making a direct attempt, which must fail,
+# so the case above passes on the relay rather than on a topology anything
+# could cross.
+topology_relay_host_box_without_relay() {
+    build_two_sided || return 1
+    nat_symmetric llgwa exta || return 1
+    nat_forwarded llgwb extb 192.168.20.2 $RIGHT_PORT 192.168.20.2 || return 1
+    start_server
+    echo "192.168.20.2:$RIGHT_PORT" >"$RUN/b.cand"
+    start_peer llha "192.168.10.2:$LEFT_PORT" "$RUN/a.cand" "$RUN/b.cand" \
+        "$LEFT_UFRAG" "$LEFT_PWD" "$RIGHT_UFRAG" "$RIGHT_PWD" 161 "$RUN/a.out"
+    local a=$!
+    start_peer llhb "192.168.20.2:$RIGHT_PORT" "$RUN/b.unused" "$RUN/a.cand" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 "$RUN/b.out"
+    local b=$!
+    wait "$a" 2>/dev/null
+    wait "$b" 2>/dev/null
+    judge "relay-host-box-without-relay" failed
+}
+
+# The symmetric case, which fails, with a mapping daemon in the left gateway.
+# The left endpoint maps its port, the reflexive server confirms the gateway's
+# address, and the right reaches the left at the mapped address, which no
+# translator moves. The right's path must be that address.
+topology_mapped() {
+    build_two_sided || return 1
+    nat_mapped llgwa exta lana 192.168.10.0/24 || return 1
+    nat_symmetric llgwb extb || return 1
+    start_server
+    start_peer llha "192.168.10.2:$LEFT_PORT" "$RUN/a.cand" "$RUN/b.cand" \
+        "$LEFT_UFRAG" "$LEFT_PWD" "$RIGHT_UFRAG" "$RIGHT_PWD" 161 "$RUN/a.out" --map
+    local a=$!
+    start_peer llhb "192.168.20.2:$RIGHT_PORT" "$RUN/b.cand" "$RUN/a.cand" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 "$RUN/b.out"
+    local b=$!
+    wait "$a" 2>/dev/null
+    wait "$b" 2>/dev/null
+
+    local mapped left right
+    mapped=$(grep -Eo '^mapped .*' "$RUN/a.out" | head -1 | cut -d' ' -f2)
+    left=$(grep -Eo '^(established|failed|timeout).*' "$RUN/a.out" | tail -1)
+    right=$(grep -Eo '^(established|failed|timeout).*' "$RUN/b.out" | tail -1)
+    if [[ $mapped == "$LEFT_PUBLIC:$LEFT_PORT" && $left == established* \
+        && $right == "established $mapped" ]]; then
+        pass=$((pass + 1))
+        log "  PASS mapped: mapped at $mapped, left [$left] right [$right]"
+    else
+        fail=$((fail + 1))
+        log "  FAIL mapped: mapped [$mapped], left [$left] right [$right]"
+        log "    reflexive: $(grep -h '^reflexive' "$RUN/a.out" "$RUN/b.out" | tr '\n' ' ')"
+    fi
+    # A port per destination, reached all the same through the confirmed
+    # mapping.
+    judge_nat "mapped" 2
+}
+
+# The same with no mapping asked for, which must fail, so the case above passes
+# on the mapping rather than on anything else the daemon's gateway does.
+topology_mapped_unused() {
+    build_two_sided || return 1
+    nat_mapped llgwa exta lana 192.168.10.0/24 || return 1
+    nat_symmetric llgwb extb || return 1
+    start_server
+    run_pair "192.168.10.2:$LEFT_PORT" "192.168.20.2:$RIGHT_PORT"
+    judge "mapped-unused" failed
+    judge_nat "mapped-unused" 3
+}
+
+run_topology() {
+    log "$1:"
+    cleanup
+    mkdir -p "$RUN"
+    if [[ $1 == relay-* ]] && ! command -v turnserver >/dev/null; then
+        log "  SKIP $1: no turnserver on this machine"
+        return
+    fi
+    if [[ $1 == mapped* ]] && ! command -v miniupnpd >/dev/null; then
+        log "  SKIP $1: no miniupnpd on this machine"
+        return
+    fi
+    if ! "topology_$(echo "$1" | tr - _)"; then
+        fail=$((fail + 1))
+        log "  FAIL $1: could not build the topology"
+    fi
+    for pid in server server2 relay mapper; do
+        if [[ -f $RUN/$pid.pid ]]; then
+            kill "$(cat "$RUN/$pid.pid")" 2>/dev/null
+        fi
+    done
+    cleanup
+}
+
+if [[ $EUID -ne 0 ]]; then
+    log "skipped: network namespace fixtures need root"
+    exit 0
+fi
+if [[ ! -x $PUNCH ]]; then
+    log "skipped: no reflexive server at $PUNCH; build it first"
+    exit 0
+fi
+if [[ ! -x $PEER ]]; then
+    log "skipped: no endpoint at $PEER; build it first"
+    exit 0
+fi
+
+trap cleanup EXIT
+
+ALL="port-restricted full-cone restricted-cone symmetric carrier-grade hairpin multihome"
+ALL+=" relay-host-box relay-host-box-without-relay mapped mapped-unused"
+if [[ $# -gt 0 ]]; then
+    topologies=("$@")
+else
+    read -ra topologies <<<"$ALL"
+fi
+for topology in "${topologies[@]}"; do
+    run_topology "$topology"
+done
+
+log ""
+log "netns fixtures: $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

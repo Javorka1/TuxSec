@@ -1,0 +1,86 @@
+[package]
+name = "lowlat-sdk"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The one shared object and the one header. Everything an application links
+# is here; the host and the client are its two halves, each a feature, so a
+# platform that can only be a client builds a library with no host in it.
+[lib]
+name = "lowlat"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["host", "client", "vdd"]
+# The host half: capture, encode, delivery and input, and every
+# `lowlat_host_*` entry point. Off, none of the Linux display stack is compiled.
+host = [
+    "dep:lowlat-host",
+    "dep:lowlat-core",
+    "dep:lowlat-crypto",
+    "dep:lowlat-audio",
+    "dep:lowlat-encode",
+    "dep:lowlat-inject",
+]
+# The client half: the connecting side, decode and present, and every
+# `lowlat_client_*` entry point.
+client = [
+    "dep:lowlat-client",
+    "dep:lowlat-core",
+    "dep:lowlat-net",
+    "dep:lowlat-portmap",
+    "dep:zeroize",
+]
+# The third half: the host's own virtual displays, through the display
+# driver's controller, and every `lowlat_vdd_*` entry point. Windows alone; on
+# any other platform the feature builds nothing.
+vdd = ["dep:lowlat-vdd-ctl"]
+# The client's software decoder takes a GPL build of the machine's codec
+# library as well as an LGPL one. The default build never does: a build with
+# this on is its maker's combination, and the GPL's terms apply to it.
+# Reported by `lowlat_features` as `LOWLAT_FEATURE_GPL_LIBAVCODEC`.
+gpl-libavcodec = ["client", "lowlat-client/gpl-libavcodec"]
+
+[dependencies]
+lowlat-common.workspace = true
+lowlat-host = { workspace = true, optional = true }
+lowlat-client = { workspace = true, optional = true }
+lowlat-net = { workspace = true, optional = true }
+# The gateway's mapping as the client's status reports it.
+lowlat-portmap = { workspace = true, optional = true }
+lowlat-core = { workspace = true, optional = true }
+lowlat-crypto = { workspace = true, optional = true }
+lowlat-audio = { workspace = true, optional = true }
+lowlat-encode = { workspace = true, optional = true }
+lowlat-inject = { workspace = true, optional = true }
+lowlat-vdd-ctl = { workspace = true, optional = true }
+# Clears the copy of a relay's credential the boundary takes from the
+# caller's configuration. Already in the graph beneath the credentials crate.
+zeroize = { version = "1", optional = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Generates the C header from these definitions, so the two cannot drift
+# (docs/06-api.md 12). A dev-dependency rather than a build one: the header is
+# committed, nothing on a build machine regenerates it, and a test is what
+# fails when it is stale. Default features off drops the command-line parser,
+# which is ten crates we would carry to call a library function.
+cbindgen = { version = "0.29.4", default-features = false }
+# The decoder's own layouts, which a test holds to the header's names for them.
+# Already in the graph beneath the client half.
+lowlat-decode.workspace = true
+
+# The ABI gates' compiler and export dump on Windows: Visual Studio's own, found
+# where cargo finds its linker, with the environment they need, so the gates
+# run from any shell and on a CI runner with no developer prompt. Already in
+# the graph beneath the C compiler crate that ring's build uses; no
+# dependencies of its own.
+[target.'cfg(windows)'.dev-dependencies]
+find-msvc-tools = "0.1.11"

@@ -1,0 +1,51 @@
+[package]
+name = "lowlat-capture"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lowlat-common.workspace = true
+# The pointer is encoded in the form the wire carries it.
+lowlat-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+drm.workspace = true
+drm-ffi.workspace = true
+# The pointer plane is mapped and read; frames never are.
+libc.workspace = true
+ash.workspace = true
+khronos-egl.workspace = true
+libloading.workspace = true
+
+# The duplication and the conversion run on the system's graphics interface
+# through the device seam the encoder and the decoders already use. The
+# desktop, pointer, awareness and power calls are the system's own
+# declarations, as the IO shell takes them: linked by name at build time with
+# no import libraries.
+[target.'cfg(windows)'.dependencies]
+lowlat-drivers.workspace = true
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    # The compositor's clock, which every output's pictures are made on.
+    "Win32_Graphics_Dwm",
+    # The monitors listed behind an output, which is what a pulled cable
+    # changes when the output itself stays on the desktop.
+    "Win32_Graphics_Gdi",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_UI_HiDpi",
+    # A sleeping display is woken by input alone.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,337 @@
+name: build
+run-name: "build: ${{ inputs.name || github.ref_name }}"
+
+# Started by hand: a release build of the daemon, the Debian package, and the
+# SDK in its two forms -- the full library, and the client-only library with
+# the demo inside its tarball -- each the shared library with its header in
+# the usual lib/ and include/ layout; and on Windows the client's zip, the
+# library as a DLL with its import library and as a static one, the demo
+# inside, with its symbols beside it; and on macOS the client's zip, the client
+# half as one universal static library with its header, run where it was not
+# built as well. All kept as artifacts. Nothing here runs on a push; ci.yml is
+# what every push gets.
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "What this build is for; it names the run"
+        required: false
+        default: ""
+      deb_version:
+        description: "Package version (e.g. 0.1.0~pre1-1); the crate's when empty"
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release binary and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The artifacts are named by the short commit; there is no expression
+      # for a prefix of the full one.
+      - name: Short commit
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # The build itself needs nothing graphical: every encoder and graphics
+      # interface is loaded at runtime. cargo-deb is the one tool on top. The
+      # demo's toolkit needs its shader compiler, since its shader headers are
+      # made at build time rather than committed, and the headers of the three
+      # libraries it declares from the system's own rather than by hand; it
+      # opens every one of them at run time all the same. SDL, built here for
+      # the demo's pads and sound, needs the headers of its sound and pad
+      # backends, which it too loads at run time.
+      - uses: taiki-e/install-action@cargo-deb
+
+      - name: Install the toolkit's build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools bsdextrautils libasound2-dev libpng-dev libjpeg-dev \
+            libpulse-dev libpipewire-0.3-dev libudev-dev
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release -p lowlatd -p lowlat-sdk
+
+      # **The header ships as committed, not regenerated here.** The ABI gate
+      # in ci.yml is what proves the committed header matches the definitions
+      # in the same commit, so this takes the file the gate passed.
+      #
+      # **Two libraries, one file.** Both builds of the library land on
+      # target/release/liblowlat.so, so each is copied into its tarball before
+      # the next build, and every check reads the tarball's own copy: the
+      # describe program opens it, prints its version and feature bits into
+      # FEATURES, and fails on any bits but the expected ones or a version
+      # other than the header's.
+      - name: Assemble the SDK
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude -o describe crates/sdk/tests/c/describe.c -ldl
+          sdk=lowlat-sdk-linux-x86_64-${{ steps.sha.outputs.short }}
+          mkdir -p "$sdk/lib" "$sdk/include"
+          cp target/release/liblowlat.so "$sdk/lib/"
+          strip --strip-debug "$sdk/lib/liblowlat.so"
+          cp include/lowlat.h "$sdk/include/"
+          cp LICENSE docs/06-api.md docs/10-client.md "$sdk/"
+          ./describe "$sdk/lib/liblowlat.so" 0x3 | tee "$sdk/FEATURES"
+          tar -czf "$sdk.tar.gz" "$sdk"
+          ls -la "$sdk"/lib "$sdk"/include
+          nm -D --defined-only "$sdk/lib/liblowlat.so" | grep -c ' lowlat_'
+
+      - name: Build the client-only library
+        run: cargo build --release -p lowlat-sdk --no-default-features --features client
+
+      # SDL, for the demo's pads and sound, which this runner's system does
+      # not package: its release, built static.
+      - name: Build SDL for the demo
+        run: bash scripts/build-sdl3.sh "$RUNNER_TEMP/sdl3"
+
+      # The demo is linked against the tarball's own library, with a run path
+      # of ../lib relative to itself, and placed beside it as bin/client with
+      # nothing else: SDL is linked into it, so it needs no library but that
+      # one, which is checked. The toolkit and SDL it carries are under their
+      # own notices. Run from there with no peer, it names the library it
+      # loaded and leaves, which is the check that the run path resolves and
+      # the object is the client one.
+      - name: Assemble the client SDK, the demo inside it
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/sdl3/lib/pkgconfig
+        run: |
+          sdk=lowlat-sdk-linux-x86_64-client-${{ steps.sha.outputs.short }}
+          mkdir -p "$sdk/lib" "$sdk/include" "$sdk/bin"
+          cp target/release/liblowlat.so "$sdk/lib/"
+          strip --strip-debug "$sdk/lib/liblowlat.so"
+          cp include/lowlat.h "$sdk/include/"
+          cp LICENSE docs/06-api.md docs/10-client.md "$sdk/"
+          cp third_party/matoya/LICENSE "$sdk/LICENSE.matoya"
+          cp "$RUNNER_TEMP/sdl3/share/licenses/SDL3/LICENSE.txt" "$sdk/LICENSE.sdl3"
+          ./describe "$sdk/lib/liblowlat.so" 0x2 | tee "$sdk/FEATURES"
+          make -C examples/client LOWLAT_LIB="$PWD/$sdk/lib" client
+          cp examples/client/client "$sdk/bin/"
+          strip --strip-debug "$sdk/bin/client"
+          readelf -d "$sdk/bin/client" | grep NEEDED
+          if readelf -d "$sdk/bin/client" | grep -q 'libSDL3'; then
+            echo "the demo needs a shared SDL"; exit 1
+          fi
+          set +e
+          "$sdk/bin/client" > demo.log 2>&1
+          status=$?
+          set -e
+          cat demo.log
+          test "$status" -eq 2
+          grep -q 'features=0x2' demo.log
+          tar -czf "$sdk.tar.gz" "$sdk"
+          ls -la "$sdk"/lib "$sdk"/include "$sdk"/bin
+          nm -D --defined-only "$sdk/lib/liblowlat.so" | grep -c ' lowlat_'
+
+      - name: Package
+        run: |
+          if [ -n "${{ inputs.deb_version }}" ]; then
+            cargo deb -p lowlatd --no-build --deb-version "${{ inputs.deb_version }}"
+          else
+            cargo deb -p lowlatd --no-build
+          fi
+          ls -la target/debian/
+
+      - name: Describe
+        run: |
+          target/release/lowlatd --outputs || true
+          dpkg-deb -I target/debian/lowlat_*.deb
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlatd-linux-x86_64-${{ steps.sha.outputs.short }}
+          path: target/release/lowlatd
+          if-no-files-found: error
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlat-deb-${{ steps.sha.outputs.short }}
+          path: target/debian/lowlat_*.deb
+          if-no-files-found: error
+
+      - name: Upload the SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlat-sdk-linux-x86_64-${{ steps.sha.outputs.short }}
+          path: lowlat-sdk-linux-x86_64-${{ steps.sha.outputs.short }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload the client SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlat-sdk-linux-x86_64-client-${{ steps.sha.outputs.short }}
+          path: lowlat-sdk-linux-x86_64-client-${{ steps.sha.outputs.short }}.tar.gz
+          if-no-files-found: error
+
+  # The client's Windows zip, made by the script a machine runs by hand too
+  # (scripts/package-client-windows.ps1), which checks the zip's own copies:
+  # the DLL the client half with no host entry point, the demo started with no
+  # peer naming the library linked into it. The toolkit's one build compiles
+  # its shaders with glslang's tools from vcpkg, at the demo's baseline.
+  windows:
+    name: Windows client zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Short commit
+        id: sha
+        shell: bash
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: vcpkg
+        run: |
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          git -C $vcpkg fetch --quiet origin 19780d9cdf84d0944cf9a318666703b89ab6629c
+          git -C $vcpkg checkout --quiet 19780d9cdf84d0944cf9a318666703b89ab6629c
+          & "$vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\vcpkg-cache" | Out-Null
+          "VCPKG_ROOT=$vcpkg" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;files,$env:RUNNER_TEMP\vcpkg-cache,readwrite" >> $env:GITHUB_ENV
+
+      - name: vcpkg's packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ hashFiles('.github/windows-tools/vcpkg.json', 'examples/client/vcpkg.json') }}
+
+      - name: The shader compiler
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --x-manifest-root=.github/windows-tools `
+            "--x-install-root=$env:RUNNER_TEMP\windows-tools" --triplet x64-windows --disable-metrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP\windows-tools\x64-windows\tools\glslang" >> $env:GITHUB_PATH
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Package
+        run: |
+          scripts\package-client-windows.ps1 -OutDir "$env:RUNNER_TEMP\dist" `
+            -Name lowlat-sdk-windows-x86_64-client-${{ steps.sha.outputs.short }}
+
+      - name: Upload the client zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlat-sdk-windows-x86_64-client-${{ steps.sha.outputs.short }}
+          path: ${{ runner.temp }}/dist/lowlat-sdk-windows-x86_64-client-${{ steps.sha.outputs.short }}.zip
+          if-no-files-found: error
+
+      - name: Upload its symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlat-sdk-windows-x86_64-client-${{ steps.sha.outputs.short }}-symbols
+          path: ${{ runner.temp }}/dist/lowlat-sdk-windows-x86_64-client-${{ steps.sha.outputs.short }}-symbols.zip
+          if-no-files-found: error
+
+  # The client's macOS zip, made by the script a Mac runs by hand too
+  # (scripts/package-client-macos.sh), which checks the copies it zips: both
+  # architectures, no member for a system later than the client's oldest, no
+  # host entry point, and the C test program linked to the library as C and,
+  # with thin link-time optimisation, as C and as C++, and run. The x86_64
+  # slice is built across from this arm64 runner, its programs run under the
+  # system's translation layer.
+  macos:
+    name: macOS client zip
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Short commit
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Install toolchain
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: The translation layer
+        run: arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Package
+        run: |
+          bash scripts/package-client-macos.sh "$RUNNER_TEMP/dist" \
+            lowlat-sdk-macos-universal-client-${{ steps.sha.outputs.short }}
+
+      - name: Upload the client zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: lowlat-sdk-macos-universal-client-${{ steps.sha.outputs.short }}
+          path: ${{ runner.temp }}/dist/lowlat-sdk-macos-universal-client-${{ steps.sha.outputs.short }}.zip
+          if-no-files-found: error
+
+  # The zip where it was not built: natively on Intel, which the build runner
+  # only translates, and on the oldest macOS a runner offers. The same C test
+  # program, linked to the zip's library the same three ways for the client's
+  # oldest system with the linker's warnings as errors, and run, for the
+  # runner's own architecture.
+  macos-elsewhere:
+    name: macOS client zip on ${{ matrix.runner }}
+    needs: macos
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-14]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Short commit
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lowlat-sdk-macos-universal-client-${{ steps.sha.outputs.short }}
+          path: ${{ runner.temp }}/zip
+
+      - name: The zip's library, linked and run
+        run: |
+          name=lowlat-sdk-macos-universal-client-${{ steps.sha.outputs.short }}
+          ditto -x -k "$RUNNER_TEMP/zip/$name.zip" "$RUNNER_TEMP/unpacked"
+          sdk=$RUNNER_TEMP/unpacked/$name
+          sw_vers -productVersion
+          uname -m
+          cat "$sdk/FEATURES"
+          for way in c c-lto c++-lto; do
+            case $way in
+            c) compile="cc -std=c11" optimise="" ;;
+            c-lto) compile="cc -std=c11" optimise="-flto=thin -Wl,-dead_strip" ;;
+            c++-lto) compile="c++ -std=c++17 -x c++" optimise="-flto=thin -Wl,-dead_strip" ;;
+            esac
+            echo "== linked as $way"
+            $compile -Wall -Wextra -Werror -mmacosx-version-min=11.0 -I "$sdk/include" \
+              crates/sdk/tests/c/static.c -x none "$sdk/lib/liblowlat.a" \
+              -Wl,-fatal_warnings $optimise -o "$RUNNER_TEMP/static-$way"
+            "$RUNNER_TEMP/static-$way"
+          done

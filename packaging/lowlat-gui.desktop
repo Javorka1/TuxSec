@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Parsec Linux Host
+Comment=Gerenciar conexões, monitores e permissões do Parsec Host no Linux
+Exec=/usr/bin/lowlat-gui
+Icon=video-display
+Terminal=false
+Categories=Network;RemoteAccess;Game;
+Keywords=parsec;lowlat;host;stream;remote;
+StartupNotify=true

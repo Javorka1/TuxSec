@@ -1,0 +1,32 @@
+[package]
+name = "lowlat-decode"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lowlat-common.workspace = true
+# The video header the decoder is built from, and the codec it names.
+lowlat-core.workspace = true
+# The device interface, resolved at runtime.
+lowlat-drivers.workspace = true
+
+[dev-dependencies]
+# The counting allocator, for the assertion that the software backend's
+# per-unit path allocates nothing on this side.
+lowlat-common = { workspace = true, features = ["alloc-counter"] }
+
+# The parameter-set writers, so what the encoders write is checked to parse
+# back to what they were told; and on Windows the vendor encoder itself, fed
+# the synthetic source, whose every picture the D3D11 decoder takes back. The
+# host's crates, so where a host runs alone.
+[target.'cfg(any(target_os = "linux", windows))'.dev-dependencies]
+lowlat-encode.workspace = true
+lowlat-capture.workspace = true
+
+[lints]
+workspace = true

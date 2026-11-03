@@ -1,0 +1,12 @@
+[Unit]
+Description=lowlat PipeWire Discord/Voice Audio Guard
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+ExecStart=/usr/bin/lowlat-audio-guard
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

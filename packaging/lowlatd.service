@@ -1,0 +1,107 @@
+[Unit]
+Description=lowlat remote desktop host
+# The signaling client needs a route before it can advertise, and it retries
+# rather than failing, so this orders the start and does not gate it.
+After=network-online.target
+Wants=network-online.target
+# **The vendor encoder's kernel half is loaded on first use, and the device
+# list below is resolved once, when this starts.** Without this a service that
+# started before anything had used the encoder had that device denied for its
+# whole life, and every guest after the first login was ended with the encoder
+# unavailable (measured across a reboot). Wanted rather than required, so a
+# machine without the vendor's driver starts as before.
+Wants=modprobe@nvidia_uvm.service
+After=modprobe@nvidia_uvm.service
+
+[Service]
+# **The flags are configuration, so they come from the file below** rather
+# than from this unit, which a package owns and an administrator should not
+# have to edit. Unquoted on purpose: systemd splits it on whitespace, which is
+# what makes it a list of arguments rather than one long one.
+ExecStart=/usr/bin/lowlatd $LOWLATD_ARGS
+# The vendor's own tool makes the encoder's device node, which nothing else
+# does until a program in the session uses the encoder first. With full
+# privilege, because the node is made outside the sandbox below; ignored where
+# the tool is absent.
+ExecStartPre=-+/usr/bin/nvidia-modprobe -u -c=0
+Restart=on-failure
+RestartSec=2
+
+# **Root, and it is a product decision rather than a packaging detail**
+# (docs/07-platforms.md section 6.1). Reading the buffer handles of what a
+# display is scanning out needs CAP_SYS_ADMIN, which is already the whole
+# machine; and a session's sockets -- the sound server's, the compositor's, the
+# greeter's -- live in runtime directories that admit their owner and root and
+# nobody else. A dedicated account carrying the capability was measured to be
+# refused at each of those doors. The bounding set keeps root to what capture,
+# the device nodes and those directories need.
+# CAP_SYS_NICE is what the kernel asks before it grants the conversion's queue
+# a raised GPU priority; without it a game holding the GPU starves the
+# conversion and the guest is held on the last picture (measured on a Renoir
+# APU). Its absence is logged and the conversion runs at normal priority.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_NICE
+NoNewPrivileges=yes
+
+# Where the session side connects, created and torn down with the service.
+RuntimeDirectory=lowlatd
+RuntimeDirectoryMode=0755
+
+# The signaling server and session are configuration rather than arguments.
+EnvironmentFile=/etc/lowlat/lowlatd.env
+
+# **Denied by default, then the classes it needs.** char-drm covers both the
+# display device and the render node; the two input nodes are named because
+# they are the only ones of their class this opens -- the second presents a
+# guest's DualShock 4 or DualSense on the HID layer, and without it the pad
+# is refused at creation (measured: "Operation not permitted" under this
+# policy with the first node alone). The vendor driver's own nodes are not
+# display devices: its encoder is reached through them, and without them a
+# display on that card is captured and then refused an encoder (measured:
+# "compute runtime unavailable", and the stream stays on the other card).
+# The vendor's nodes may also be *made* here: its tool above creates the
+# encoder's node when nothing else has, and the device list denies making
+# nodes unless told otherwise -- measured across a boot, where the tool ran,
+# reported nothing, and the node appeared only at the first login.
+DevicePolicy=closed
+DeviceAllow=char-drm rw
+DeviceAllow=char-nvidia rwm
+DeviceAllow=char-nvidia-uvm rwm
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/uhid rw
+
+# **Not `strict`, deliberately.** The session's own sockets live under /run,
+# and a read-only /run refuses a connection to one, which would take the
+# desktop's sound with it.
+ProtectSystem=full
+# **Not ProtectHome, for the same reason**: it hides /run/user along with the
+# home directories, and /run/user is where every session's sockets are -- the
+# sound server's, the compositor's, the greeter's. Measured: with it set, the
+# service found no session at all. The two directories it was really for are
+# hidden by name instead.
+ProtectHome=no
+InaccessiblePaths=-/home -/root
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+# **Four more that the hardening report asks for and this does not take**, each
+# for a measured or structural reason rather than an oversight:
+#
+#   ProcSubset=pid            hides /proc/sys, and the default host name is
+#                             read from /proc/sys/kernel/hostname
+#   MemoryDenyWriteExecute=   the graphics stack compiles shaders at runtime
+#   PrivateDevices=           the whole point is two device classes
+#   PrivateNetwork=,          a remote desktop host talks to peers nobody can
+#   IPAddressDeny=            enumerate in advance
+
+[Install]
+WantedBy=multi-user.target

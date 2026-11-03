@@ -1,0 +1,5147 @@
+//! The host half of the public C ABI.
+//!
+//! Every `lowlat_host_*` entry point and every type it takes or fills. Behind
+//! the `host` feature, which is what lets a build carry a client and no host.
+
+use core::ffi::{c_char, c_void};
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
+
+use ::lowlat_host::admission::{Event, Outcome};
+use ::lowlat_host::events::Delivery;
+use lowlat_event_type::*;
+use lowlat_outcome::*;
+
+use super::guard;
+use super::lowlat_status::{self, *};
+use super::shared::*;
+
+const _: () = assert!(LOWLAT_SERVERS_MAX == ::lowlat_host::admission::SERVERS_MAX);
+
+/// How much colour the stream carries, relative to its luma.
+///
+/// **Typed and carried as [`lowlat_codec`] is**, and an axis rather than a
+/// flag because it has somewhere to go: a third layout is in wide use
+/// elsewhere even though nothing here produces one.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum lowlat_chroma {
+    /// Nothing is being coded yet: what a status says before its stream
+    /// exists.
+    LOWLAT_CHROMA_NONE = 0,
+    /// Colour at half resolution in both directions, which is what a session
+    /// runs at until a guest asks otherwise.
+    LOWLAT_CHROMA_420 = 1,
+    /// Colour at full resolution. Reported once a guest has asked for it and
+    /// the offer has been granted, which needs the second codec and the
+    /// captured output's encoder to be able to code it.
+    LOWLAT_CHROMA_444 = 2,
+}
+
+/// Which encoder to build.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum lowlat_encoder {
+    /// **The default, and the right one.** A conversion target is allocated on
+    /// the device the display is on and an encoder belonging to another cannot
+    /// take it, so the encoder is a consequence of where the display is rather
+    /// than a preference. Choosing one is for forcing a particular encoder on a
+    /// machine where either would do.
+    LOWLAT_ENCODER_FOLLOW_DISPLAY = 0,
+    LOWLAT_ENCODER_OPEN = 1,
+    LOWLAT_ENCODER_VENDOR = 2,
+}
+
+/// Which congestion control level a session runs at.
+///
+/// **Zero is the most aggressive, not "off".** Its thresholds are all zero, so
+/// every outstanding fragment classifies stale and congestion is declared on
+/// every pass once the send window passes its floor. Sensitive is the default
+/// and the one to leave alone.
+///
+/// **Adaptive is not a fourth tolerance.** The first three are tunings of one
+/// detector and describe the whole of what a host does about congestion.
+/// Adaptive runs the sensitive tuning and adds host-local signals that see
+/// what the window floor hides. **Nothing is behind it yet**, so it behaves
+/// exactly as sensitive today; it is named here so that a signal which earns
+/// its measurement becomes a setting rather than a rebuild.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum lowlat_cg_level {
+    LOWLAT_CG_LEVEL_AGGRESSIVE = 0,
+    LOWLAT_CG_LEVEL_SENSITIVE = 1,
+    LOWLAT_CG_LEVEL_RELAXED = 2,
+    LOWLAT_CG_LEVEL_ADAPTIVE = 3,
+}
+
+/// Where a host sits between delay and picture.
+///
+/// **The only encoder tuning this boundary exposes.** An encoder has a dozen
+/// knobs and almost none of them are an application's business; what an
+/// application wants to say is whether its guests would rather wait less or
+/// look at more. See [05 §4.1](../docs/05-host.md) for the levers this
+/// moves and [06 §quality](../docs/06-api.md).
+///
+/// **Zero is the low-latency end, and that is deliberate**: a zeroed structure
+/// has to mean the sensible default, and for a product whose first goal is
+/// delay the sensible default is a bounded frame.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum lowlat_quality {
+    LOWLAT_QUALITY_LOWEST_LATENCY = 0,
+    LOWLAT_QUALITY_BALANCED = 1,
+    LOWLAT_QUALITY_HIGHEST = 2,
+}
+
+/// The video settings that can change while a host is running.
+///
+/// **Split out because the split is real.** Everything here is applied without
+/// rebuilding anything the session rests on: a bitrate re-bases the budget and
+/// reaches the encoder through the reconfigure the rate loop already performs,
+/// a frame rate changes the pacing from the next frame, and the quality moves
+/// the running encoder. What is not here -- the codec, the encoder, the guest
+/// limit, the ports -- is settled when hosting starts, because changing it
+/// means building the pipeline again.
+///
+/// **There is no resolution and no rotation.** The display decides its own size
+/// and orientation and this host follows; asking it to be something else is a
+/// request to whoever owns the display, which is not this library
+/// ([impl-plan](../docs/impl-plan.md), *Output selection*).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_host_video_config {
+    /// Set by the caller to `sizeof(lowlat_host_video_config)`.
+    pub size: u32,
+    /// **A ceiling, not a target.** Capture runs at the display's own rate and
+    /// this is the most that is encoded from it. **Default: 60.**
+    pub fps: u32,
+    /// What the operator asked for, before it is divided among guests.
+    /// **Default: 10.0.**
+    pub bitrate_mbps: f64,
+    /// The floor congestion control may not descend below. Lowered with the
+    /// ceiling when it would otherwise sit above it. **Default: 1.0.**
+    pub min_bitrate_mbps: f64,
+    /// Emit at `fps` even when the picture has not changed.
+    ///
+    /// **A permission, not an instruction, and off by default.** There is no
+    /// damage signal here, so nothing yet skips a repeated picture; a host that
+    /// keeps sending costs bitrate rather than being wrong. Setting it promises
+    /// to spend that bitrate whatever else becomes possible later.
+    pub full_fps: bool,
+    pub reserved: [u8; 3],
+    /// Which output to capture, by an identity from the enumeration. **Empty
+    /// means whichever this host would pick on its own**, which is the output
+    /// at the desktop's corner and then whatever is lit. `virtual` is the
+    /// host's own display, plugged when it is asked for (Windows alone;
+    /// refused elsewhere).
+    pub output: [c_char; LOWLAT_OUTPUT_MAX],
+    /// The host's own display's size, both or neither (minor 27; Windows
+    /// alone from minor 32). **Zero lets the host decide**: the size an owner
+    /// states as it joins an empty room, within the largest picture that guest
+    /// accepts, else the size the display already has, 1920x1080 when first
+    /// plugged. Otherwise 640x480 to 7680x4320, refused outside it rather than
+    /// clamped.
+    #[cfg(windows)]
+    pub virtual_width: u32,
+    #[cfg(windows)]
+    pub virtual_height: u32,
+    /// The host's own display's refresh (minor 27; Windows alone from minor
+    /// 32). **Zero means the frame rate's ceiling, `fps`**, so the display
+    /// composes no picture the stream would not take; **with `fps` zero too,
+    /// the display's own refresh**, which a person may set in its display
+    /// settings, 60 when it is first plugged with none to restore. Otherwise
+    /// 24 to 480.
+    #[cfg(windows)]
+    pub virtual_hz: u32,
+    /// One of [`lowlat_quality`] (minor 37; before it, on the configuration,
+    /// and settled when hosting started). **Moved under a running stream**:
+    /// live where the encoder takes it as it runs, at one keyframe where it
+    /// takes it only with a new sequence, by a rebuild where it takes it not
+    /// at all (docs/06-api.md section 3).
+    ///
+    /// **What a host reports back is what it asked for, not what a device
+    /// did.** No interface here says whether a driver honoured a quantiser
+    /// floor or an effort level, and one measured takes the floor on one codec
+    /// and ignores it on the other, so a host logs its request and does not
+    /// claim more than that. **Default: lowest latency.**
+    pub quality: u32,
+    /// One of [`lowlat_cg_level`] (minor 37; before it, on the configuration,
+    /// and settled when hosting started). **Moves every guest from the next
+    /// pass**: the thresholds each guest's session counts stale fragments by
+    /// and the ratio its controller judges the count by, one setting moving
+    /// both, with nothing rebuilt and no keyframe. **Zero is the most
+    /// aggressive, not "off"**, and a structure zeroed by its caller asks for
+    /// it. **Default: sensitive**, which is the tuning every other one is
+    /// judged against.
+    ///
+    /// With the quality, **what makes this structure eight bytes longer than
+    /// minor 36's on every platform**, so a caller built against that minor is
+    /// refused rather than misread: on Windows the quality alone fills the
+    /// padding minor 36's ended in.
+    pub cg_level: u32,
+}
+
+/// How sound is configured.
+///
+/// **Every field here is live.** Sound has no half that must be settled when
+/// hosting starts: the device and the mute cost a reconnect the loop performs,
+/// and the rest are read on the frame that uses them. So this is both what a
+/// host starts with and what [`lowlat_host_set_audio_config`] takes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct lowlat_host_audio_config {
+    /// Set by the caller to `sizeof(lowlat_host_audio_config)`.
+    pub size: u32,
+    /// What the compressed form is encoded at, in kilobits a second.
+    /// **Default: [`lowlat_audio::encode::DEFAULT_BITRATE_KBPS`].**
+    pub bitrate_kbps: u32,
+    /// Whether sound is captured at all. Off gives the device back and puts
+    /// the speakers at the desk back with it. **Default: on** -- a host that
+    /// streams a desktop streams its sound.
+    pub enabled: bool,
+    /// Whether a guest that asked for the uncompressed form may have it.
+    ///
+    /// **A permission, not a request**, and off by default: it costs an order
+    /// of magnitude more of the uplink than the compressed form, which comes
+    /// out of what is left for the picture.
+    pub allow_uncompressed: bool,
+    /// Silence the speakers at the desk while a guest is connected.
+    ///
+    /// **On a device that applies its own mute**, the tap is ahead of it: a
+    /// guest still hears everything and it is the person at the machine who
+    /// stops hearing what they are sending. Restored when the last guest
+    /// leaves, and only if this host is what silenced them.
+    ///
+    /// **On a device whose mute the server applies, this does nothing and says
+    /// so.** The mix the mute is applied to is the one the capture reads, so
+    /// obeying would silence every guest; asking is not refused, because the
+    /// device can change under a running host, but the mute is not performed
+    /// while the device is of that kind.
+    pub mute_local: bool,
+    /// Whether a guest's microphone is taken.
+    ///
+    /// **Off by default, and it is the switch a guest waits on**: a peer sends
+    /// no microphone audio until this host says it will take it, so nothing
+    /// arrives while this is clear however the guest has configured itself.
+    ///
+    /// It costs a packet every ten milliseconds on the channel that carries
+    /// control messages, which is why it is a decision rather than something
+    /// switched on by polling for it.
+    pub accept_microphone: bool,
+    pub reserved: [u8; 1],
+    /// Which device to capture, by an identity from the enumeration. **Empty
+    /// means the default output's monitor**, followed as the default changes.
+    pub device: [c_char; LOWLAT_OUTPUT_MAX],
+}
+
+/// How the guests' input reaches the system, on Windows alone (minor 32).
+///
+/// **Every field here is live**, set and read back through its own pair of
+/// calls as sound's are, and none is the video configuration's: the devices a
+/// guest's input lands on are not the stream's, and changing them neither
+/// carries nor resends the stream's settings.
+///
+/// **What it needs**: the host's own input driver, installed by its own script
+/// (docs/07-platforms.md section 10), and a host the driver admits -- the
+/// system account, or an administrator elevated. Nothing of this library
+/// installs it.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_host_input_config {
+    /// Set by the caller to `sizeof(lowlat_host_input_config)`.
+    pub size: u32,
+    /// Whether a guest's keys and pointer go to a keyboard and a mouse of the
+    /// host's own input driver, which the system takes as devices', rather
+    /// than through the system's batch input call. **Default: off**, zero
+    /// included, so a caller that never sets it keeps the batch input call.
+    ///
+    /// Switching it on where the driver is not installed, or does not admit
+    /// this process, is refused and changes nothing; a start asking for it
+    /// there is not refused for it, says why once, and reads back off. Each
+    /// seated guest moves on its next pass, what it holds on the old way
+    /// released first; its input waits the few milliseconds until the system
+    /// takes each device, and goes through the batch input call where one never
+    /// does. A driver lost while it is on gives the guests the batch input call
+    /// until it is switched on again. **The attention chord is never typed on
+    /// it**: a Delete going down while Ctrl and Alt are held goes through the
+    /// batch input call, which raises no secure screen. **A position on any
+    /// display but the primary goes through the batch input call too**: the
+    /// mouse's positions span the primary alone; its buttons, wheels and motion
+    /// stay on the mouse.
+    pub virtual_input: bool,
+    /// Whether a DualShock 4 or a DualSense a guest sends as its own reports is
+    /// presented as that product on the host's own input driver, its touchpad,
+    /// motion, lights and trigger effects with it, rather than played as the
+    /// Xbox pad from its whole states (minor 33). **Default: off**, zero
+    /// included: a pad on the input driver never reaches a game that reads only
+    /// the Xbox pad's interface.
+    ///
+    /// Switching it on where the driver is not installed, or does not admit
+    /// this process, is refused and changes nothing, as `virtual_input` is; a
+    /// start asking for it there is not refused for it, says why once, and
+    /// reads back off. **A change reaches the pads plugged after it**: one
+    /// already plugged keeps what its first report made it. A pad whose device
+    /// never comes, or goes, plays on as the Xbox pad from its own reports. A
+    /// library of an earlier minor ignores this byte and reads it back zero.
+    pub virtual_pads: bool,
+    pub reserved: [u8; 2],
+}
+
+/// Where a report pad's reports go: which side holds the virtual device for
+/// a DualShock 4 or a DualSense a guest sends as its own reports
+/// (`lowlat_client_send_pad_report`; docs/05-host.md section 7.2).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum lowlat_pad_sink {
+    /// This library presents a device of its own, which the kernel's own
+    /// driver claims as the real thing, and what is written to it goes back
+    /// to the guest by itself. **The default.**
+    LOWLAT_PAD_SINK_DEVICE = 0,
+    /// The application holds the device: it takes the reports from
+    /// [`lowlat_host_poll_pad_report`] and gives back the output reports its
+    /// device is written with [`lowlat_host_send_pad_report`]; a feature write
+    /// stays on the host (minor 33). The permission gate, the per-guest cap
+    /// and the unplug rule apply as they do above.
+    LOWLAT_PAD_SINK_APP = 1,
+}
+
+/// How a host is configured.
+///
+/// **There is no resolution here.** The display decides the picture's size, the
+/// encoder follows it, and the application is told what it got rather than
+/// asking for it; `fps` is a cap over whatever the display runs at, not a
+/// target. A host that creates its own display chooses that display's size when
+/// it creates it, which is a different question and not this field's.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_host_config {
+    /// Set by the caller to `sizeof(lowlat_host_config)`.
+    pub size: u32,
+    /// The base a guest's port bind walks from. **Default: 9000.**
+    pub base_port: u16,
+    /// Whether a stream on an NVIDIA GPU holds the GPU's memory clock at a
+    /// floor for as long as it runs (minor 31; Windows alone from minor 32):
+    /// the driver's light-load memory states bound the encoder, 4 to 5 ms a
+    /// picture at 1080p against 1 to 2 above them (docs/05-host.md section
+    /// 4.2). **Default: off**, since it changes the machine and needs the
+    /// administrator; `lowlatd` turns it on. Settled when hosting starts.
+    #[cfg(windows)]
+    pub hold_memory_clock: bool,
+    pub reserved: u8,
+    /// Advertised capacity. Above [`LOWLAT_GUESTS_MAX`] is refused rather than
+    /// quietly reduced. **Default: 4.**
+    pub max_guests: u32,
+    /// One of [`lowlat_codec`]. Settled when hosting starts: one encode serves
+    /// every seat and a session has one video configuration. **Default: H.264**,
+    /// the one every peer decodes.
+    pub codec: u32,
+    /// One of [`lowlat_encoder`]. **Default: follow display.**
+    pub encoder: u32,
+    /// The congestion level's place to minor 36, read by nothing since: it is
+    /// `video.cg_level`, which can move while the host runs.
+    pub reserved3: u32,
+    /// The quality's place to minor 36, read by nothing since: it is
+    /// `video.quality`, which can move while the host runs.
+    pub reserved2: u32,
+    /// How long a guest keeps the pointer after its last movement, when
+    /// `exclusive_pointer` is set. Clamped rather than refused: this is a
+    /// comfort setting and the nearest usable value beats refusing to start.
+    /// **Default: [`::lowlat_host::floor::HOLD_MS`]**, the figure the arbitration was
+    /// tuned to.
+    pub exclusive_hold_ms: u32,
+    /// Whether one guest at a time may drive the pointer. Off means everybody
+    /// drives it, which is a configuration rather than a fault. **Default: off.**
+    pub exclusive_pointer: bool,
+    /// One of [`lowlat_pad_sink`]: who holds the virtual device for a pad a
+    /// guest sends as its own reports. **Default: this library**, a device
+    /// of its own; set to the application, the reports come out of
+    /// [`lowlat_host_poll_pad_report`] instead. Settled when hosting starts.
+    pub pad_sink: u8,
+    /// Whether the host plugs a display of its own when nothing is lit, and
+    /// keeps it for as long as it runs (minor 27; Windows alone from minor
+    /// 32). **Default: off**, since it changes the machine; `output` set to
+    /// `virtual` plugs it either way. Settled when hosting starts.
+    #[cfg(windows)]
+    pub virtual_fallback: bool,
+    /// Whether a stream wakes the display it captures as it starts, with one
+    /// pointer move of no distance (minor 28; Windows alone from minor 32):
+    /// holding a display on does not wake one that slept, which gives no
+    /// pictures until input wakes it. **Default: off**, so a guest's first
+    /// input wakes it and a connection lights nothing at the desk by itself.
+    /// Settled when hosting starts.
+    #[cfg(windows)]
+    pub wake_display: bool,
+    /// How many of `servers` are set. **Default: 0**, so a host consults
+    /// nothing for its own address until an application names a server.
+    pub server_count: u32,
+    /// Reflexive servers, consulted for this host's own mapped address, each
+    /// `host:port`.
+    pub servers: [[c_char; LOWLAT_SERVER_MAX]; LOWLAT_SERVERS_MAX],
+    /// The half of this that can also be set while the host runs.
+    pub video: lowlat_host_video_config,
+    /// Sound, every field of which can also be set while the host runs.
+    pub audio: lowlat_host_audio_config,
+    /// The guests' input, every field of which can also be set while the host
+    /// runs (minor 32; Windows alone).
+    #[cfg(windows)]
+    pub input: lowlat_host_input_config,
+}
+
+/// `sizeof(lowlat_host_config)` as minors 27 to 31 laid it out off Windows,
+/// with the video configuration's own display fields in it: **refused rather
+/// than misread**, as its sound half sits sixteen bytes further on than minor
+/// 32 read it (minor 32), and eight further than this library does: minor 37
+/// made the video half eight bytes longer.
+#[cfg(not(windows))]
+const HOST_CONFIG_MINOR_31: usize = core::mem::size_of::<lowlat_host_config>() + 8;
+
+/// The most guests a host may advertise, which is what the ring memory per
+/// guest is sized against.
+pub const LOWLAT_GUESTS_MAX: u32 = 16;
+
+/// Fill a configuration with what a host would choose for itself.
+///
+/// **Zero is not a configuration.** Every enumerated field here is validated
+/// rather than clamped, so a structure the caller zeroed asks for the first
+/// variant of each -- the most aggressive congestion level among them -- and
+/// names no codec, which is refused; the boundary cannot tell a zero that was
+/// meant from one that was not. Starting from this, and overwriting what the
+/// application actually has an opinion about, is what keeps an unset field
+/// unset rather than accidentally set to zero.
+///
+/// **Filled through the caller's pointer, as every other structure is.** The
+/// caller sets `size`, and one shorter than this configuration is refused
+/// rather than written past; the inner structures' sizes are filled in, so a
+/// caller that starts here does not set them. Each field's own default is on
+/// the field.
+///
+/// @param[out] out One [`lowlat_host_config`] with `size` set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_INVALID_ARGUMENT`] for a null `out`
+/// or a `size` shorter than the configuration.
+///
+/// # Safety
+///
+/// `out` is null or points to one [`lowlat_host_config`] whose `size` is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_default_config(out: *mut lowlat_host_config) -> lowlat_status {
+    guard(LOWLAT_ERR_INTERNAL, || {
+        if out.is_null() {
+            return LOWLAT_ERR_INVALID_ARGUMENT;
+        }
+        // Read through the pointer and written whole, as every structure
+        // filled here is.
+        // SAFETY: the caller's contract.
+        let size = unsafe { core::ptr::addr_of!((*out).size).read_unaligned() };
+        if (size as usize) < core::mem::size_of::<lowlat_host_config>() {
+            return LOWLAT_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: `out` holds a whole configuration, as its size says.
+        unsafe {
+            out.write(lowlat_host_config {
+                size,
+                ..default_config()
+            });
+        }
+        LOWLAT_OK
+    })
+}
+
+/// What a host would choose for itself, as [`lowlat_host_default_config`]
+/// fills it.
+fn default_config() -> lowlat_host_config {
+    lowlat_host_config {
+        size: u32::try_from(core::mem::size_of::<lowlat_host_config>()).unwrap_or(u32::MAX),
+        base_port: 9000,
+        #[cfg(windows)]
+        hold_memory_clock: false,
+        reserved: 0,
+        max_guests: 4,
+        codec: lowlat_codec::LOWLAT_CODEC_H264 as u32,
+        encoder: lowlat_encoder::LOWLAT_ENCODER_FOLLOW_DISPLAY as u32,
+        reserved3: 0,
+        reserved2: 0,
+        // The figure the pointer arbitration was tuned to. Held as a literal
+        // because the field is whole milliseconds and `floor`'s is not; the
+        // test below is what keeps the two the same number.
+        exclusive_hold_ms: 500,
+        exclusive_pointer: false,
+        pad_sink: lowlat_pad_sink::LOWLAT_PAD_SINK_DEVICE as u8,
+        #[cfg(windows)]
+        virtual_fallback: false,
+        #[cfg(windows)]
+        wake_display: false,
+        server_count: 0,
+        servers: [[0; LOWLAT_SERVER_MAX]; LOWLAT_SERVERS_MAX],
+        video: lowlat_host_video_config {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_video_config>())
+                .unwrap_or(u32::MAX),
+            fps: 60,
+            bitrate_mbps: 10.0,
+            min_bitrate_mbps: 1.0,
+            full_fps: false,
+            reserved: [0; 3],
+            output: [0; LOWLAT_OUTPUT_MAX],
+            #[cfg(windows)]
+            virtual_width: 0,
+            #[cfg(windows)]
+            virtual_height: 0,
+            #[cfg(windows)]
+            virtual_hz: 0,
+            quality: lowlat_quality::LOWLAT_QUALITY_LOWEST_LATENCY as u32,
+            cg_level: lowlat_cg_level::LOWLAT_CG_LEVEL_SENSITIVE as u32,
+        },
+        audio: lowlat_host_audio_config {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_audio_config>())
+                .unwrap_or(u32::MAX),
+            bitrate_kbps: lowlat_audio::encode::DEFAULT_BITRATE_KBPS,
+            enabled: true,
+            allow_uncompressed: false,
+            mute_local: false,
+            accept_microphone: false,
+            reserved: [0; 1],
+            device: [0; LOWLAT_OUTPUT_MAX],
+        },
+        #[cfg(windows)]
+        input: lowlat_host_input_config {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_input_config>())
+                .unwrap_or(u32::MAX),
+            virtual_input: false,
+            virtual_pads: false,
+            reserved: [0; 2],
+        },
+    }
+}
+
+/// What a handle is created with.
+///
+/// **The caller sets `size`.** It is read rather than assumed, so this can grow
+/// without breaking an application compiled against an older header
+/// (docs/06-api.md 1).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_host_create_info {
+    pub size: u32,
+}
+
+/// Everything one handle owns, under one lock.
+///
+/// **One lock rather than two.** A second would be a lock ordering, and a lock
+/// ordering is what produces the first deadlock on the day somebody adds a call
+/// that needs both (docs/06-api.md 8).
+#[derive(Debug)]
+struct Held {
+    seam: Option<::lowlat_host::admission::Admission>,
+}
+
+/// What a guest may drive.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_permissions {
+    pub keyboard: bool,
+    pub pointer: bool,
+    pub gamepad: bool,
+    pub reserved: u8,
+}
+
+/// What signaling learned about a peer, handed over to register an attempt.
+///
+/// **Signaling is the application's**, so everything here arrived over a
+/// transport this library does not have and does not want
+/// ([04 §1](../docs/04-signaling.md)).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_attempt_info {
+    /// Set by the caller to `sizeof(lowlat_attempt_info)`.
+    pub size: u32,
+    pub reserved: u32,
+    /// The application's own identifier for this attempt. Everything else in
+    /// the seam is addressed by it.
+    pub attempt_id: [c_char; LOWLAT_ATTEMPT_MAX],
+    pub ufrag: [c_char; LOWLAT_ICE_MAX],
+    pub pwd: [c_char; LOWLAT_ICE_MAX],
+    /// The peer's media key material, as text.
+    ///
+    /// **Empty selects the legacy path**, which is a decision rather than a
+    /// degradation: the offer either carried one or it did not, and which
+    /// crypto a session uses follows from that ([00 §D2](../docs/00-overview.md)).
+    pub aes256: [c_char; LOWLAT_ICE_MAX],
+    /// What signaling says this peer may drive.
+    pub permissions: lowlat_permissions,
+    /// Whether this peer owns the machine: it takes the pointer from another
+    /// guest rather than waiting for it, and it alone presses a pad's Guide.
+    pub owner: bool,
+    pub reserved2: [u8; 3],
+    /// Which pipe the offer asked for, a [`lowlat_transport`] value.
+    ///
+    /// **Appended in minor 2.** An application built against minor 1 sets a
+    /// smaller `size`, and everything from here on then reads as the native
+    /// transport with no digest.
+    pub transport: u32,
+    /// The peer's certificate digest as its offer carried it, with or
+    /// without the hash name. Read on the browser pipe and required there;
+    /// ignored on the native one.
+    pub fingerprint: [c_char; LOWLAT_FINGERPRINT_MAX],
+}
+
+/// The size of [`lowlat_attempt_info`] before the fields minor 2 appended,
+/// which is the smallest `size` a caller may set.
+const ATTEMPT_INFO_MINOR_1: usize = core::mem::offset_of!(lowlat_attempt_info, transport);
+
+/// Every guest at once, where a guest number is taken.
+///
+/// **Zero, because guest numbers start at one.** A message aimed here reaches
+/// everyone seated rather than nobody.
+pub const LOWLAT_GUEST_ALL: u32 = 0;
+
+/// One connected guest.
+///
+/// **No leading `size` field, and it is the one structure that cannot have
+/// one.** The caller passes an array of these and walks it by stride, so a
+/// size written per element says nothing about how far apart they are; the
+/// count is the versioning instead, and this stays fixed for the major
+/// version. Anything learned about a guest later arrives through a call of its
+/// own rather than by growing this.
+///
+/// **Every guest here is connected.** One that is still negotiating has no
+/// number yet and nothing to address, and the state it passes through is what
+/// the guest-state event reports.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_guest {
+    /// What this guest is addressed by, and what it finds itself by in a
+    /// roster the application sends.
+    pub number: u32,
+    pub permissions: lowlat_permissions,
+    /// Whether this guest owns the machine: it takes the pointer from another
+    /// guest rather than waiting for it, and it alone presses a pad's Guide.
+    pub owner: bool,
+    pub reserved: [u8; 3],
+    /// The identifier this attempt was registered under.
+    ///
+    /// **The link between the seam's two halves.** Everything before a guest is
+    /// seated is addressed by attempt and everything after is addressed by
+    /// number; without this, an application holding one peer per attempt cannot
+    /// tell which peer an event about guest three concerns.
+    pub attempt: [c_char; LOWLAT_ATTEMPT_MAX],
+}
+
+/// One host session, as the application holds it.
+///
+/// Opaque: the application holds a pointer it cannot look inside, so what is
+/// in here changes freely.
+#[derive(Debug)]
+pub struct lowlat_host {
+    /// Set when a call was contained, and never cleared.
+    poisoned: AtomicBool,
+    held: std::sync::Mutex<Held>,
+    /// **The queue exists from the moment the handle does**, and outlives any
+    /// one host on it. An application starts its polling thread before it
+    /// starts hosting, so a poll has something real to wait on from the first
+    /// call; and events a host raised on the way down are still there to be
+    /// taken after it has stopped.
+    ///
+    /// Held outside the lock because a poll waits for as long as its caller
+    /// asked and every other call must stay answerable while it does.
+    events: ::lowlat_host::events::Receiver,
+    /// The other end, handed to each host as it starts.
+    raise: ::lowlat_host::events::Sender,
+    /// **A queue of its own, for the reason the events one is separate from
+    /// everything else**: a hundred packets a second of sound sharing a bounded
+    /// queue with control events would evict the events
+    /// ([06 §13](../docs/06-api.md)).
+    heard: ::lowlat_host::microphone::Receiver,
+    /// The other end, handed to each host as it starts.
+    hear: ::lowlat_host::microphone::Sender,
+    /// The report pads' queue, for the same reason: a pad reports several
+    /// hundred times a second.
+    reports: ::lowlat_host::padsink::Receiver,
+    /// The other end, handed to a host that starts with the application as
+    /// the sink.
+    report: ::lowlat_host::padsink::Sender,
+    /// Held for the handle's life and declared last, so it is released only
+    /// after every thread the handle ran has been joined.
+    _timer: lowlat_common::clock::TimerResolution,
+}
+
+impl lowlat_host {
+    /// **A poisoned lock is not a second failure to report.** The handle is
+    /// already refusing every call once a panic has been contained, and that
+    /// is the state this would be describing.
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(|held| held.into_inner())
+    }
+}
+
+/// Create a handle.
+///
+/// @param[in] info One [`lowlat_host_create_info`] whose `size` says how much of it is set.
+/// May be null, which takes every default.
+/// @param[out] out Receives the handle.
+/// @returns [`LOWLAT_OK`], or an error and `out` left untouched.
+///
+/// # Safety
+///
+/// `out` must point to storage for one pointer. `info` may be null, which
+/// takes every default.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_create(
+    info: *const lowlat_host_create_info,
+    out: *mut *mut lowlat_host,
+) -> lowlat_status {
+    guard(LOWLAT_ERR_INTERNAL, || {
+        if out.is_null() {
+            return LOWLAT_ERR_INVALID_ARGUMENT;
+        }
+        // Read only as much as the caller says it wrote. There is nothing
+        // beyond the length yet; the check is here because the first version
+        // is where the habit is either established or lost.
+        if let Some(info) = (unsafe { info.as_ref() })
+            && (info.size as usize) < core::mem::size_of::<u32>()
+        {
+            return LOWLAT_ERR_INVALID_ARGUMENT;
+        }
+        let (raise, events) = ::lowlat_host::events::queue();
+        let (hear, heard) = ::lowlat_host::microphone::queue();
+        let (report, reports) = ::lowlat_host::padsink::queue();
+        let handle = Box::new(lowlat_host {
+            poisoned: AtomicBool::new(false),
+            held: std::sync::Mutex::new(Held { seam: None }),
+            events,
+            raise,
+            heard,
+            hear,
+            reports,
+            report,
+            _timer: lowlat_common::clock::TimerResolution::raise(),
+        });
+        unsafe { out.write(Box::into_raw(handle)) };
+        LOWLAT_OK
+    })
+}
+
+/// Destroy a handle.
+///
+/// **Works on a poisoned handle**, which is the point of poisoning: everything
+/// else is refused and this still releases what was taken.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`], not used again. Null is accepted
+/// and does nothing.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`] and is not used again. A null pointer is
+/// accepted and does nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_destroy(hl: *mut lowlat_host) {
+    guard((), || {
+        if hl.is_null() {
+            return;
+        }
+        drop(unsafe { Box::from_raw(hl) });
+    });
+}
+
+/// Turn what the application wrote into what the seam takes.
+///
+/// **Every enumerated field is validated rather than transmuted.** The
+/// application filled this structure, so each of these is whatever it wrote,
+/// and a value nothing defined is refused here instead of becoming a variant
+/// that does not exist.
+fn configured(cfg: &lowlat_host_config) -> Option<::lowlat_host::admission::Config> {
+    // The microphone queue is the handle's, so the caller fills it in: this
+    // builds what the configuration alone can say.
+    let codec = match cfg.codec {
+        code if code == lowlat_codec::LOWLAT_CODEC_H264 as u32 => {
+            ::lowlat_host::stream::Codec::H264
+        }
+        code if code == lowlat_codec::LOWLAT_CODEC_HEVC as u32 => {
+            ::lowlat_host::stream::Codec::H265
+        }
+        _ => return None,
+    };
+    let backend = match cfg.encoder {
+        code if code == lowlat_encoder::LOWLAT_ENCODER_FOLLOW_DISPLAY as u32 => None,
+        code if code == lowlat_encoder::LOWLAT_ENCODER_OPEN as u32 => {
+            Some(::lowlat_host::stream::Backend::Open)
+        }
+        code if code == lowlat_encoder::LOWLAT_ENCODER_VENDOR as u32 => {
+            Some(::lowlat_host::stream::Backend::Vendor)
+        }
+        _ => return None,
+    };
+    if cfg.max_guests == 0 || cfg.max_guests > LOWLAT_GUESTS_MAX {
+        return None;
+    }
+    if cfg.server_count as usize > LOWLAT_SERVERS_MAX {
+        return None;
+    }
+    let mut servers = Vec::new();
+    let mut dropped = 0usize;
+    for server in cfg.servers.iter().take(cfg.server_count as usize) {
+        // Resolved here rather than at the first check, so a name that does not
+        // resolve is refused while the caller is still holding the call that
+        // set it.
+        let text = taken(server)?;
+        let found = ::lowlat_host::admission::resolve_server(text);
+        // A name that resolves to nothing is refused here, while the caller is
+        // still holding the call that set it.
+        if found.is_empty() {
+            return None;
+        }
+        for addr in found {
+            if servers.len() < LOWLAT_SERVERS_MAX {
+                servers.push(addr);
+            } else {
+                dropped += 1;
+            }
+        }
+    }
+    // **Said out loud.** Two families per name can exceed what the engine
+    // holds, and a cap nobody reports reads as though every server configured
+    // is being asked.
+    if dropped > 0 {
+        lowlat_common::log_warn!(
+            "host: reflexive servers capped, kept={} dropped={dropped}",
+            servers.len()
+        );
+    }
+    if u32::from(cfg.pad_sink) > lowlat_pad_sink::LOWLAT_PAD_SINK_APP as u32 {
+        return None;
+    }
+    let (video, own_display) = video_configured(&cfg.video)?;
+    // The level every guest starts at, and the stream's first live one.
+    let cg_level = video.cg_level;
+    let output = output_named(&cfg.video.output)?;
+    let (sound_on, allow_raw, audio_kbps, audio_live) = audio_configured(&cfg.audio)?;
+    #[cfg(windows)]
+    input_configured(&cfg.input)?;
+    // The fields only Windows acts on, which exist nowhere else.
+    #[cfg(windows)]
+    let (virtual_fallback, wake_display, hold_memory_clock) = (
+        cfg.virtual_fallback,
+        cfg.wake_display,
+        cfg.hold_memory_clock,
+    );
+    #[cfg(not(windows))]
+    let (virtual_fallback, wake_display, hold_memory_clock) = (false, false, false);
+
+    Some(::lowlat_host::admission::Config {
+        microphone: None,
+        pad_sink: None,
+        base_port: cfg.base_port,
+        // Not on the boundary yet: no application has asked to offer shared
+        // address space, and a field nobody sets is a field nobody tests.
+        shared_address_space: false,
+        max_guests: cfg.max_guests as usize,
+        servers,
+        exclusive_pointer: cfg.exclusive_pointer,
+        exclusive_hold_ms: f64::from(cfg.exclusive_hold_ms),
+        cg_level,
+        // A live-run aid, and nothing an application should be able to ask for.
+        rumble_probe: false,
+        stream: Some(::lowlat_host::stream::Config {
+            // **Settled by what the guests declare, never configured.** One
+            // encode serves every seat, so a depth chosen here would be chosen
+            // for guests whose decoders an application cannot see.
+            ten_bit: false,
+            chroma_444: false,
+            // **Not exposed at the boundary.** An application has no way to
+            // know which interface a machine should use, so the stream
+            // follows the device; naming one is the daemon's measurement
+            // knob.
+            convert: None,
+            // The knob is the environment's (LOWLAT_VULKAN_ENCODE=1), which
+            // the stream reads itself; the boundary names meanings, not
+            // mechanisms.
+            prefer_vulkan: false,
+            audio_kbps,
+            allow_raw_audio: allow_raw,
+            // **The source is always described and the switch is separate.**
+            // Sound has no settled half at this boundary, so a host started
+            // with it off must be able to turn it on: a source decided once
+            // from the starting value would make `enabled` the one field of
+            // this structure that is not live.
+            audio_on: sound_on,
+            accept_microphone: cfg.audio.accept_microphone,
+            audio: Some(lowlat_audio::Config {
+                server: None,
+                wanted: std::sync::Arc::new(lowlat_audio::Wanted::new(audio_live)),
+            }),
+            codec,
+            backend,
+            cg_level,
+            // **The generated picture's size, which is not a product
+            // feature.** A host started through this boundary captures a
+            // display and follows whatever size it is; these exist for running
+            // the layers above capture without a screen.
+            width: 0,
+            height: 0,
+            detail_rows: 0,
+            display: true,
+            fps: video.fps,
+            configured_mbps: video.bitrate_mbps,
+            min_mbps: video.min_mbps,
+            full_fps: video.full_fps,
+            quality: video.quality,
+            output: (!output.is_empty()).then(|| output.to_string()),
+            virtual_fallback,
+            wake_display,
+            hold_memory_clock,
+            own_display,
+        }),
+    })
+}
+
+/// Check the guests' input half: whole, as its caller's `size` says. Which
+/// devices it asks for is answered by the host, which alone can ask the
+/// driver.
+#[cfg(windows)]
+fn input_configured(cfg: &lowlat_host_input_config) -> Option<(bool, bool)> {
+    if (cfg.size as usize) < core::mem::size_of::<lowlat_host_input_config>() {
+        return None;
+    }
+    Some((cfg.virtual_input, cfg.virtual_pads))
+}
+
+/// The input driver's refusal, as an application reads it.
+#[cfg(windows)]
+fn input_refused(error: lowlat_inject::hid::Error) -> lowlat_status {
+    use lowlat_inject::hid::Error;
+    match error {
+        Error::Absent => LOWLAT_ERR_INPUT_DRIVER_ABSENT,
+        Error::Denied => LOWLAT_ERR_INPUT_DRIVER_DENIED,
+        Error::Version(_) => LOWLAT_ERR_INPUT_DRIVER_VERSION,
+        Error::Refused(_) => LOWLAT_ERR_INPUT_DRIVER_IO,
+    }
+}
+
+/// The output a configuration names, read for its terminator. **`virtual` is
+/// refused where there is no display of the host's own**, at the call, since
+/// a stream asked for an output that never lights waits for ever rather than
+/// failing.
+fn output_named(field: &[c_char; LOWLAT_OUTPUT_MAX]) -> Option<&str> {
+    let output = taken(field)?;
+    if cfg!(not(windows)) && output.eq_ignore_ascii_case(::lowlat_host::display::VIRTUAL) {
+        return None;
+    }
+    Some(output)
+}
+
+/// Check the half that can also be set while a host runs.
+fn video_configured(
+    cfg: &lowlat_host_video_config,
+) -> Option<(
+    ::lowlat_host::stream::LiveVideo,
+    ::lowlat_host::stream::OwnDisplay,
+)> {
+    if (cfg.size as usize) < core::mem::size_of::<lowlat_host_video_config>() {
+        return None;
+    }
+    #[cfg(windows)]
+    let own_display = ::lowlat_host::stream::OwnDisplay {
+        width: cfg.virtual_width,
+        height: cfg.virtual_height,
+        refresh_hz: cfg.virtual_hz,
+    };
+    #[cfg(not(windows))]
+    let own_display = ::lowlat_host::stream::OwnDisplay::default();
+    // **Both or neither, and within what a monitor of the display may be**:
+    // refused rather than clamped, so an application is never told yes and
+    // given another size.
+    let sized = match (own_display.width, own_display.height) {
+        (0, 0) => true,
+        (width, height) => (640..=7680).contains(&width) && (480..=4320).contains(&height),
+    };
+    if !sized || !(own_display.refresh_hz == 0 || (24..=480).contains(&own_display.refresh_hz)) {
+        return None;
+    }
+    if cfg.fps == 0 {
+        return None;
+    }
+    if !(cfg.bitrate_mbps.is_finite() && cfg.bitrate_mbps > 0.0)
+        || !(cfg.min_bitrate_mbps.is_finite() && cfg.min_bitrate_mbps > 0.0)
+        || cfg.min_bitrate_mbps > cfg.bitrate_mbps
+    {
+        return None;
+    }
+    // Read for its terminator even where the value is not wanted here: a field
+    // that was overrun is refused rather than half-read.
+    taken(&cfg.output)?;
+    // **An unknown value is refused rather than rounded to something.** A
+    // setting nobody here recognises is a request this library cannot honour,
+    // and quietly serving the nearest one is how an application ends up
+    // believing it got what it asked for.
+    let quality = match cfg.quality {
+        code if code == lowlat_quality::LOWLAT_QUALITY_LOWEST_LATENCY as u32 => {
+            lowlat_encode::Quality::LowestLatency
+        }
+        code if code == lowlat_quality::LOWLAT_QUALITY_BALANCED as u32 => {
+            lowlat_encode::Quality::Balanced
+        }
+        code if code == lowlat_quality::LOWLAT_QUALITY_HIGHEST as u32 => {
+            lowlat_encode::Quality::Highest
+        }
+        _ => return None,
+    };
+    let cg_level = match cfg.cg_level {
+        code if code == lowlat_cg_level::LOWLAT_CG_LEVEL_AGGRESSIVE as u32 => 0,
+        code if code == lowlat_cg_level::LOWLAT_CG_LEVEL_SENSITIVE as u32 => 1,
+        code if code == lowlat_cg_level::LOWLAT_CG_LEVEL_RELAXED as u32 => 2,
+        code if code == lowlat_cg_level::LOWLAT_CG_LEVEL_ADAPTIVE as u32 => {
+            lowlat_core::congestion::ADAPTIVE
+        }
+        _ => return None,
+    };
+    Some((
+        ::lowlat_host::stream::LiveVideo {
+            fps: cfg.fps,
+            bitrate_mbps: cfg.bitrate_mbps,
+            min_mbps: cfg.min_bitrate_mbps,
+            full_fps: cfg.full_fps,
+            quality,
+            cg_level,
+        },
+        own_display,
+    ))
+}
+
+/// Turn what an application wrote about sound into what the host takes.
+fn audio_configured(
+    cfg: &lowlat_host_audio_config,
+) -> Option<(bool, bool, u32, lowlat_audio::Live)> {
+    // The microphone is read by the caller straight off the structure: it is
+    // the one field here that does not describe what this host sends.
+    if (cfg.size as usize) < core::mem::size_of::<lowlat_host_audio_config>() {
+        return None;
+    }
+    if cfg.bitrate_kbps == 0 || cfg.bitrate_kbps > LOWLAT_AUDIO_KBPS_MAX {
+        return None;
+    }
+    let device = taken(&cfg.device)?;
+    Some((
+        cfg.enabled,
+        cfg.allow_uncompressed,
+        cfg.bitrate_kbps,
+        lowlat_audio::Live {
+            device: (!device.is_empty()).then(|| device.to_owned()),
+            mute_local: cfg.mute_local,
+        },
+    ))
+}
+
+/// The most this host will encode sound at.
+///
+/// **A ceiling rather than a range**, because the codec silently clamps its own
+/// and an application that asked for ten megabits would be told yes and given
+/// something else. Well above any rate stereo desktop sound is worth.
+pub const LOWLAT_AUDIO_KBPS_MAX: u32 = 512;
+
+/// Start hosting.
+///
+/// Guests are admitted through the signaling seam, which is the application's
+/// own; this starts what serves them once they arrive.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] cfg One [`lowlat_host_config`] whose `size` says how much of it is set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_ALREADY_STARTED`] when this handle is
+/// already hosting.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `cfg` points to one
+/// [`lowlat_host_config`] whose `size` says how much of it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_start(
+    hl: *mut lowlat_host,
+    cfg: *const lowlat_host_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            // **Null means the defaults**, which is the one reading of a null
+            // configuration that cannot be a mistake. An application with no
+            // opinion should not have to build a structure to say so, and
+            // building one by zeroing it asks for something else entirely.
+            let defaults = default_config();
+            let cfg = match cfg.as_ref() {
+                Some(cfg) => cfg,
+                None => &defaults,
+            };
+            if (cfg.size as usize) < core::mem::size_of::<lowlat_host_config>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            #[cfg(not(windows))]
+            if cfg.size as usize == HOST_CONFIG_MINOR_31 {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let mut held = handle.held();
+            if held.seam.is_some() {
+                return LOWLAT_ERR_ALREADY_STARTED;
+            }
+            let Some(mut config) = configured(cfg) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            config.microphone = Some(handle.hear.clone());
+            if u32::from(cfg.pad_sink) == lowlat_pad_sink::LOWLAT_PAD_SINK_APP as u32 {
+                config.pad_sink = Some(handle.report.clone());
+            }
+            // **Raising into the handle's queue rather than its own**, so a
+            // host starting and stopping does not take the queue with it.
+            let seam = held
+                .seam
+                .insert(::lowlat_host::admission::Admission::raising(
+                    config,
+                    handle.raise.clone(),
+                    None,
+                ));
+            // **Not refused for the input driver**, as sound is not for its
+            // server: a host without one still serves its guests through the
+            // batch input call. Said once, and read back off.
+            #[cfg(windows)]
+            if cfg.input.virtual_input
+                && let Err(error) = seam.set_virtual_input(true)
+            {
+                lowlat_common::log_warn!(
+                    "abi: the guests' keys on the input driver refused at start, keys go through the batch input call, error={error}"
+                );
+            }
+            #[cfg(windows)]
+            if cfg.input.virtual_pads
+                && let Err(error) = seam.set_virtual_pads(true)
+            {
+                lowlat_common::log_warn!(
+                    "abi: the guests' pads on the input driver refused at start, they play as the Xbox pad, error={error}"
+                );
+            }
+            #[cfg(not(windows))]
+            let _ = seam;
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Map a seam error onto the status an application reads.
+///
+/// Exhaustive on purpose: a new way for admission to refuse should break this
+/// build rather than reach an application as a generic failure.
+fn refused(error: ::lowlat_host::admission::Error) -> lowlat_status {
+    use ::lowlat_host::admission::Error;
+    match error {
+        Error::UnknownAttempt => LOWLAT_ERR_UNKNOWN_ATTEMPT,
+        Error::AtCapacity => LOWLAT_ERR_AT_CAPACITY,
+        Error::AlreadyBegun => LOWLAT_ERR_ALREADY_BEGUN,
+        Error::Withdrawn => LOWLAT_ERR_WITHDRAWN,
+        Error::Io => LOWLAT_ERR_IO,
+        Error::Crypto => LOWLAT_ERR_CRYPTO,
+        Error::Fingerprint => LOWLAT_ERR_FINGERPRINT,
+    }
+}
+
+/// Register an attempt from an offer signaling delivered.
+///
+/// **Registering is not approving.** This takes a seat's worth of bookkeeping
+/// and nothing else; no socket is opened and no thread is started until
+/// [`lowlat_host_begin_p2p`]. An application that decides to decline simply
+/// never calls that, and says so over its own signaling.
+///
+/// [`LOWLAT_ERR_AT_CAPACITY`] means the offer should be declined rather than
+/// left unanswered: nothing in the protocol reports a host that never replied,
+/// so a peer given silence sits connecting until its own deadline.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] info One [`lowlat_attempt_info`] whose `size` says how much of it is set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_AT_CAPACITY`] when the room is full -- which
+/// the application should decline over its own signaling rather than leave unanswered.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `info` points to one
+/// [`lowlat_attempt_info`] whose `size` says how much of it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_new_attempt(
+    hl: *mut lowlat_host,
+    info: *const lowlat_attempt_info,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if info.is_null() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            // **Field by field, never through a reference to the whole.** The
+            // caller's `size` says how much of the structure exists; an
+            // application built against an earlier minor allocated less, and
+            // a reference to the full structure would reach past it.
+            let size = core::ptr::addr_of!((*info).size).read_unaligned() as usize;
+            if size < ATTEMPT_INFO_MINOR_1 {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let attempt_id = core::ptr::addr_of!((*info).attempt_id).read_unaligned();
+            let ufrag_field = core::ptr::addr_of!((*info).ufrag).read_unaligned();
+            let pwd_field = core::ptr::addr_of!((*info).pwd).read_unaligned();
+            let aes256_field = core::ptr::addr_of!((*info).aes256).read_unaligned();
+            let permissions = core::ptr::addr_of!((*info).permissions).read_unaligned();
+            let owner = core::ptr::addr_of!((*info).owner).read_unaligned();
+            let (Some(attempt), Some(ufrag), Some(pwd), Some(aes256)) = (
+                taken(&attempt_id),
+                taken(&ufrag_field),
+                taken(&pwd_field),
+                taken(&aes256_field),
+            ) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            // An attempt with no identifier cannot be addressed again, so every
+            // later call about it would find nothing.
+            if attempt.is_empty() || ufrag.is_empty() || pwd.is_empty() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            // The fields minor 2 appended are read only when the caller's
+            // size says they are there; a smaller structure is a native
+            // attempt with no digest, which is what every earlier caller
+            // meant.
+            let (transport, fingerprint) = if size >= core::mem::size_of::<lowlat_attempt_info>() {
+                let transport = core::ptr::addr_of!((*info).transport).read_unaligned();
+                let fingerprint = core::ptr::addr_of!((*info).fingerprint).read_unaligned();
+                let transport = match transport {
+                    x if x == lowlat_transport::LOWLAT_TRANSPORT_BUD as u32 => {
+                        ::lowlat_host::admission::Transport::Bud
+                    }
+                    x if x == lowlat_transport::LOWLAT_TRANSPORT_WEB as u32 => {
+                        ::lowlat_host::admission::Transport::Web
+                    }
+                    _ => return LOWLAT_ERR_INVALID_ARGUMENT,
+                };
+                let Some(fingerprint) = taken(&fingerprint) else {
+                    return LOWLAT_ERR_INVALID_ARGUMENT;
+                };
+                (
+                    transport,
+                    (!fingerprint.is_empty()).then(|| fingerprint.to_string()),
+                )
+            } else {
+                (::lowlat_host::admission::Transport::Bud, None)
+            };
+            let peer = ::lowlat_host::admission::Peer {
+                ufrag: ufrag.to_string(),
+                pwd: pwd.to_string(),
+                aes256: (!aes256.is_empty()).then(|| aes256.to_string()),
+                permissions: lowlat_inject::event::Permissions {
+                    keyboard: permissions.keyboard,
+                    pointer: permissions.pointer,
+                    gamepad: permissions.gamepad,
+                },
+                owner,
+                transport,
+                fingerprint,
+            };
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            match seam.new_attempt(attempt, peer) {
+                Ok(()) => LOWLAT_OK,
+                Err(error) => refused(error),
+            }
+        })
+    }
+}
+
+/// Offer one address the peer might be reachable at.
+///
+/// **An unknown attempt is accepted silently.** Candidates trickle and a
+/// withdrawal can overtake them, so this is a race with teardown rather than a
+/// fault, and a status the caller would have to ignore is worse than no status.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] attempt_id The attempt this address belongs to, NUL-terminated. One
+/// nothing registered is accepted silently.
+/// @param[in] cand One [`lowlat_candidate`].
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], `attempt_id` is a NUL-terminated
+/// string, and `cand` points to one [`lowlat_candidate`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_add_candidate(
+    hl: *mut lowlat_host,
+    attempt_id: *const c_char,
+    cand: *const lowlat_candidate,
+) {
+    unsafe {
+        entered(hl, |handle| {
+            let (Some(attempt), Some(cand)) = (read_c_str(attempt_id), cand.as_ref()) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            if (cand.size as usize) < core::mem::size_of::<lowlat_candidate>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let Some(address) = taken(&cand.address) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            // **A readiness marker carries no usable address**, so one is not
+            // required of it; every other candidate is refused without one
+            // rather than checked against nothing.
+            let addr = match address.parse::<std::net::IpAddr>() {
+                Ok(ip) => std::net::SocketAddr::new(ip, cand.port),
+                Err(_) if cand.sync => std::net::SocketAddr::from(([0, 0, 0, 0], cand.port)),
+                Err(_) => return LOWLAT_ERR_INVALID_ARGUMENT,
+            };
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            let kind = lowlat_core::conn::Kind::marked(cand.lan, cand.reflexive);
+            seam.add_candidate(attempt, addr, cand.sync, kind);
+            LOWLAT_OK
+        });
+    }
+}
+
+/// Approve an attempt and answer it with this host's own credentials.
+///
+/// This is where a socket is opened and this guest's threads are started, so
+/// it is the one call in the seam that costs more than bookkeeping. It sends
+/// nothing: the answer travels over the application's signaling, because this
+/// library has no transport for it.
+///
+/// `port` is where the bind **starts**, not where it must land. It walks when
+/// the port is taken and the port it reached comes back in `out`, so the two
+/// are an in and an out pair rather than one value asked and assumed. **Zero
+/// asks for the configured base port**, which is what a caller with no opinion
+/// passes; a caller with an opinion has one for a reason -- a mapping on the
+/// gateway, a rule on the firewall, a pool it allocates from -- and none of
+/// those survive this library choosing for it.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] attempt_id The attempt to approve, NUL-terminated.
+/// @param[in] port Where the bind starts, not where it must land. Zero asks for the
+/// configured base port.
+/// @param[out] out Receives this host's credentials and the port the bind reached, in
+/// one [`lowlat_credentials`] whose `size` says how much of it is set.
+/// @returns [`LOWLAT_OK`], and the application sends `out` to the peer over its own
+/// signaling.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], `attempt_id` is a NUL-terminated
+/// string, and `out` points to one [`lowlat_credentials`] whose `size` says how much of
+/// it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_begin_p2p(
+    hl: *mut lowlat_host,
+    attempt_id: *const c_char,
+    port: u16,
+    out: *mut lowlat_credentials,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let (Some(attempt), Some(slot)) = (read_c_str(attempt_id), out.as_mut()) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            if (slot.size as usize) < core::mem::size_of::<lowlat_credentials>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            let ours = match seam.begin_p2p(attempt, port) {
+                Ok(ours) => ours,
+                Err(error) => return refused(error),
+            };
+            slot.port = ours.port;
+            slot.reserved = 0;
+            put(&mut slot.ufrag, &ours.ufrag);
+            put(&mut slot.pwd, &ours.pwd);
+            put(&mut slot.fingerprint, &ours.fingerprint);
+            put(&mut slot.aes256, &ours.aes256);
+            LOWLAT_OK
+        })
+    }
+}
+
+/// End an attempt, whether or not it was ever approved.
+///
+/// **An unknown identifier is accepted silently**, and remembered: a
+/// withdrawal can arrive before the offer it withdraws, and admitting that
+/// offer afterwards spends a socket and a thread on a guest that has already
+/// gone.
+///
+/// **The peer is not told why.** Ending stops this guest's loop; the far side
+/// learns from its own liveness deadline rather than from a message, for the
+/// same reason [`lowlat_host_stop`] does.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] attempt_id The attempt to end, NUL-terminated. One nothing registered is
+/// accepted silently and remembered.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`] and `attempt_id` is a NUL-terminated
+/// string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_end_connection(
+    hl: *mut lowlat_host,
+    attempt_id: *const c_char,
+) {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(attempt) = read_c_str(attempt_id) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            seam.end_connection(attempt);
+            LOWLAT_OK
+        });
+    }
+}
+
+/// List the guests that are connected.
+///
+/// **Two calls, and the caller owns the buffer.** Pass `NULL` for `out` to
+/// learn how many there are, then an array of that many. Nothing here is
+/// allocated on the application's behalf, so there is nothing to free.
+///
+/// `count` carries the array's capacity in and the number written out. A
+/// buffer smaller than the roster is filled as far as it goes and answered
+/// with [`LOWLAT_ERR_TOO_SMALL`], `count` set to what it would have taken --
+/// the roster moves, and a caller that sized its array a moment ago must not
+/// be made to lose the call.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[out] out An array of at least `*count` entries, or `NULL` to ask only how
+/// many there are.
+/// @param[in,out] count The array's capacity in, the number written out.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_TOO_SMALL`] with `count` set to what the
+/// roster would have taken.
+///
+/// # Safety
+///
+/// `count` must be readable and writable, and `out`, when not null, must
+/// point to at least `*count` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_get_guests(
+    hl: *mut lowlat_host,
+    out: *mut lowlat_guest,
+    count: *mut u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if count.is_null() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            let guests = seam.guests();
+            let found = u32::try_from(guests.len()).unwrap_or(u32::MAX);
+            if out.is_null() {
+                count.write(found);
+                return LOWLAT_OK;
+            }
+            let room = count.read() as usize;
+            let writing = guests.len().min(room);
+            for (at, guest) in guests.iter().take(writing).enumerate() {
+                let mut slot = lowlat_guest {
+                    number: guest.number,
+                    permissions: lowlat_permissions {
+                        keyboard: guest.permissions.keyboard,
+                        pointer: guest.permissions.pointer,
+                        gamepad: guest.permissions.gamepad,
+                        reserved: 0,
+                    },
+                    owner: guest.owner,
+                    reserved: [0; 3],
+                    attempt: [0; LOWLAT_ATTEMPT_MAX],
+                };
+                put(&mut slot.attempt, &guest.attempt);
+                out.add(at).write(slot);
+            }
+            if writing < guests.len() {
+                count.write(found);
+                return LOWLAT_ERR_TOO_SMALL;
+            }
+            count.write(u32::try_from(writing).unwrap_or(u32::MAX));
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Send one guest an application message, or every guest at once.
+///
+/// **Nothing here reads the body.** The sub-identifier and the bytes are an
+/// agreement between an application and the clients it serves; a host that
+/// interpreted either would be inventing a protocol on its behalf
+/// ([05 §5](../docs/05-host.md)).
+///
+/// `guest_id` of [`LOWLAT_GUEST_ALL`] reaches everyone seated. A body past
+/// what a peer will accept is refused here rather than sent and dropped in
+/// silence at the far end.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] guest_id Which guest, or [`LOWLAT_GUEST_ALL`] for everyone seated.
+/// @param[in] id The sub-identifier, which means whatever the application and its
+/// clients agreed it means.
+/// @param[in] data The body, copied before this returns and never retained.
+/// @param[in] len How long the body is. A body past what a peer will accept is refused
+/// here.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_UNKNOWN_GUEST`].
+///
+/// # Safety
+///
+/// `data` must point to at least `len` bytes when `len` is not zero. It is
+/// copied before the call returns and never retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_send_user_data(
+    hl: *mut lowlat_host,
+    guest_id: u32,
+    id: u32,
+    data: *const c_void,
+    len: u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if data.is_null() && len != 0 {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let body: &[u8] = if len == 0 {
+                &[]
+            } else {
+                core::slice::from_raw_parts(data.cast::<u8>(), len as usize)
+            };
+            // Refused here, where the caller can still do something about it,
+            // rather than at a far end that says nothing.
+            if lowlat_core::control::string_body_len(body.len())
+                > lowlat_core::control::USER_DATA_MAX
+            {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            if guest_id == LOWLAT_GUEST_ALL {
+                seam.send_user_data_all(id, body);
+                // **Reaching nobody is not a failure.** An application
+                // announcing something to an empty room has not made a
+                // mistake, and reporting one would make it look like it had.
+                return LOWLAT_OK;
+            }
+            if seam.send_user_data(guest_id, id, body) {
+                LOWLAT_OK
+            } else {
+                LOWLAT_ERR_UNKNOWN_GUEST
+            }
+        })
+    }
+}
+
+/// End one guest, telling it why.
+///
+/// **`reason` is not a [`lowlat_status`].** It reaches the peer as the
+/// protocol's own disconnect status, which is a different numbering that
+/// happens to share a width. **Zero is not a value to pass**: a peer carries on
+/// through it, so a guest kicked with zero is told nothing and stays.
+///
+/// The guest is sent the reason, given a moment for it to arrive, and then its
+/// seat goes back. It does not disappear from the roster the instant this
+/// returns.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] guest_id Which guest to end.
+/// @param[in] reason What the peer is told, in the protocol's own disconnect numbering
+/// rather than this API's. Zero tells it nothing and leaves it seated.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_UNKNOWN_GUEST`].
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_kick_guest(
+    hl: *mut lowlat_host,
+    guest_id: u32,
+    reason: i32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if reason == 0 {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            if seam.kick_guest(guest_id, reason) {
+                LOWLAT_OK
+            } else {
+                LOWLAT_ERR_UNKNOWN_GUEST
+            }
+        })
+    }
+}
+
+/// Change what one guest may drive, while it is connected.
+///
+/// **This is the only way to set them.** There is no separate call to turn a
+/// guest's input off, because that is this call with every flag cleared, and
+/// two calls writing one field can disagree about what a guest is allowed to
+/// do.
+///
+/// The change reaches the roster immediately and the guest's own devices on its
+/// next pass.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] guest_id Which guest.
+/// @param[in] perms One [`lowlat_permissions`]. Every flag clear is how a guest's input
+/// is turned off.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_UNKNOWN_GUEST`].
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `perms` points to one
+/// [`lowlat_permissions`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_set_permissions(
+    hl: *mut lowlat_host,
+    guest_id: u32,
+    perms: *const lowlat_permissions,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(perms) = perms.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let permissions = lowlat_inject::event::Permissions {
+                keyboard: perms.keyboard,
+                pointer: perms.pointer,
+                gamepad: perms.gamepad,
+            };
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            if seam.set_permissions(guest_id, permissions) {
+                LOWLAT_OK
+            } else {
+                LOWLAT_ERR_UNKNOWN_GUEST
+            }
+        })
+    }
+}
+
+/// One output this host could be asked to capture.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_output {
+    /// What to ask for, and what a capture-changed event reports. **Stable
+    /// across a mode change**, which is why it is not the size.
+    pub id: [c_char; LOWLAT_OUTPUT_MAX],
+    /// The connector's own name, which is what the session knows it by and
+    /// what a person recognises.
+    pub name: [c_char; LOWLAT_OUTPUT_MAX],
+    pub width: u32,
+    pub height: u32,
+    /// Where it sits in the desktop around it, which is the space absolute
+    /// input is expressed against. Zero when no session said, which is also
+    /// the corner: with one output the two are the same answer.
+    pub x: u32,
+    pub y: u32,
+}
+
+/// One sound output a host could capture.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct lowlat_audio_output {
+    /// What to put in [`lowlat_host_audio_config::device`].
+    ///
+    /// **The monitor of the output, not the output**, because that is the
+    /// device a host reads: it carries what the speakers are playing.
+    pub id: [c_char; LOWLAT_OUTPUT_MAX],
+    /// What a person calls it, which is the name to show them.
+    pub name: [c_char; LOWLAT_OUTPUT_MAX],
+}
+
+/// List the sound outputs this host could capture.
+///
+/// **Available before hosting starts**, and it does not disturb a host that is
+/// running: it asks over a connection of its own. Two calls and the caller's
+/// own buffer, like the video one.
+///
+/// A machine with no sound server answers with none rather than failing, which
+/// is the same thing an application does with it: offer what there is.
+///
+/// @param[out] out An array of at least `*count` entries, or `NULL` to ask only how
+/// many there are.
+/// @param[in,out] count The array's capacity in, the number written out.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_TOO_SMALL`] with `count` set to what it
+/// would have taken.
+///
+/// # Safety
+///
+/// `count` must be readable and writable, and `out`, when not null, must
+/// point to at least `*count` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_get_audio_outputs(
+    out: *mut lowlat_audio_output,
+    count: *mut u32,
+) -> lowlat_status {
+    guard(LOWLAT_ERR_INTERNAL, || {
+        if count.is_null() {
+            return LOWLAT_ERR_INVALID_ARGUMENT;
+        }
+        let listed = lowlat_audio::outputs(None).unwrap_or_default();
+        let found = u32::try_from(listed.len()).unwrap_or(u32::MAX);
+        if out.is_null() {
+            unsafe { count.write(found) };
+            return LOWLAT_OK;
+        }
+        let room = unsafe { count.read() } as usize;
+        let writing = listed.len().min(room);
+        for (at, output) in listed.iter().take(writing).enumerate() {
+            let mut slot = lowlat_audio_output {
+                id: [0; LOWLAT_OUTPUT_MAX],
+                name: [0; LOWLAT_OUTPUT_MAX],
+            };
+            put(&mut slot.id, &output.id);
+            put(&mut slot.name, &output.name);
+            unsafe { out.add(at).write(slot) };
+        }
+        if writing < listed.len() {
+            unsafe { count.write(found) };
+            return LOWLAT_ERR_TOO_SMALL;
+        }
+        unsafe { count.write(u32::try_from(writing).unwrap_or(u32::MAX)) };
+        LOWLAT_OK
+    })
+}
+
+/// List the outputs this host could capture.
+///
+/// **Available before hosting starts**, so an application can present a choice
+/// before committing to one. Two calls and the caller's own buffer, like the
+/// roster: pass `NULL` to learn the count.
+///
+/// @param[out] out An array of at least `*count` entries, or `NULL` to ask only how
+/// many there are.
+/// @param[in,out] count The array's capacity in, the number written out.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_TOO_SMALL`] with `count` set to what it
+/// would have taken.
+///
+/// # Safety
+///
+/// `count` must be readable and writable, and `out`, when not null, must
+/// point to at least `*count` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_get_outputs(
+    out: *mut lowlat_output,
+    count: *mut u32,
+) -> lowlat_status {
+    guard(LOWLAT_ERR_INTERNAL, || {
+        if count.is_null() {
+            return LOWLAT_ERR_INVALID_ARGUMENT;
+        }
+        let listed = ::lowlat_host::display::Display::outputs();
+        let found = u32::try_from(listed.len()).unwrap_or(u32::MAX);
+        if out.is_null() {
+            unsafe { count.write(found) };
+            return LOWLAT_OK;
+        }
+        let room = unsafe { count.read() } as usize;
+        let writing = listed.len().min(room);
+        for (at, output) in listed.iter().take(writing).enumerate() {
+            let mut slot = lowlat_output {
+                id: [0; LOWLAT_OUTPUT_MAX],
+                name: [0; LOWLAT_OUTPUT_MAX],
+                width: output.width,
+                height: output.height,
+                x: 0,
+                y: 0,
+            };
+            put(&mut slot.id, &output.id);
+            put(&mut slot.name, &output.connector);
+            if let Some(place) = output.place {
+                slot.x = place.x;
+                slot.y = place.y;
+            }
+            unsafe { out.add(at).write(slot) };
+        }
+        if writing < listed.len() {
+            unsafe { count.write(found) };
+            return LOWLAT_ERR_TOO_SMALL;
+        }
+        unsafe { count.write(u32::try_from(writing).unwrap_or(u32::MAX)) };
+        LOWLAT_OK
+    })
+}
+
+/// Whether this machine could host right now.
+///
+/// **A pre-flight, and the reason it exists is that the two ways of failing
+/// look identical afterwards.** Starting a host that cannot capture fails deep
+/// in the stream loop, where an application can tell "there is no display"
+/// from "this process may not read one" only by reading a log. This answers
+/// which, before anything is started.
+///
+/// [`LOWLAT_OK`] means a display is lit and its framebuffer can be reached.
+/// It is a read: no encoder is built and no thread is started.
+///
+/// @returns [`LOWLAT_OK`] when a display is lit and its framebuffer can be reached,
+/// [`LOWLAT_ERR_NO_DISPLAY`] when there is none, and [`LOWLAT_ERR_DISPLAY_UNREACHABLE`]
+/// when this process may not read the one there is.
+#[unsafe(no_mangle)]
+pub extern "C" fn lowlat_can_host() -> lowlat_status {
+    guard(LOWLAT_ERR_INTERNAL, || {
+        status_of(::lowlat_host::display::Display::capturable())
+    })
+}
+
+/// What each answer means at the boundary.
+fn status_of(found: ::lowlat_host::display::Capturable) -> lowlat_status {
+    match found {
+        ::lowlat_host::display::Capturable::Yes => LOWLAT_OK,
+        ::lowlat_host::display::Capturable::NothingLit => LOWLAT_ERR_NO_DISPLAY,
+        ::lowlat_host::display::Capturable::NotReachable => LOWLAT_ERR_DISPLAY_UNREACHABLE,
+    }
+}
+
+/// What a host is doing right now.
+///
+/// **What is happening, not what was asked for.** The picture's size is the
+/// display's answer and the guest count is the room's; the settings that
+/// produced them are read back through [`lowlat_host_get_video_config`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_host_status {
+    /// Set by the caller to `sizeof(lowlat_host_status)`.
+    pub size: u32,
+    /// Guests that are connected and addressable.
+    pub guests: u32,
+    /// The picture the stream is producing. **Zero before a display has been
+    /// opened**, which is the honest answer: until then the size is the
+    /// display's to decide and nothing here knows it.
+    pub width: u32,
+    pub height: u32,
+    /// Whether this handle is hosting.
+    pub running: bool,
+    /// Whether a sound device is being read right now.
+    ///
+    /// **Not what sound is set to.** Nothing is read while nobody is
+    /// listening, so this is clear in an empty room however sound is
+    /// configured; and it is also clear when the device could not be opened or
+    /// has gone away, which is the case an application cannot learn any other
+    /// way -- the settings still say enabled, because they are what was asked
+    /// for.
+    pub audio_active: bool,
+    /// Whether the stream codes ten bits a sample. **A flag rather than a
+    /// number, because the axis has nowhere to go**: no encoder on this
+    /// platform offers a depth above ten and one of them cannot describe one.
+    pub ten_bit: bool,
+    pub reserved: [u8; 1],
+    /// **None until something is being coded.**
+    ///
+    /// **What is coming out, not what was asked for.** A seated guest can move
+    /// the codec and the depth while the stream runs, so the configuration
+    /// stops being the answer as soon as one does.
+    pub codec: lowlat_codec,
+    /// None until something is being coded.
+    pub chroma: lowlat_chroma,
+    /// The sound device being read, empty when none is.
+    ///
+    /// **What it landed on, not what was asked for.** An empty request means
+    /// the default output's monitor, and the sound server can move a stream
+    /// while it runs, so this is the only place the two can be compared.
+    pub audio_device: [c_char; LOWLAT_OUTPUT_MAX],
+}
+
+/// Read what the host is doing.
+///
+/// Answers on a handle that is not hosting too, with `running` clear: an
+/// application asking what state something is in should not have to know the
+/// answer first.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[out] out One [`lowlat_host_status`] whose `size` says how much of it is set.
+/// @returns [`LOWLAT_OK`], on a handle that is not hosting too.
+///
+/// # Safety
+///
+/// `out` points to one [`lowlat_host_status`] whose `size` says how much of
+/// it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_get_status(
+    hl: *mut lowlat_host,
+    out: *mut lowlat_host_status,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if out.is_null() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            // Read through the pointer and written whole: a reference to the
+            // caller's structure would say it already holds valid values.
+            let size = core::ptr::addr_of!((*out).size).read_unaligned();
+            if (size as usize) < core::mem::size_of::<lowlat_host_status>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let mut status = lowlat_host_status {
+                size,
+                guests: 0,
+                width: 0,
+                height: 0,
+                running: false,
+                audio_active: false,
+                ten_bit: false,
+                reserved: [0; 1],
+                codec: lowlat_codec::LOWLAT_CODEC_NONE,
+                chroma: lowlat_chroma::LOWLAT_CHROMA_NONE,
+                audio_device: [0; LOWLAT_OUTPUT_MAX],
+            };
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                out.write(status);
+                return LOWLAT_OK;
+            };
+            let (width, height) = seam.picture().unwrap_or((0, 0));
+            let (reading, device) = seam.audio_state();
+            status.guests = u32::try_from(seam.guests().len()).unwrap_or(u32::MAX);
+            status.width = width;
+            status.height = height;
+            status.running = true;
+            status.audio_active = reading;
+            // None and clear until an encoder exists, the same way a picture
+            // of no size is reported before a display has been opened.
+            let (codec, ten_bit, chroma) = match seam.colour() {
+                Some((::lowlat_host::stream::Codec::H264, ten_bit, chroma_444)) => (
+                    lowlat_codec::LOWLAT_CODEC_H264,
+                    ten_bit,
+                    if chroma_444 {
+                        lowlat_chroma::LOWLAT_CHROMA_444
+                    } else {
+                        lowlat_chroma::LOWLAT_CHROMA_420
+                    },
+                ),
+                Some((::lowlat_host::stream::Codec::H265, ten_bit, chroma_444)) => (
+                    lowlat_codec::LOWLAT_CODEC_HEVC,
+                    ten_bit,
+                    if chroma_444 {
+                        lowlat_chroma::LOWLAT_CHROMA_444
+                    } else {
+                        lowlat_chroma::LOWLAT_CHROMA_420
+                    },
+                ),
+                None => (
+                    lowlat_codec::LOWLAT_CODEC_NONE,
+                    false,
+                    lowlat_chroma::LOWLAT_CHROMA_NONE,
+                ),
+            };
+            status.codec = codec;
+            status.chroma = chroma;
+            status.ten_bit = ten_bit;
+            put(
+                &mut status.audio_device,
+                device.as_deref().unwrap_or_default(),
+            );
+            out.write(status);
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Tell every guest who is in the room.
+///
+/// **A different message from an application message, and not a variant of
+/// one.** It travels on its own opcode, it is addressed to everybody rather
+/// than to a guest, and each peer finds *itself* in the list by number and
+/// takes that entry as what it is allowed to do. A peer has no way to ask for
+/// it, so one that is never sent one does not know what it is.
+///
+/// **The body's shape belongs to the clients an application serves**, exactly
+/// as an application message's does; nothing here reads it.
+///
+/// Answers how many guests it reached, which is zero for an empty room and not
+/// an error.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] data The body, whose shape belongs to the clients the application serves.
+/// Copied before this returns and never retained.
+/// @param[in] len How long the body is.
+/// @param[out] reached How many guests it reached. Zero for an empty room, which is not
+/// an error.
+/// @returns [`LOWLAT_OK`].
+///
+/// # Safety
+///
+/// `data` must point to at least `len` bytes when `len` is not zero. It is
+/// copied before the call returns and never retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_send_roster(
+    hl: *mut lowlat_host,
+    data: *const c_void,
+    len: u32,
+    reached: *mut u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if data.is_null() && len != 0 {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let body: &[u8] = if len == 0 {
+                &[]
+            } else {
+                core::slice::from_raw_parts(data.cast::<u8>(), len as usize)
+            };
+            if lowlat_core::control::string_body_len(body.len())
+                > lowlat_core::control::USER_DATA_MAX
+            {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            let sent = seam.send_roster(body);
+            if let Some(slot) = reached.as_mut() {
+                *slot = u32::try_from(sent).unwrap_or(u32::MAX);
+            }
+            LOWLAT_OK
+        })
+    }
+}
+
+/// What one of a guest's channels is doing.
+///
+/// **Named, not numbered.** A number here would be a stream index, and this
+/// host produces one stream and switches which display feeds it, so there is
+/// nothing to index. What genuinely differs between these figures is the
+/// channel, and there are three of them.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct lowlat_channel_metrics {
+    /// Distinct fragments put on the wire.
+    ///
+    /// **First transmissions only**, so the resend counters below divide into
+    /// this as a loss rate rather than as a ratio of two overlapping counts.
+    /// Pinned at the ceiling rather than wrapped, because a wrap reads as a
+    /// session that has just started.
+    pub packets_sent: u32,
+    /// Retransmissions the peer asked for, and retransmissions the timeout had
+    /// to find. **The two apart are the loss picture**: a path that reports its
+    /// losses and one that swallows them need different answers.
+    pub fast_rts: u32,
+    pub slow_rts: u32,
+    pub bitrate_mbps: f32,
+    /// What this channel's payload cost this host to produce. **Zero on
+    /// control**, which encodes nothing.
+    pub encode_ms: f32,
+    /// What the peer says this channel costs it to decode.
+    ///
+    /// **The peer's own figure.** It is the one number here this host cannot
+    /// measure, and it arrives only because a guest volunteers it: zero until
+    /// one has, and zero always on control.
+    pub decode_ms: f32,
+}
+
+/// What one guest is doing.
+///
+/// **Its own structure behind its own call, and that is deliberate.** A guest
+/// is delivered as an array element and an array element cannot carry a `size`
+/// -- the caller walks it by stride -- so [`lowlat_guest`] is fixed for the
+/// major version. These are the numbers most likely to grow, so they live
+/// where growing them is free.
+///
+/// **Shared figures once, per-channel figures per channel.** The round trip,
+/// the input stamps and the congestion count describe the guest and are here;
+/// the counters and the rates describe one channel and are in each of the
+/// three.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct lowlat_metrics {
+    /// Set by the caller to `sizeof(lowlat_metrics)`.
+    pub size: u32,
+    /// How long this guest has been connected.
+    pub connected_ms: u32,
+    /// When each kind of input last arrived, on the same clock as
+    /// `connected_ms`. **Zero means never**, which is not zero milliseconds
+    /// ago -- an application kicking idle guests has to tell the two apart.
+    pub keyboard_ms: u32,
+    pub pointer_ms: u32,
+    pub gamepad_ms: u32,
+    /// Video frames sent to this guest.
+    pub frames: u32,
+    /// Fragments outstanding, and how many are past due. **These are the
+    /// controller's own inputs**, so an application reads what the host is
+    /// steering by rather than a second set derived elsewhere; together they
+    /// are what "chronically behind" means.
+    pub window: u32,
+    pub stale: u32,
+    /// Times congestion cost this guest rate.
+    ///
+    /// **One count, not one per channel.** Video is the only channel a rate
+    /// controller steers, here and in every peer this talks to.
+    pub cg_events: u32,
+    /// The smoothed round trip to this peer. **One path, one figure**, which
+    /// is why it is here rather than repeated in each channel.
+    pub network_ms: f32,
+    pub control: lowlat_channel_metrics,
+    pub audio: lowlat_channel_metrics,
+    pub video: lowlat_channel_metrics,
+}
+
+/// One channel's figures, as the boundary reports them.
+fn channel_metrics(from: ::lowlat_host::admission::ChannelMetrics) -> lowlat_channel_metrics {
+    lowlat_channel_metrics {
+        packets_sent: from.packets_sent,
+        fast_rts: from.fast_rts,
+        slow_rts: from.slow_rts,
+        bitrate_mbps: from.bitrate_mbps,
+        encode_ms: from.encode_ms,
+        decode_ms: from.decode_ms,
+    }
+}
+
+/// Read what one guest is doing.
+///
+/// **What this host can answer for, and nothing else.** A peer's own decode
+/// time and how many frames it has queued waiting to decode are the peer's to
+/// know; reporting either would be reporting a number this host made up.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] guest_id Which guest.
+/// @param[out] out One [`lowlat_metrics`] whose `size` says how much of it is set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_UNKNOWN_GUEST`].
+///
+/// # Safety
+///
+/// `out` points to one [`lowlat_metrics`] whose `size` says how much of it
+/// is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_get_metrics(
+    hl: *mut lowlat_host,
+    guest_id: u32,
+    out: *mut lowlat_metrics,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(slot) = out.as_mut() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            if (slot.size as usize) < core::mem::size_of::<lowlat_metrics>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            let Some(found) = seam
+                .guests()
+                .into_iter()
+                .find(|guest| guest.number == guest_id)
+            else {
+                return LOWLAT_ERR_UNKNOWN_GUEST;
+            };
+            let metrics = found.metrics;
+            slot.connected_ms = metrics.connected_ms;
+            slot.keyboard_ms = metrics.keyboard_ms;
+            slot.pointer_ms = metrics.pointer_ms;
+            slot.gamepad_ms = metrics.gamepad_ms;
+            slot.frames = metrics.frames;
+            slot.window = metrics.window;
+            slot.stale = metrics.stale;
+            slot.cg_events = metrics.cg_events;
+            slot.network_ms = metrics.network_ms;
+            slot.control = channel_metrics(metrics.control);
+            slot.audio = channel_metrics(metrics.audio);
+            slot.video = channel_metrics(metrics.video);
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Change the video settings while the host runs.
+///
+/// **Everything in this structure is applied without rebuilding the session.**
+/// The bitrate re-bases the budget and reaches the encoder through the
+/// reconfigure the rate loop already does, so it costs no keyframe and no
+/// interruption; the frame rate changes the pacing from the next frame. The
+/// output is the exception in cost rather than in kind: a different picture
+/// cannot be absorbed into a stream built for another one, so it rebuilds
+/// around the new source and costs one coded refresh, keeping every guest on
+/// its seat and its channel.
+///
+/// **The quality moves the running encoder** (minor 37), asked of it only when
+/// it differs from what the stream runs at, so sending it again as it stands
+/// costs nothing. Most moves cost no keyframe; a move in or out of the highest
+/// setting costs one where the encoder takes a change of effort only with a
+/// new sequence, and an encoder that cannot move at all is rebuilt at the new
+/// setting, as an output change is.
+///
+/// **The congestion level moves every guest from the next pass** (minor 37):
+/// the thresholds each guest's session counts stale fragments by and the ratio
+/// its controller judges the count by, with nothing rebuilt and no keyframe.
+///
+/// Refused with [`LOWLAT_ERR_INVALID_ARGUMENT`] when the host is not running,
+/// because there is nothing yet for the values to apply to and accepting them
+/// silently would report settings that never took.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] cfg One [`lowlat_host_video_config`] whose `size` says how much of it is
+/// set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_INVALID_ARGUMENT`] when the host is not
+/// running.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `cfg` points to one
+/// [`lowlat_host_video_config`] whose `size` says how much of it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_set_video_config(
+    hl: *mut lowlat_host,
+    cfg: *const lowlat_host_video_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(cfg) = cfg.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let Some((video, own_display)) = video_configured(cfg) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let Ok(output) = output_named(&cfg.output).ok_or(()) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            seam.configure(
+                video,
+                own_display,
+                (!output.is_empty()).then(|| output.to_string()),
+            );
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Change what sound is set to, while a host runs.
+///
+/// **Every field takes effect without a restart.** Switching sound off gives
+/// the device back and restores the speakers; switching it on takes it again.
+/// A device that does not resolve is refused rather than substituted, and the
+/// host keeps the one it has.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] cfg One [`lowlat_host_audio_config`] whose `size` says how much of it is
+/// set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_INVALID_ARGUMENT`] for a device that does
+/// not resolve, the host keeping the one it has.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `cfg` points to one
+/// [`lowlat_host_audio_config`] whose `size` says how much of it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_set_audio_config(
+    hl: *mut lowlat_host,
+    cfg: *const lowlat_host_audio_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(cfg) = cfg.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let Some((on, allow_raw, kbps, live)) = audio_configured(cfg) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            // **A named device is checked here rather than where it is
+            // opened.** A sound server substitutes something plausible for a
+            // name it does not know, so a caller told yes would be capturing
+            // something it did not ask for; and the loop that opens it cannot
+            // refuse a call that has already returned. Checked before the
+            // handle is locked, because it asks the server over a connection
+            // of its own.
+            if let Some(device) = live.device.as_deref()
+                && !lowlat_audio::outputs(None)
+                    .is_ok_and(|listed| listed.iter().any(|output| output.id == device))
+            {
+                lowlat_common::log_warn!("abi: no such sound device, sound is unchanged");
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            seam.set_audio(&::lowlat_host::stream::SoundSettings {
+                on,
+                allow_raw,
+                kbps,
+                accept_microphone: cfg.accept_microphone,
+                live,
+            });
+            LOWLAT_OK
+        })
+    }
+}
+
+/// What sound is set to now.
+///
+/// **Read back rather than remembered**, for the reason the video one is: what
+/// a host is set to is the host's answer and another caller may have changed
+/// it.
+///
+/// **These are the settings and not the state.** `device` is the request, so
+/// an application that reads this, changes one field and writes it back does
+/// not accidentally pin a host that was following the default output. What is
+/// actually being read, and whether anything is, is in
+/// [`lowlat_host_status`].
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[out] out One [`lowlat_host_audio_config`] whose `size` says how much of it is
+/// set.
+/// @returns [`LOWLAT_OK`].
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `out` points to one
+/// [`lowlat_host_audio_config`] whose `size` says how much of it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_get_audio_config(
+    hl: *mut lowlat_host,
+    out: *mut lowlat_host_audio_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(slot) = out.as_mut() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            if (slot.size as usize) < core::mem::size_of::<lowlat_host_audio_config>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let settings = seam.audio();
+            slot.enabled = settings.on;
+            slot.allow_uncompressed = settings.allow_raw;
+            slot.bitrate_kbps = settings.kbps;
+            slot.mute_local = settings.live.mute_local;
+            slot.accept_microphone = settings.accept_microphone;
+            slot.reserved = [0; 1];
+            put(
+                &mut slot.device,
+                settings.live.device.as_deref().unwrap_or_default(),
+            );
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Change how the guests' input reaches the system, while a host runs
+/// (minor 32; Windows alone; `virtual_pads` from minor 33).
+///
+/// **Switching `virtual_input` or `virtual_pads` on asks the host's input
+/// driver first**, and is refused where it is not installed or does not admit
+/// this process, nothing changed: both fields are taken or neither. Each
+/// seated guest moves its keys and pointer on its next pass, what it holds on
+/// the old way released first; the pads plugged after a change follow it.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] cfg One [`lowlat_host_input_config`] whose `size` says how much of it is
+/// set.
+/// @returns [`LOWLAT_OK`]; [`LOWLAT_ERR_INPUT_DRIVER_ABSENT`],
+/// [`LOWLAT_ERR_INPUT_DRIVER_DENIED`], [`LOWLAT_ERR_INPUT_DRIVER_VERSION`] or
+/// [`LOWLAT_ERR_INPUT_DRIVER_IO`] for a driver that cannot be used, nothing changed;
+/// [`LOWLAT_ERR_INVALID_ARGUMENT`] when the host is not running.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `cfg` points to one
+/// [`lowlat_host_input_config`] whose `size` says how much of it is set.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_set_input_config(
+    hl: *mut lowlat_host,
+    cfg: *const lowlat_host_input_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(cfg) = cfg.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let Some((virtual_input, virtual_pads)) = input_configured(cfg) else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            match seam.set_input(virtual_input, virtual_pads) {
+                Ok(()) => LOWLAT_OK,
+                Err(error) => {
+                    lowlat_common::log_warn!(
+                        "abi: the guests' input on the input driver refused, unchanged, error={error}"
+                    );
+                    input_refused(error)
+                }
+            }
+        })
+    }
+}
+
+/// How the guests' input reaches the system now (minor 32; Windows alone;
+/// `virtual_pads` from minor 33).
+///
+/// **The settings and not the state**: each switch is what was last asked,
+/// which a driver lost since does not change.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[out] out One [`lowlat_host_input_config`] whose `size` says how much of it is
+/// set.
+/// @returns [`LOWLAT_OK`], or [`LOWLAT_ERR_INVALID_ARGUMENT`] when the host is not
+/// running.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `out` points to one
+/// [`lowlat_host_input_config`] whose `size` says how much of it is set.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_get_input_config(
+    hl: *mut lowlat_host,
+    out: *mut lowlat_host_input_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(slot) = out.as_mut() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            if (slot.size as usize) < core::mem::size_of::<lowlat_host_input_config>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            slot.virtual_input = seam.virtual_input();
+            slot.virtual_pads = seam.virtual_pads();
+            slot.reserved = [0; 2];
+            LOWLAT_OK
+        })
+    }
+}
+
+/// What the host is running at now.
+///
+/// **Read back rather than remembered.** What a stream is doing is the
+/// stream's answer, and an application that kept its own copy would be
+/// describing settings another guest may have changed underneath it.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[out] out One [`lowlat_host_video_config`] whose `size` says how much of it is
+/// set.
+/// @returns [`LOWLAT_OK`].
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`], and `out` points to one
+/// [`lowlat_host_video_config`] whose `size` says how much of it is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_get_video_config(
+    hl: *mut lowlat_host,
+    out: *mut lowlat_host_video_config,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            let Some(slot) = out.as_mut() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            if (slot.size as usize) < core::mem::size_of::<lowlat_host_video_config>() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let held = handle.held();
+            let Some(seam) = held.seam.as_ref() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            let Some(video) = seam.video() else {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            };
+            slot.fps = video.fps;
+            slot.bitrate_mbps = video.bitrate_mbps;
+            slot.min_bitrate_mbps = video.min_mbps;
+            slot.full_fps = video.full_fps;
+            slot.reserved = [0; 3];
+            slot.quality = match video.quality {
+                lowlat_encode::Quality::LowestLatency => {
+                    lowlat_quality::LOWLAT_QUALITY_LOWEST_LATENCY as u32
+                }
+                lowlat_encode::Quality::Balanced => lowlat_quality::LOWLAT_QUALITY_BALANCED as u32,
+                lowlat_encode::Quality::Highest => lowlat_quality::LOWLAT_QUALITY_HIGHEST as u32,
+            };
+            slot.cg_level = match video.cg_level {
+                0 => lowlat_cg_level::LOWLAT_CG_LEVEL_AGGRESSIVE as u32,
+                2 => lowlat_cg_level::LOWLAT_CG_LEVEL_RELAXED as u32,
+                level if level == lowlat_core::congestion::ADAPTIVE => {
+                    lowlat_cg_level::LOWLAT_CG_LEVEL_ADAPTIVE as u32
+                }
+                _ => lowlat_cg_level::LOWLAT_CG_LEVEL_SENSITIVE as u32,
+            };
+            // **The request, as the sound device is**: the display's own size
+            // is the picture's, on the status.
+            #[cfg(windows)]
+            {
+                let own_display = seam.own_display();
+                slot.virtual_width = own_display.width;
+                slot.virtual_height = own_display.height;
+                slot.virtual_hz = own_display.refresh_hz;
+            }
+            // **What is being captured, not what was asked for.** A guest can
+            // switch outputs and a display can move by itself; an application
+            // told the request marks the wrong screen.
+            let listed = ::lowlat_host::display::Display::outputs();
+            let running = ::lowlat_host::display::captured(&listed, seam.captured())
+                .map(|output| output.id.clone())
+                .unwrap_or_default();
+            put(&mut slot.output, &running);
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Stop hosting, disconnecting every guest and joining every thread.
+///
+/// **Not the same as destroying the handle.** A host may be stopped and started
+/// again on the same handle, and events raised before it stopped are still
+/// waiting to be polled.
+///
+/// **A peer is not yet told why.** Guest loops are stopped and joined, and the
+/// far side learns by its own liveness deadline rather than from a message, so
+/// stopping costs a peer the wait rather than being immediate to it. There is
+/// no reason parameter here because there is nothing yet that could carry one.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`]. It may be started again.
+/// @returns [`LOWLAT_OK`], once every guest is disconnected and every thread joined.
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_stop(hl: *mut lowlat_host) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            // The queue outlives the seam on purpose: what it raised on the way
+            // down is still worth polling.
+            handle.held().seam = None;
+            LOWLAT_OK
+        })
+    }
+}
+
+/// Samples one microphone packet can carry.
+///
+/// **What a buffer must hold**, not what a packet usually is: a peer sends ten
+/// milliseconds and this is twice that, because the length is the peer's to
+/// write and a receiver sizes its own work.
+pub const LOWLAT_MICROPHONE_SAMPLES_MAX: u32 = 960;
+
+/// Samples a second a microphone packet carries.
+pub const LOWLAT_MICROPHONE_SAMPLE_RATE: u32 = 48_000;
+
+/// How many channels it carries.
+pub const LOWLAT_MICROPHONE_CHANNELS: u32 = 1;
+
+/// Take one packet of a guest's microphone, waiting up to `timeout_ms`.
+///
+/// **Its own poll, not the event queue.** A hundred packets a second sharing
+/// that queue would evict the events it is there to deliver, so sound has a
+/// queue of its own and an application that wants both polls both.
+///
+/// **Always samples, never a codec.** A guest chooses how it encodes and this
+/// library decodes whichever it chose: sixteen-bit, mono, at
+/// [`LOWLAT_MICROPHONE_SAMPLE_RATE`]. `samples` must hold
+/// [`LOWLAT_MICROPHONE_SAMPLES_MAX`] of them; a packet cannot be larger, so
+/// there is no partial delivery and nothing to call back for.
+///
+/// Answers [`LOWLAT_TIMEOUT`] when nothing arrived, which is not an error, and
+/// [`LOWLAT_ERR_NOT_STARTED`] when this host is not taking microphones: it
+/// does nothing in that case rather than waiting out a timeout for sound that
+/// by construction cannot come. Set `accept_microphone` in
+/// [`lowlat_host_audio_config`] to take one; it is off by default, and until
+/// it is on a peer keeps its microphone muted and sends nothing.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] timeout_ms How long to wait for a packet. Zero polls without waiting.
+/// @param[out] samples Where the packet is written. Must hold
+/// [`LOWLAT_MICROPHONE_SAMPLES_MAX`].
+/// @param[in,out] count The buffer's capacity in samples in, how many were written out.
+/// @param[out] guest Which guest sent it. May be null.
+/// @param[out] dropped How many packets were lost to a queue nobody was draining,
+/// reported with the next delivery. May be null.
+/// @returns [`LOWLAT_OK`], [`LOWLAT_TIMEOUT`] when nothing arrived, or
+/// [`LOWLAT_ERR_NOT_STARTED`] when this host is not taking microphones.
+///
+/// # Safety
+///
+/// `samples` points to at least `*count` samples, and `count`, `guest` and
+/// `dropped` are readable and writable. `guest` and `dropped` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_poll_microphone(
+    hl: *mut lowlat_host,
+    timeout_ms: u32,
+    samples: *mut i16,
+    count: *mut u32,
+    guest: *mut u32,
+    dropped: *mut u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if samples.is_null() || count.is_null() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let capacity = count.read() as usize;
+            if capacity < LOWLAT_MICROPHONE_SAMPLES_MAX as usize {
+                count.write(LOWLAT_MICROPHONE_SAMPLES_MAX);
+                return LOWLAT_ERR_TOO_SMALL;
+            }
+            // **Refused rather than waited out.** A host that is not taking
+            // microphones will never have one, and blocking a caller's timeout
+            // to tell it nothing would read as sound that is merely late.
+            let taking = handle
+                .held()
+                .seam
+                .as_ref()
+                .is_some_and(|seam| seam.audio().accept_microphone);
+            if !taking {
+                count.write(0);
+                return LOWLAT_ERR_NOT_STARTED;
+            }
+            let buffer = core::slice::from_raw_parts_mut(samples, capacity);
+            match handle
+                .heard
+                .recv_timeout_into(Duration::from_millis(u64::from(timeout_ms)), buffer)
+            {
+                ::lowlat_host::microphone::Taken::Empty => {
+                    count.write(0);
+                    LOWLAT_TIMEOUT
+                }
+                ::lowlat_host::microphone::Taken::Took {
+                    guest: from,
+                    samples: written,
+                    dropped: lost,
+                } => {
+                    count.write(u32::try_from(written).unwrap_or(0));
+                    if !guest.is_null() {
+                        guest.write(from);
+                    }
+                    if !dropped.is_null() {
+                        dropped.write(lost);
+                    }
+                    LOWLAT_OK
+                }
+            }
+        })
+    }
+}
+
+/// Take one of a report pad's reports, waiting up to `timeout_ms`.
+///
+/// **For an application that holds the virtual device** (docs/05-host.md
+/// section 7.2): with `pad_sink` set to [`LOWLAT_PAD_SINK_APP`] in
+/// [`lowlat_host_config`], a DualShock 4's or a DualSense's reports come out
+/// here rather than into a device of this library's own -- the guest, the
+/// pad as the guest named it, the product, the kind, then the report in the
+/// pad's USB form, identifier byte first. The feature reports
+/// ([`LOWLAT_PAD_REPORT_FEATURE`]: calibration, firmware) come ahead of the
+/// first input report ([`LOWLAT_PAD_REPORT_INPUT`], 64 bytes), which is
+/// when the application creates its device; [`LOWLAT_PAD_REPORT_UNPLUG`],
+/// with no report, comes after the pad's last one -- on the guest's unplug
+/// and on its leaving -- and is when the application destroys it. The output
+/// reports that device is written go back with [`lowlat_host_send_pad_report`];
+/// a feature write stays on the host.
+///
+/// **Its own poll, not the event queue**, for the microphone's reason: a pad
+/// reports several hundred times a second. The queue is bounded; when the
+/// application falls behind the oldest input report is dropped and counted,
+/// never a feature report or a pad's end. **Park a thread on it.** The wait
+/// is the same wake the microphone's is, one cross-thread wake after the
+/// report was parsed; a loop polling it with a zero timeout adds its own
+/// interval to every report.
+///
+/// Answers [`LOWLAT_TIMEOUT`] when nothing arrived, which is not an error,
+/// and [`LOWLAT_ERR_NOT_STARTED`] when this host does not hand reports to
+/// the application: it does nothing in that case rather than waiting out a
+/// timeout for a report that by construction cannot come.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] timeout_ms How long to wait for a report. Zero polls without waiting.
+/// @param[out] guest Which guest sent it.
+/// @param[out] pad The pad, as the guest named it.
+/// @param[out] type_ One of [`lowlat_pad_type`].
+/// @param[out] kind One of [`lowlat_pad_report`]: input, feature, or unplug.
+/// @param[out] report Where the report is written. Must hold [`LOWLAT_PAD_REPORT_MAX`].
+/// @param[in,out] len The buffer's capacity in, how many bytes were written out.
+/// @param[out] dropped How many input reports were lost to a queue nobody was
+/// draining, reported with the next delivery. May be null.
+/// @returns [`LOWLAT_OK`], [`LOWLAT_TIMEOUT`] when nothing arrived, or
+/// [`LOWLAT_ERR_NOT_STARTED`] when the reports go to this library's own device.
+///
+/// # Safety
+///
+/// `report` points to at least `*len` bytes, and `guest`, `pad`, `type_`,
+/// `kind` and `len` are writable. `dropped` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_poll_pad_report(
+    hl: *mut lowlat_host,
+    timeout_ms: u32,
+    guest: *mut u32,
+    pad: *mut u32,
+    type_: *mut lowlat_pad_type,
+    kind: *mut lowlat_pad_report,
+    report: *mut u8,
+    len: *mut u32,
+    dropped: *mut u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if guest.is_null()
+                || pad.is_null()
+                || type_.is_null()
+                || kind.is_null()
+                || report.is_null()
+                || len.is_null()
+            {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let capacity = len.read() as usize;
+            if capacity < LOWLAT_PAD_REPORT_MAX as usize {
+                len.write(LOWLAT_PAD_REPORT_MAX);
+                return LOWLAT_ERR_TOO_SMALL;
+            }
+            // **Refused rather than waited out**, as the microphone's is: a
+            // host whose reports go into its own devices will never have one
+            // here.
+            let forwarding = handle
+                .held()
+                .seam
+                .as_ref()
+                .is_some_and(::lowlat_host::admission::Admission::forwards_pad_reports);
+            if !forwarding {
+                len.write(0);
+                return LOWLAT_ERR_NOT_STARTED;
+            }
+            let buffer = core::slice::from_raw_parts_mut(report, capacity);
+            match handle
+                .reports
+                .recv_timeout_into(Duration::from_millis(u64::from(timeout_ms)), buffer)
+            {
+                ::lowlat_host::padsink::Taken::Empty => {
+                    len.write(0);
+                    LOWLAT_TIMEOUT
+                }
+                ::lowlat_host::padsink::Taken::Took {
+                    guest: from,
+                    pad: which,
+                    product,
+                    kind: what,
+                    len: written,
+                    dropped: lost,
+                } => {
+                    guest.write(from);
+                    pad.write(which);
+                    type_.write(pad_type(product));
+                    kind.write(match what {
+                        ::lowlat_host::padsink::Kind::Input => {
+                            lowlat_pad_report::LOWLAT_PAD_REPORT_INPUT
+                        }
+                        ::lowlat_host::padsink::Kind::Feature => {
+                            lowlat_pad_report::LOWLAT_PAD_REPORT_FEATURE
+                        }
+                        ::lowlat_host::padsink::Kind::Unplug => {
+                            lowlat_pad_report::LOWLAT_PAD_REPORT_UNPLUG
+                        }
+                    });
+                    len.write(u32::try_from(written).unwrap_or(0));
+                    if !dropped.is_null() {
+                        dropped.write(lost);
+                    }
+                    LOWLAT_OK
+                }
+            }
+        })
+    }
+}
+
+/// The product as the boundary names it. The core's list may grow; a third
+/// product is named here before it is reported.
+fn pad_type(product: lowlat_core::pad::Product) -> lowlat_pad_type {
+    if product == lowlat_core::pad::Product::DualShock4 {
+        lowlat_pad_type::LOWLAT_PAD_TYPE_DS4
+    } else {
+        lowlat_pad_type::LOWLAT_PAD_TYPE_DS5
+    }
+}
+
+/// Give a guest's report pad the output report the application's device was
+/// written ([`LOWLAT_PAD_REPORT_OUTPUT`]: motors, lights, a DualSense's
+/// trigger effects), in the pad's USB form, identifier byte first. The pair
+/// of [`lowlat_host_poll_pad_report`]; the guest frames it for its pad's own
+/// transport.
+///
+/// **A feature write is refused** (minor 33): it stays on the host
+/// (docs/05-host.md section 7.2). A pad's features carry its pairing, test
+/// commands and firmware update, none a game needs, and the guest would write
+/// them to its own controller.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] guest The guest holding the pad.
+/// @param[in] pad The pad, as the guest named it.
+/// @param[in] kind [`LOWLAT_PAD_REPORT_OUTPUT`].
+/// @param[in] report The report, identifier byte first.
+/// @param[in] len How many bytes, at most 64.
+/// @returns [`LOWLAT_OK`], [`LOWLAT_ERR_UNKNOWN_GUEST`] when no such guest is
+/// connected, [`LOWLAT_ERR_INVALID_ARGUMENT`] for a kind that does not go this
+/// way -- [`LOWLAT_PAD_REPORT_FEATURE`] among them -- or a report no pad takes,
+/// or [`LOWLAT_ERR_NOT_STARTED`].
+///
+/// # Safety
+///
+/// `report` points to at least `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_send_pad_report(
+    hl: *mut lowlat_host,
+    guest: u32,
+    pad: u32,
+    kind: u32,
+    report: *const u8,
+    len: u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if kind != lowlat_pad_report::LOWLAT_PAD_REPORT_OUTPUT as u32 {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            if report.is_null() || len == 0 || len as usize > lowlat_core::pad::FEATURE_MAX {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let body = core::slice::from_raw_parts(report, len as usize);
+            let mut held = handle.held();
+            let Some(seam) = held.seam.as_mut() else {
+                return LOWLAT_ERR_NOT_STARTED;
+            };
+            if seam.send_pad_report(guest, pad, body) {
+                LOWLAT_OK
+            } else {
+                LOWLAT_ERR_UNKNOWN_GUEST
+            }
+        })
+    }
+}
+
+/// Take one event, waiting up to `timeout_ms` for one to arrive.
+///
+/// Answers [`LOWLAT_TIMEOUT`] when nothing arrived, which is not an error. A
+/// `timeout_ms` of zero polls without waiting.
+///
+/// `body` receives an application message's body and may be null, which means
+/// the application does not want bodies: one that arrives is delivered without
+/// it, and the event still says how long it was. When `body` is not null,
+/// `body_len` carries its capacity in and the bytes written out.
+///
+/// **A body that does not fit consumes nothing.** [`LOWLAT_ERR_TOO_SMALL`] is
+/// answered, `body_len` is set to what the body needs, and the same event is
+/// delivered by the next call with room for it.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`].
+/// @param[in] timeout_ms How long to wait for an event. Zero polls without waiting.
+/// @param[out] out One [`lowlat_event`].
+/// @param[out] body Receives an application message's body, or `NULL` to be delivered
+/// events without their bodies.
+/// @param[in,out] body_len When `body` is not null, its capacity in and the bytes
+/// written out.
+/// @returns [`LOWLAT_OK`], [`LOWLAT_TIMEOUT`] when nothing arrived, or
+/// [`LOWLAT_ERR_TOO_SMALL`] with `body_len` set to what the body needs and the event
+/// kept for the next call.
+///
+/// # Safety
+///
+/// `out` must point to one [`lowlat_event`]. `body`, when not null, must
+/// point to at least `*body_len` bytes, and `body_len` must then be readable and
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_host_poll_events(
+    hl: *mut lowlat_host,
+    timeout_ms: u32,
+    out: *mut lowlat_event,
+    body: *mut c_void,
+    body_len: *mut u32,
+) -> lowlat_status {
+    unsafe {
+        entered(hl, |handle| {
+            if out.is_null() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            if !body.is_null() && body_len.is_null() {
+                return LOWLAT_ERR_INVALID_ARGUMENT;
+            }
+            let timeout = Duration::from_millis(u64::from(timeout_ms));
+            let events = &handle.events;
+
+            if body.is_null() {
+                // The body is dropped, and the event still reports its length
+                // so that what was given up is visible.
+                let Some(received) = events.recv_timeout(timeout) else {
+                    return LOWLAT_TIMEOUT;
+                };
+                out.write(described(&received));
+                return LOWLAT_OK;
+            }
+
+            let capacity = body_len.read() as usize;
+            let buffer = core::slice::from_raw_parts_mut(body.cast::<u8>(), capacity);
+            match events.recv_timeout_into(timeout, buffer) {
+                Delivery::Empty => LOWLAT_TIMEOUT,
+                Delivery::TooSmall { needed } => {
+                    body_len.write(u32::try_from(needed).unwrap_or(u32::MAX));
+                    LOWLAT_ERR_TOO_SMALL
+                }
+                Delivery::Took(received) => {
+                    let event = described(&received);
+                    let written = if event.kind == LOWLAT_EVENT_USER_DATA {
+                        event.body.user_data.body_len
+                    } else {
+                        0
+                    };
+                    body_len.write(written);
+                    out.write(event);
+                    LOWLAT_OK
+                }
+            }
+        })
+    }
+}
+
+/// Panic on purpose, and prove the boundary contains it.
+///
+/// **Exported by the shipped library rather than hidden behind a build
+/// option**, because what has to be tested is that *this* object still
+/// unwinds. Building it to abort on panic silently disables containment
+/// everywhere, and the same code linked into a test binary answers for the
+/// test's build rather than for this one.
+/// **It takes the handle** so that what follows a contained panic is testable
+/// too: the handle is poisoned, every later call on it is refused, and
+/// destroying it still works.
+///
+/// @param[in] hl The handle from [`lowlat_host_create`]. It is poisoned afterwards: every
+/// later call on it is refused and destroying it still works.
+/// @returns [`LOWLAT_ERR_INTERNAL`], the panic having been caught. Every later call on
+/// `hl` answers [`LOWLAT_ERR_POISONED`].
+///
+/// # Safety
+///
+/// `hl` came from [`lowlat_host_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lowlat_debug_panic(hl: *mut lowlat_host) -> lowlat_status {
+    unsafe {
+        entered(hl, |_| {
+            panic!("deliberate panic, to prove the boundary contains one")
+        })
+    }
+}
+
+/// Describe one event in the shape the boundary publishes.
+fn described(received: &::lowlat_host::events::Received) -> lowlat_event {
+    let dropped = received.dropped;
+    match &received.event {
+        Event::Candidate {
+            attempt,
+            addr,
+            from_stun,
+            lan,
+        } => {
+            let mut body = lowlat_candidate_event {
+                attempt: [0; LOWLAT_ATTEMPT_MAX],
+                address: [0; LOWLAT_ADDRESS_MAX],
+                port: 0,
+                from_stun: *from_stun,
+                lan: *lan,
+            };
+            put(&mut body.attempt, attempt);
+            put_address(&mut body.address, &mut body.port, addr);
+            lowlat_event {
+                kind: LOWLAT_EVENT_CANDIDATE,
+                dropped,
+                body: lowlat_event_body { candidate: body },
+            }
+        }
+        Event::Ready { attempt } => {
+            let mut body = lowlat_ready_event {
+                attempt: [0; LOWLAT_ATTEMPT_MAX],
+            };
+            put(&mut body.attempt, attempt);
+            lowlat_event {
+                kind: LOWLAT_EVENT_READY,
+                dropped,
+                body: lowlat_event_body { ready: body },
+            }
+        }
+        Event::Established { attempt, addr } => {
+            let mut body = lowlat_established_event {
+                attempt: [0; LOWLAT_ATTEMPT_MAX],
+                address: [0; LOWLAT_ADDRESS_MAX],
+                port: 0,
+                reserved: [0; 2],
+            };
+            put(&mut body.attempt, attempt);
+            put_address(&mut body.address, &mut body.port, addr);
+            lowlat_event {
+                kind: LOWLAT_EVENT_ESTABLISHED,
+                dropped,
+                body: lowlat_event_body { established: body },
+            }
+        }
+        Event::Ended { attempt, outcome } => {
+            // Exhaustive on purpose: a new way for an attempt to finish should
+            // break this build rather than reach an application as a number it
+            // has no name for.
+            let (outcome, reason) = match outcome {
+                Outcome::ConnectivityFailed => (LOWLAT_OUTCOME_CONNECTIVITY_FAILED, 0),
+                Outcome::PeerGone => (LOWLAT_OUTCOME_PEER_GONE, 0),
+                Outcome::Undeliverable => (LOWLAT_OUTCOME_UNDELIVERABLE, 0),
+                Outcome::PeerLeft(reason) => (LOWLAT_OUTCOME_PEER_LEFT, *reason),
+                Outcome::NeverDeclared => (LOWLAT_OUTCOME_NEVER_DECLARED, 0),
+                Outcome::TransportFailed => (LOWLAT_OUTCOME_TRANSPORT_FAILED, 0),
+                Outcome::ControlStalled => (LOWLAT_OUTCOME_CONTROL_STALLED, 0),
+                Outcome::Kicked(reason) => (LOWLAT_OUTCOME_KICKED, *reason),
+                Outcome::HandshakeFailed => (LOWLAT_OUTCOME_HANDSHAKE_FAILED, 0),
+            };
+            let mut body = lowlat_ended_event {
+                attempt: [0; LOWLAT_ATTEMPT_MAX],
+                outcome,
+                reason,
+            };
+            put(&mut body.attempt, attempt);
+            lowlat_event {
+                kind: LOWLAT_EVENT_ENDED,
+                dropped,
+                body: lowlat_event_body { ended: body },
+            }
+        }
+        Event::CaptureChanged {
+            width,
+            height,
+            output,
+        } => {
+            let mut body = lowlat_capture_changed_event {
+                width: *width,
+                height: *height,
+                output: [0; LOWLAT_OUTPUT_MAX],
+            };
+            put(&mut body.output, output);
+            lowlat_event {
+                kind: LOWLAT_EVENT_CAPTURE_CHANGED,
+                dropped,
+                body: lowlat_event_body {
+                    capture_changed: body,
+                },
+            }
+        }
+        Event::InputOwnerChanged { guest } => lowlat_event {
+            kind: LOWLAT_EVENT_INPUT_OWNER_CHANGED,
+            dropped,
+            body: lowlat_event_body {
+                input_owner: lowlat_input_owner_event {
+                    guest: guest.unwrap_or(LOWLAT_GUEST_ALL),
+                },
+            },
+        },
+        Event::Fatal { reason } => lowlat_event {
+            kind: LOWLAT_EVENT_FATAL,
+            dropped,
+            body: lowlat_event_body {
+                fatal: lowlat_fatal_event { reason: *reason },
+            },
+        },
+        Event::UserData { guest, id, text } => lowlat_event {
+            kind: LOWLAT_EVENT_USER_DATA,
+            dropped,
+            body: lowlat_event_body {
+                user_data: lowlat_user_data_event {
+                    guest: *guest,
+                    id: *id,
+                    body_len: u32::try_from(text.len()).unwrap_or(u32::MAX),
+                },
+            },
+        },
+    }
+}
+
+/// Run an entry point that needs the handle.
+///
+/// Null is refused, a poisoned handle is refused, and a panic poisons it. **The
+/// poisoning is what makes asserting unwind safety sound**: state a panic may
+/// have left half-written is never read again, because every later call stops
+/// here.
+///
+/// # Safety
+///
+/// `hl` is null or came from [`lowlat_host_create`].
+unsafe fn entered(
+    hl: *mut lowlat_host,
+    call: impl FnOnce(&lowlat_host) -> lowlat_status,
+) -> lowlat_status {
+    let Some(handle) = (unsafe { hl.as_ref() }) else {
+        return LOWLAT_ERR_INVALID_ARGUMENT;
+    };
+    if handle.poisoned.load(Ordering::Acquire) {
+        return LOWLAT_ERR_POISONED;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(handle))) {
+        Ok(status) => status,
+        Err(_) => {
+            handle.poisoned.store(true, Ordering::Release);
+            lowlat_common::log_error!("abi: a call panicked, contained and the handle poisoned");
+            LOWLAT_ERR_INTERNAL
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A panic is contained, and what follows it is refused.** The test
+    /// that matters runs against the built shared object, in `tests/abi.rs`;
+    /// this one says the handle is poisoned by it and that destroying a
+    /// poisoned handle still works, which is the half a C harness cannot see.
+    #[test]
+    fn a_panic_poisons_the_handle_and_destroying_it_still_works() {
+        let mut handle: *mut lowlat_host = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { lowlat_host_create(core::ptr::null(), &raw mut handle) },
+            LOWLAT_OK
+        );
+        assert!(!handle.is_null());
+
+        assert_eq!(unsafe { lowlat_debug_panic(handle) }, LOWLAT_ERR_INTERNAL);
+        // Every later call, including another panic, stops at the poison.
+        assert_eq!(unsafe { lowlat_debug_panic(handle) }, LOWLAT_ERR_POISONED);
+        let mut event = core::mem::MaybeUninit::<lowlat_event>::uninit();
+        assert_eq!(
+            unsafe {
+                lowlat_host_poll_events(
+                    handle,
+                    0,
+                    event.as_mut_ptr(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                )
+            },
+            LOWLAT_ERR_POISONED
+        );
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **A null handle is refused rather than dereferenced**, which is the
+    /// first thing any application does by accident.
+    #[test]
+    fn a_null_handle_is_refused() {
+        assert_eq!(
+            unsafe { lowlat_debug_panic(core::ptr::null_mut()) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        // And destroying nothing is allowed, so an application's cleanup path
+        // needs no branch of its own.
+        unsafe { lowlat_host_destroy(core::ptr::null_mut()) };
+    }
+
+    /// **Polling a host that has not started waits on a real queue.** An
+    /// application starts its polling thread before it starts hosting, so a
+    /// poll that answered instantly would make that thread a spin -- and the
+    /// queue exists from creation rather than arriving with a host, so there
+    /// is nothing to special-case.
+    #[test]
+    fn polling_before_hosting_waits_and_then_times_out() {
+        let mut handle: *mut lowlat_host = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { lowlat_host_create(core::ptr::null(), &raw mut handle) },
+            LOWLAT_OK
+        );
+        let mut event = core::mem::MaybeUninit::<lowlat_event>::uninit();
+        let began = lowlat_common::clock::Time::now();
+        assert_eq!(
+            unsafe {
+                lowlat_host_poll_events(
+                    handle,
+                    60,
+                    event.as_mut_ptr(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                )
+            },
+            LOWLAT_TIMEOUT
+        );
+        let waited = lowlat_common::clock::elapsed_ms(began);
+        assert!(waited >= 50.0, "returned after {waited:.1} ms, so it spun");
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+
+    pub(super) fn video() -> lowlat_host_video_config {
+        lowlat_host_video_config {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_video_config>())
+                .unwrap_or(u32::MAX),
+            fps: 60,
+            bitrate_mbps: 10.0,
+            min_bitrate_mbps: 1.0,
+            full_fps: true,
+            reserved: [0; 3],
+            output: [0; LOWLAT_OUTPUT_MAX],
+            #[cfg(windows)]
+            virtual_width: 0,
+            #[cfg(windows)]
+            virtual_height: 0,
+            #[cfg(windows)]
+            virtual_hz: 0,
+            quality: lowlat_quality::LOWLAT_QUALITY_LOWEST_LATENCY as u32,
+            cg_level: lowlat_cg_level::LOWLAT_CG_LEVEL_SENSITIVE as u32,
+        }
+    }
+
+    pub(super) fn config() -> lowlat_host_config {
+        lowlat_host_config {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_config>()).unwrap_or(u32::MAX),
+            base_port: 9000,
+            #[cfg(windows)]
+            hold_memory_clock: false,
+            reserved: 0,
+            max_guests: 4,
+            codec: lowlat_codec::LOWLAT_CODEC_H264 as u32,
+            encoder: lowlat_encoder::LOWLAT_ENCODER_FOLLOW_DISPLAY as u32,
+            reserved3: 0,
+            reserved2: 0,
+            exclusive_hold_ms: 500,
+            exclusive_pointer: false,
+            pad_sink: 0,
+            #[cfg(windows)]
+            virtual_fallback: false,
+            #[cfg(windows)]
+            wake_display: false,
+            server_count: 0,
+            servers: [[0; LOWLAT_SERVER_MAX]; LOWLAT_SERVERS_MAX],
+            video: video(),
+            audio: audio(),
+            #[cfg(windows)]
+            input: input(),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn input() -> lowlat_host_input_config {
+        lowlat_host_input_config {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_input_config>())
+                .unwrap_or(u32::MAX),
+            virtual_input: false,
+            virtual_pads: false,
+            reserved: [0; 2],
+        }
+    }
+
+    pub(super) fn audio() -> lowlat_host_audio_config {
+        lowlat_host_audio_config {
+            accept_microphone: false,
+            size: u32::try_from(core::mem::size_of::<lowlat_host_audio_config>())
+                .unwrap_or(u32::MAX),
+            bitrate_kbps: 128,
+            // **Off in the fixtures**, because a test that opened a sound
+            // device would be a test of the machine it runs on.
+            enabled: false,
+            allow_uncompressed: false,
+            mute_local: false,
+            reserved: [0; 1],
+            device: [0; LOWLAT_OUTPUT_MAX],
+        }
+    }
+
+    pub(super) fn handle() -> *mut lowlat_host {
+        let mut handle: *mut lowlat_host = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { lowlat_host_create(core::ptr::null(), &raw mut handle) },
+            LOWLAT_OK
+        );
+        handle
+    }
+
+    /// Hosting starts, stops, and starts again on the same handle.
+    #[test]
+    fn a_host_starts_and_stops_and_starts_again() {
+        let handle = handle();
+        let cfg = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        // **Starting twice is refused rather than silently reconfiguring.** A
+        // second configuration that looks accepted and is not is a host running
+        // settings nobody can see.
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_ERR_ALREADY_STARTED
+        );
+        assert_eq!(unsafe { lowlat_host_stop(handle) }, LOWLAT_OK);
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **What a caller sets at start is what it reads back.** A field the
+    /// boundary accepts and then drops is worse than one it refuses: the
+    /// application believes it asked for something. This one was dropped --
+    /// the stream's configuration had no such field, so the live cell was
+    /// built from a default and the start-time value went nowhere.
+    #[test]
+    fn a_setting_made_at_start_is_the_one_read_back() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.video.full_fps = true;
+        cfg.video.fps = 45;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+
+        let mut back = video();
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert!(back.full_fps, "a permission set at start was dropped");
+        assert_eq!(back.fps, 45);
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **The quality reads back as asked, at start and live**, and one nobody
+    /// here names is refused at either, never served as the nearest: refused
+    /// live, the host keeps the one it has.
+    #[test]
+    fn the_quality_asked_is_read_back_and_an_unknown_one_refused() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.video.quality = lowlat_quality::LOWLAT_QUALITY_HIGHEST as u32;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let mut back = video();
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            back.quality,
+            lowlat_quality::LOWLAT_QUALITY_HIGHEST as u32,
+            "the quality asked at start was dropped"
+        );
+
+        let mut live = video();
+        live.quality = lowlat_quality::LOWLAT_QUALITY_BALANCED as u32;
+        assert_eq!(
+            unsafe { lowlat_host_set_video_config(handle, &raw const live) },
+            LOWLAT_OK
+        );
+        live.quality = 3;
+        assert_eq!(
+            unsafe { lowlat_host_set_video_config(handle, &raw const live) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            back.quality,
+            lowlat_quality::LOWLAT_QUALITY_BALANCED as u32,
+            "a live quality was dropped, or a refused one taken"
+        );
+
+        assert_eq!(unsafe { lowlat_host_stop(handle) }, LOWLAT_OK);
+        cfg.video.quality = 3;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **The congestion level reads back as asked, at start and live**, and
+    /// one nobody here names is refused at either: refused live, the host
+    /// keeps the one it has. The configuration's old place for it is read by
+    /// nothing.
+    #[test]
+    fn the_level_asked_is_read_back_and_an_unknown_one_refused() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.video.cg_level = lowlat_cg_level::LOWLAT_CG_LEVEL_RELAXED as u32;
+        cfg.reserved3 = 99;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let mut back = video();
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            back.cg_level,
+            lowlat_cg_level::LOWLAT_CG_LEVEL_RELAXED as u32,
+            "the level asked at start was dropped"
+        );
+
+        let mut live = video();
+        live.cg_level = lowlat_cg_level::LOWLAT_CG_LEVEL_ADAPTIVE as u32;
+        assert_eq!(
+            unsafe { lowlat_host_set_video_config(handle, &raw const live) },
+            LOWLAT_OK
+        );
+        live.cg_level = 4;
+        assert_eq!(
+            unsafe { lowlat_host_set_video_config(handle, &raw const live) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            back.cg_level,
+            lowlat_cg_level::LOWLAT_CG_LEVEL_ADAPTIVE as u32,
+            "a live level was dropped, or a refused one taken"
+        );
+
+        assert_eq!(unsafe { lowlat_host_stop(handle) }, LOWLAT_OK);
+        cfg.video.cg_level = 4;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **A video configuration laid out as minor 36's is refused, never
+    /// misread**, on every platform: its quality is on the configuration, and
+    /// read here it would be whatever that caller's padding held.
+    #[test]
+    fn a_video_configuration_from_minor_36_is_refused() {
+        let shared = 4 + 4 + 8 + 8 + 1 + 3 + LOWLAT_OUTPUT_MAX;
+        let minor_36 = if cfg!(windows) {
+            shared + 12 + 4
+        } else {
+            shared
+        };
+        let handle = handle();
+        let mut whole = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const whole) },
+            LOWLAT_OK
+        );
+        let mut cfg = video();
+        cfg.size = u32::try_from(minor_36).unwrap();
+        assert_eq!(
+            unsafe { lowlat_host_set_video_config(handle, &raw const cfg) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        whole.video.size = u32::try_from(minor_36).unwrap();
+        assert_eq!(unsafe { lowlat_host_stop(handle) }, LOWLAT_OK);
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const whole) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **What the host's own display is asked to be is what reads back**, at
+    /// start and live, zero being the host deciding. Nothing here names the
+    /// display or allows it, so nothing is plugged on the machine running it.
+    #[cfg(windows)]
+    #[test]
+    fn the_host_display_request_is_the_one_read_back() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.video.virtual_width = 2560;
+        cfg.video.virtual_height = 1440;
+        cfg.video.virtual_hz = 120;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let mut back = video();
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            (back.virtual_width, back.virtual_height, back.virtual_hz),
+            (2560, 1440, 120),
+            "a request made at start was dropped"
+        );
+        let live = video();
+        assert_eq!(
+            unsafe { lowlat_host_set_video_config(handle, &raw const live) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            unsafe { lowlat_host_get_video_config(handle, &raw mut back) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            (back.virtual_width, back.virtual_height, back.virtual_hz),
+            (0, 0, 0),
+            "a live request was dropped"
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **A size is both or neither and within what a monitor may be, a
+    /// refresh within what a compositor keeps** -- refused, never clamped, so
+    /// an application is not told yes and given another display.
+    #[cfg(windows)]
+    #[test]
+    fn a_host_display_request_no_monitor_could_be_is_refused() {
+        let asked = |width, height, refresh| {
+            let mut cfg = video();
+            cfg.virtual_width = width;
+            cfg.virtual_height = height;
+            cfg.virtual_hz = refresh;
+            video_configured(&cfg).is_some()
+        };
+        for (width, height, refresh) in [
+            (1920, 0, 0),
+            (0, 1080, 0),
+            (639, 480, 0),
+            (640, 479, 0),
+            (7681, 4320, 0),
+            (7680, 4321, 0),
+            (1920, 1080, 23),
+            (1920, 1080, 481),
+        ] {
+            assert!(
+                !asked(width, height, refresh),
+                "{width}x{height}@{refresh} was accepted"
+            );
+        }
+        for (width, height, refresh) in [
+            (0, 0, 0),
+            (640, 480, 24),
+            (7680, 4320, 480),
+            (3420, 2148, 0),
+        ] {
+            assert!(
+                asked(width, height, refresh),
+                "{width}x{height}@{refresh} was refused"
+            );
+        }
+    }
+
+    /// **`virtual` names a display only Windows has**, so elsewhere it is
+    /// refused at the call: a stream asked for an output that never lights
+    /// waits for ever rather than failing.
+    #[test]
+    fn virtual_is_refused_where_the_host_has_no_display_of_its_own() {
+        let mut cfg = config();
+        put(&mut cfg.video.output, "virtual");
+        assert_eq!(configured(&cfg).is_some(), cfg!(windows));
+    }
+
+    /// **The layout is the platform's** (minor 32): the fields only Windows
+    /// acts on, and the input half, exist on Windows alone. Written out from
+    /// the fields rather than taken from the types, which would agree with any
+    /// layout: the video half is its own display's three words longer on
+    /// Windows, the whole that and the input half's eight bytes.
+    #[test]
+    fn the_configuration_is_laid_out_per_platform() {
+        let video = core::mem::size_of::<lowlat_host_video_config>();
+        let whole = core::mem::size_of::<lowlat_host_config>();
+        // size, fps, two doubles, full_fps and three reserved, the output:
+        // 288, already a multiple of the doubles' eight.
+        let shared = 4 + 4 + 8 + 8 + 1 + 3 + LOWLAT_OUTPUT_MAX;
+        assert_eq!(shared, 288);
+        #[cfg(windows)]
+        {
+            // The three words, the quality and the word after it (minor 37),
+            // and four bytes taking it to a multiple of eight. **Minor 36's
+            // ended at the three words and the four**, which the quality alone
+            // would have filled, leaving the size as it was.
+            assert_eq!(video, shared + 12 + 8 + 4);
+            assert_eq!(core::mem::size_of::<lowlat_host_input_config>(), 8);
+            // Minor 33's switch in the first reserved byte: nothing moved.
+            assert_eq!(
+                core::mem::offset_of!(lowlat_host_input_config, virtual_pads),
+                5
+            );
+            assert_eq!(
+                core::mem::offset_of!(lowlat_host_config, input),
+                core::mem::offset_of!(lowlat_host_config, audio)
+                    + core::mem::size_of::<lowlat_host_audio_config>(),
+                "the input half follows the sound's"
+            );
+            let _ = whole;
+        }
+        #[cfg(not(windows))]
+        {
+            // The quality and the word after it (minor 37).
+            assert_eq!(video, shared + 8);
+            assert_eq!(HOST_CONFIG_MINOR_31, whole + 8);
+        }
+    }
+
+    /// **Off Windows, a caller laid out as minors 27 to 31 were is refused,
+    /// never misread**: its sound half sits where this library reads the
+    /// video half's end. A smaller structure is refused as ever, and one of
+    /// this library's own size is taken.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_configuration_laid_out_before_minor_32_is_refused_off_windows() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.size = u32::try_from(HOST_CONFIG_MINOR_31).unwrap();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        cfg.size = u32::try_from(core::mem::size_of::<lowlat_host_config>()).unwrap();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **The input driver is asked before the keys go to it**: switching the
+    /// guests' input on is answered as the driver answers this process --
+    /// taken and read back on where it can be used, refused with the driver's
+    /// reason and read back off where it cannot -- switching it off is always
+    /// taken, and a structure shorter than the library's is refused. A start
+    /// asking for it is not refused for it.
+    #[cfg(windows)]
+    #[test]
+    fn the_input_driver_is_asked_before_the_keys_go_to_it() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.input.virtual_input = true;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK,
+            "a start is not refused for the input driver"
+        );
+        let probed = lowlat_inject::hid::probe();
+        let read = || {
+            let mut back = input();
+            back.virtual_input = !probed.is_ok();
+            assert_eq!(
+                unsafe { lowlat_host_get_input_config(handle, &raw mut back) },
+                LOWLAT_OK
+            );
+            back.virtual_input
+        };
+        assert_eq!(
+            read(),
+            probed.is_ok(),
+            "the start's ask, as the driver answered it"
+        );
+
+        let mut asked = input();
+        asked.virtual_input = false;
+        assert_eq!(
+            unsafe { lowlat_host_set_input_config(handle, &raw const asked) },
+            LOWLAT_OK
+        );
+        assert!(!read(), "switched off");
+        asked.virtual_input = true;
+        let expected = match probed {
+            Ok(()) => LOWLAT_OK,
+            Err(error) => input_refused(error),
+        };
+        assert_eq!(
+            unsafe { lowlat_host_set_input_config(handle, &raw const asked) },
+            expected
+        );
+        assert_eq!(read(), probed.is_ok(), "switched on as the driver allows");
+        assert_eq!(
+            unsafe { lowlat_host_set_input_config(handle, &raw const asked) },
+            expected,
+            "asked again"
+        );
+        asked.size = 4;
+        assert_eq!(
+            unsafe { lowlat_host_set_input_config(handle, &raw const asked) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **The pads' switch follows the input switch's rule**: switching it on
+    /// is answered as the driver answers this process -- taken and read back
+    /// on where the driver can be used, refused with its reason and nothing
+    /// changed where it cannot -- and a set carrying both switches takes both
+    /// or neither. A start asking for it is not refused for it.
+    #[cfg(windows)]
+    #[test]
+    fn the_pads_switch_asks_the_driver_and_a_set_takes_both_or_neither() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.input.virtual_pads = true;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK,
+            "a start is not refused for the input driver"
+        );
+        let probed = lowlat_inject::hid::probe();
+        let read = || {
+            let mut back = input();
+            back.virtual_input = !probed.is_ok();
+            back.virtual_pads = !probed.is_ok();
+            assert_eq!(
+                unsafe { lowlat_host_get_input_config(handle, &raw mut back) },
+                LOWLAT_OK
+            );
+            (back.virtual_input, back.virtual_pads)
+        };
+        assert_eq!(
+            read(),
+            (false, probed.is_ok()),
+            "the start's ask, as the driver answered it"
+        );
+
+        let mut asked = input();
+        assert_eq!(
+            unsafe { lowlat_host_set_input_config(handle, &raw const asked) },
+            LOWLAT_OK
+        );
+        assert_eq!(read(), (false, false), "both switched off");
+        asked.virtual_input = true;
+        asked.virtual_pads = true;
+        let expected = match probed {
+            Ok(()) => LOWLAT_OK,
+            Err(error) => input_refused(error),
+        };
+        assert_eq!(
+            unsafe { lowlat_host_set_input_config(handle, &raw const asked) },
+            expected
+        );
+        let on = probed.is_ok();
+        assert_eq!(read(), (on, on), "both or neither");
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **Each way the input driver cannot be used reads as a status of its
+    /// own**, so an application can say which: installed, admitted, the same
+    /// version.
+    #[cfg(windows)]
+    #[test]
+    fn the_input_drivers_refusals_read_as_their_own_statuses() {
+        use lowlat_inject::hid::Error;
+        assert_eq!(input_refused(Error::Absent), LOWLAT_ERR_INPUT_DRIVER_ABSENT);
+        assert_eq!(input_refused(Error::Denied), LOWLAT_ERR_INPUT_DRIVER_DENIED);
+        assert_eq!(
+            input_refused(Error::Version(2)),
+            LOWLAT_ERR_INPUT_DRIVER_VERSION
+        );
+        assert_eq!(
+            input_refused(Error::Refused(31)),
+            LOWLAT_ERR_INPUT_DRIVER_IO
+        );
+    }
+
+    /// **A configuration nobody filled in is not a zeroed one.**
+    ///
+    /// Every enumerated field is validated rather than clamped, so zero is a
+    /// valid request for the first variant of each -- including the most
+    /// aggressive congestion level. These are what a host would choose.
+    #[test]
+    fn the_defaults_are_what_a_host_would_choose_and_zero_is_not_them() {
+        // Filled through the caller's pointer: refused when there is none, and
+        // when the size is short, with not a byte of the structure written.
+        assert_eq!(
+            unsafe { lowlat_host_default_config(core::ptr::null_mut()) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        let whole = core::mem::size_of::<lowlat_host_config>();
+        let size = u32::try_from(whole).unwrap();
+        let mut cfg = core::mem::MaybeUninit::<lowlat_host_config>::uninit();
+        let bytes = cfg.as_mut_ptr().cast::<u8>();
+        unsafe {
+            bytes.write_bytes(0xa5, whole);
+            core::ptr::addr_of_mut!((*cfg.as_mut_ptr()).size).write(size - 1);
+        }
+        assert_eq!(
+            unsafe { lowlat_host_default_config(cfg.as_mut_ptr()) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        let after = unsafe { core::slice::from_raw_parts(bytes.add(4), whole - 4) };
+        assert!(
+            after.iter().all(|byte| *byte == 0xa5),
+            "a short structure was written"
+        );
+        unsafe { core::ptr::addr_of_mut!((*cfg.as_mut_ptr()).size).write(size) };
+        assert_eq!(
+            unsafe { lowlat_host_default_config(cfg.as_mut_ptr()) },
+            LOWLAT_OK
+        );
+        // SAFETY: the call wrote the whole of it.
+        let cfg = unsafe { cfg.assume_init() };
+        assert_eq!(
+            cfg.video.cg_level,
+            lowlat_cg_level::LOWLAT_CG_LEVEL_SENSITIVE as u32
+        );
+        assert_ne!(
+            cfg.video.cg_level,
+            lowlat_cg_level::LOWLAT_CG_LEVEL_AGGRESSIVE as u32,
+            "a zeroed structure already asks for the aggressive level; the defaults must not"
+        );
+        // The sizes are filled in, so a caller starting here never sets them.
+        assert_eq!(
+            cfg.size as usize,
+            core::mem::size_of::<lowlat_host_config>()
+        );
+        assert_eq!(
+            cfg.video.size as usize,
+            core::mem::size_of::<lowlat_host_video_config>()
+        );
+        assert_eq!(
+            cfg.audio.size as usize,
+            core::mem::size_of::<lowlat_host_audio_config>()
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                cfg.input.size as usize,
+                core::mem::size_of::<lowlat_host_input_config>()
+            );
+            assert!(!cfg.input.virtual_input, "the batch input call by default");
+        }
+        // **One figure, two types.** The field is whole milliseconds and the
+        // arbitration's constant is not, so this is what catches a drift.
+        assert!(
+            (f64::from(cfg.exclusive_hold_ms) - ::lowlat_host::floor::HOLD_MS).abs() < f64::EPSILON
+        );
+        // And the whole of it survives the validation an application's own
+        // structure would face.
+        assert!(
+            configured(&cfg).is_some(),
+            "the defaults are not a configuration this boundary accepts"
+        );
+    }
+
+    /// **A null configuration means the defaults, not a refusal.**
+    ///
+    /// An application with no opinion should not have to build a structure to
+    /// say so, and the obvious way to build one -- zeroing it -- asks for
+    /// something else.
+    #[test]
+    fn a_null_configuration_is_taken_as_the_defaults() {
+        let handle = handle();
+        assert_ne!(
+            unsafe { lowlat_host_start(handle, core::ptr::null()) },
+            LOWLAT_ERR_INVALID_ARGUMENT,
+            "a null configuration was refused instead of meaning the defaults"
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **Every enumerated field is checked, not transmuted.** The application
+    /// fills this structure, so each of these is whatever it wrote, and a value
+    /// nothing defined must be refused rather than become a variant that does
+    /// not exist.
+    #[test]
+    fn a_value_nothing_defines_is_refused() {
+        let handle = handle();
+        for spoil in [
+            (|cfg: &mut lowlat_host_config| cfg.codec = 99) as fn(&mut lowlat_host_config),
+            |cfg| cfg.encoder = 99,
+            |cfg| cfg.video.cg_level = 99,
+            |cfg| cfg.max_guests = 0,
+            |cfg| cfg.max_guests = LOWLAT_GUESTS_MAX + 1,
+            |cfg| cfg.video.fps = 0,
+            |cfg| cfg.video.bitrate_mbps = 0.0,
+            |cfg| cfg.video.bitrate_mbps = f64::NAN,
+            // A floor above the ceiling leaves congestion control nowhere to go.
+            |cfg| cfg.video.min_bitrate_mbps = 100.0,
+            |cfg| cfg.server_count = u32::try_from(LOWLAT_SERVERS_MAX + 1).unwrap_or(u32::MAX),
+            |cfg| cfg.pad_sink = 2,
+            // A field with no terminator was overrun by whoever filled it.
+            |cfg| cfg.video.output = [b'x' as c_char; LOWLAT_OUTPUT_MAX],
+            // The size field is the versioning, and one that says less than the
+            // struct holds means the caller and the header disagree.
+            |cfg| cfg.size = 4,
+            |cfg| cfg.video.size = 4,
+        ] {
+            let mut cfg = config();
+            spoil(&mut cfg);
+            assert_eq!(
+                unsafe { lowlat_host_start(handle, &raw const cfg) },
+                LOWLAT_ERR_INVALID_ARGUMENT,
+                "a configuration that should have been refused was accepted"
+            );
+        }
+        // And none of that left it hosting.
+        let good = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const good) },
+            LOWLAT_OK
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **Both families of a dual-stack reflexive server are asked.**
+    ///
+    /// A name that answers with A and AAAA is ordered by this machine's own
+    /// addressing, so keeping the head alone gives a host with global v6 a v6
+    /// reflexive address and no v4 one, and a v4-only peer is then offered
+    /// nothing from us it can reach. Asserted per family rather than on order,
+    /// which belongs to the resolver.
+    #[test]
+    fn a_dual_stack_reflexive_server_contributes_both_families() {
+        // Stated rather than assumed: on a machine whose localhost answers on
+        // one family only, this test cannot tell the two behaviours apart, and
+        // saying so is better than passing without having checked.
+        let families: std::collections::BTreeSet<bool> =
+            std::net::ToSocketAddrs::to_socket_addrs("localhost:3478")
+                .expect("localhost must resolve")
+                .map(|addr| addr.is_ipv6())
+                .collect();
+        assert_eq!(
+            families.len(),
+            2,
+            "this check needs a localhost that answers on both families"
+        );
+
+        let mut cfg = config();
+        cfg.server_count = 1;
+        put(&mut cfg.servers[0], "localhost:3478");
+
+        let translated = configured(&cfg).expect("a resolvable server is configuration");
+        assert_eq!(
+            translated.servers.iter().filter(|a| a.is_ipv4()).count(),
+            1,
+            "no v4 reflexive server came out of a dual-stack name: {:?}",
+            translated.servers
+        );
+        assert_eq!(
+            translated.servers.iter().filter(|a| a.is_ipv6()).count(),
+            1,
+            "no v6 reflexive server came out of a dual-stack name: {:?}",
+            translated.servers
+        );
+    }
+
+    /// A reflexive server is resolved while the caller is still holding the
+    /// call that set it, rather than failing later where nothing can be done.
+    #[test]
+    fn a_server_that_does_not_resolve_is_refused_at_the_call_that_set_it() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.server_count = 1;
+        put(&mut cfg.servers[0], "no-such-host.invalid:3478");
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+
+        let mut cfg = config();
+        cfg.server_count = 1;
+        put(&mut cfg.servers[0], "127.0.0.1:3478");
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **The queue outlives the host on it.** It exists from creation, so a
+    /// poll before hosting waits on something real; and stopping does not empty
+    /// it, because what was raised on the way down is still worth taking.
+    #[test]
+    fn events_reach_the_poll_once_hosting_has_started() {
+        let handle = handle();
+        let cfg = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+
+        let mut event = core::mem::MaybeUninit::<lowlat_event>::uninit();
+        let polled = unsafe {
+            lowlat_host_poll_events(
+                handle,
+                0,
+                event.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        // Nobody has offered, so there is nothing yet -- but the queue is real
+        // now rather than absent, which is what the next assertion rests on.
+        assert_eq!(polled, LOWLAT_TIMEOUT);
+
+        // Raised by the seam and still takeable after the host that raised it
+        // has gone.
+        assert_eq!(unsafe { lowlat_host_stop(handle) }, LOWLAT_OK);
+        let mut event = core::mem::MaybeUninit::<lowlat_event>::uninit();
+        let after = unsafe {
+            lowlat_host_poll_events(
+                handle,
+                0,
+                event.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert!(
+            after == LOWLAT_OK || after == LOWLAT_TIMEOUT,
+            "the queue went away with the host that was raising into it"
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::start_tests::{config, handle};
+    use super::*;
+    use crate::abi::lowlat_status_string;
+    use core::ffi::CStr;
+
+    fn attempt(id: &str) -> lowlat_attempt_info {
+        let mut info = lowlat_attempt_info {
+            size: u32::try_from(core::mem::size_of::<lowlat_attempt_info>()).unwrap_or(u32::MAX),
+            reserved: 0,
+            attempt_id: [0; LOWLAT_ATTEMPT_MAX],
+            ufrag: [0; LOWLAT_ICE_MAX],
+            pwd: [0; LOWLAT_ICE_MAX],
+            aes256: [0; LOWLAT_ICE_MAX],
+            permissions: lowlat_permissions {
+                keyboard: true,
+                pointer: true,
+                gamepad: true,
+                reserved: 0,
+            },
+            owner: false,
+            reserved2: [0; 3],
+            transport: lowlat_transport::LOWLAT_TRANSPORT_BUD as u32,
+            fingerprint: [0; LOWLAT_FINGERPRINT_MAX],
+        };
+        put(&mut info.attempt_id, id);
+        put(&mut info.ufrag, "G+sZxQ==");
+        put(&mut info.pwd, "Det3D+arYViymh6I2v7UaOnrsHieoTRE");
+        // A media key in the offer, as every current client sends one. An
+        // attempt registered without one takes the legacy cipher.
+        put(&mut info.aes256, "deadbeef");
+        info
+    }
+
+    /// A browser's attempt: the pipe named, a digest carried, no media key.
+    fn web_attempt(id: &str) -> lowlat_attempt_info {
+        let mut info = attempt(id);
+        info.transport = lowlat_transport::LOWLAT_TRANSPORT_WEB as u32;
+        info.aes256 = [0; LOWLAT_ICE_MAX];
+        put(
+            &mut info.fingerprint,
+            "sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:\
+             00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF",
+        );
+        info
+    }
+
+    /// An application built against minor 1 sets the size that structure
+    /// had, and its attempt is the native one with no digest. *Named
+    /// regression test*: the appended fields are read only when the size
+    /// says they exist.
+    #[test]
+    fn an_old_size_attempt_info_still_registers_a_bud_attempt() {
+        let handle = started();
+        let mut info = attempt("old");
+        // Poisoned past the old size: a reader that reached into the tail
+        // would refuse the transport value below.
+        info.transport = u32::MAX;
+        info.size = u32::try_from(ATTEMPT_INFO_MINOR_1).unwrap_or(u32::MAX);
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+        let mut ours = credentials();
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"old".as_ptr(), 0, &raw mut ours) },
+            LOWLAT_OK
+        );
+        // A native answer: the media key is there and the digest is the
+        // random material, not a certificate's.
+        assert!(taken(&ours.aes256).is_some_and(|text| !text.is_empty()));
+        assert!(taken(&ours.fingerprint).is_some_and(|text| !text.starts_with("sha-256 ")));
+
+        // One byte short of the old size is refused, and so is a transport
+        // value nothing defined at the full size.
+        info.size -= 1;
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        let mut info = attempt("bad");
+        info.transport = 7;
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        unsafe { lowlat_host_stop(handle) };
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// A browser is trusted by its digest and nothing else, so an attempt
+    /// on that pipe with none, or with one that is not a digest, is refused
+    /// with its own status.
+    #[test]
+    fn a_web_attempt_needs_a_fingerprint() {
+        let handle = started();
+        let mut info = web_attempt("web");
+        info.fingerprint = [0; LOWLAT_FINGERPRINT_MAX];
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_ERR_FINGERPRINT
+        );
+        put(&mut info.fingerprint, "sha-256 not:a:digest");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_ERR_FINGERPRINT
+        );
+        let text = unsafe { CStr::from_ptr(lowlat_status_string(LOWLAT_ERR_FINGERPRINT as i32)) };
+        assert_eq!(
+            text.to_str().unwrap(),
+            "the offer's certificate digest is missing or malformed"
+        );
+        unsafe { lowlat_host_stop(handle) };
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// A browser's answer carries the process certificate's digest with its
+    /// hash name, which the peer pastes into its own description, and no
+    /// media key, which the peer has no field for.
+    #[test]
+    fn a_web_answer_carries_the_certificate_fingerprint_and_no_media_key() {
+        let handle = started();
+        let info = web_attempt("web");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+        let mut ours = credentials();
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"web".as_ptr(), 0, &raw mut ours) },
+            LOWLAT_OK
+        );
+        let fingerprint = taken(&ours.fingerprint).expect("a digest");
+        assert!(fingerprint.starts_with("sha-256 "), "{fingerprint}");
+        assert_eq!(fingerprint.len(), 8 + 32 * 3 - 1, "{fingerprint}");
+        assert_eq!(
+            fingerprint,
+            lowlat_crypto::cert::certificate()
+                .unwrap()
+                .fingerprint_sdp()
+        );
+        assert_eq!(taken(&ours.aes256), Some(""));
+        assert_ne!(ours.port, 0);
+        unsafe { lowlat_host_stop(handle) };
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// Register and approve one attempt, which is what gives it a number.
+    pub(super) fn approved(handle: *mut lowlat_host, id: &str) {
+        let info = attempt(id);
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+        let mut ours = credentials();
+        let id = std::ffi::CString::new(id).expect("no interior nul");
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, id.as_ptr(), 0, &raw mut ours) },
+            LOWLAT_OK
+        );
+    }
+
+    pub(super) fn started() -> *mut lowlat_host {
+        let handle = handle();
+        let cfg = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        handle
+    }
+
+    fn credentials() -> lowlat_credentials {
+        lowlat_credentials {
+            size: u32::try_from(core::mem::size_of::<lowlat_credentials>()).unwrap_or(u32::MAX),
+            port: 0,
+            reserved: 0,
+            ufrag: [0; LOWLAT_ICE_MAX],
+            pwd: [0; LOWLAT_ICE_MAX],
+            fingerprint: [0; LOWLAT_FINGERPRINT_MAX],
+            aes256: [0; LOWLAT_ICE_MAX],
+        }
+    }
+
+    /// The four calls, in the order an application makes them.
+    #[test]
+    fn an_attempt_is_registered_approved_and_ended() {
+        let handle = started();
+        let info = attempt("a");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+
+        let mut ours = credentials();
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"a".as_ptr(), 0, &raw mut ours) },
+            LOWLAT_OK
+        );
+        // **The port that was bound, not the one that was configured.** The
+        // bind walks when a port is taken, and advertising the configured one
+        // produces a peer that answers checks and never establishes.
+        assert_ne!(ours.port, 0);
+        for field in [&ours.ufrag[..], &ours.pwd[..], &ours.fingerprint[..]] {
+            assert!(
+                taken(field).is_some_and(|text| !text.is_empty()),
+                "a credential came back empty"
+            );
+        }
+        assert_eq!(
+            taken(&ours.aes256).map(str::len),
+            Some(254),
+            "the media key is the field this array is sized for"
+        );
+        unsafe { lowlat_host_end_connection(handle, c"a".as_ptr()) };
+
+        // An offer without a media key selects the legacy cipher, and the
+        // answer states it: the field comes back empty for a peer generation
+        // that has no field to read.
+        let mut info = attempt("old");
+        info.aes256 = [0; LOWLAT_ICE_MAX];
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+        let mut legacy = credentials();
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"old".as_ptr(), 0, &raw mut legacy) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            taken(&legacy.aes256),
+            Some(""),
+            "a legacy answer carried a media key"
+        );
+        unsafe { lowlat_host_end_connection(handle, c"old".as_ptr()) };
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **Every refusal is its own status.** An application declines an offer
+    /// for a full host and retries a race with teardown; collapsing them into
+    /// one failure leaves it unable to tell which it is looking at.
+    #[test]
+    fn each_way_of_refusing_an_attempt_has_its_own_status() {
+        let handle = started();
+
+        // Approving something never registered.
+        let mut ours = credentials();
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"nothing".as_ptr(), 0, &raw mut ours) },
+            LOWLAT_ERR_UNKNOWN_ATTEMPT
+        );
+
+        // A withdrawal that overtook its own offer.
+        unsafe { lowlat_host_end_connection(handle, c"late".as_ptr()) };
+        let late = attempt("late");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const late) },
+            LOWLAT_ERR_WITHDRAWN
+        );
+
+        // Approving twice.
+        let info = attempt("a");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"a".as_ptr(), 0, &raw mut ours) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            unsafe { lowlat_host_begin_p2p(handle, c"a".as_ptr(), 0, &raw mut ours) },
+            LOWLAT_ERR_ALREADY_BEGUN
+        );
+
+        // And a full house. **Capacity counts guests that were approved, not
+        // offers that were registered**, so filling it means approving each
+        // one: registering costs bookkeeping and approving costs a socket and
+        // a thread, and it is the second that the limit exists to bound.
+        let mut ids: Vec<String> = Vec::new();
+        for extra in 0..8 {
+            let id = format!("guest{extra}");
+            let info = attempt(&id);
+            let status = unsafe { lowlat_host_new_attempt(handle, &raw const info) };
+            if status == LOWLAT_ERR_AT_CAPACITY {
+                for id in &ids {
+                    let id = std::ffi::CString::new(id.as_str()).expect("no interior nul");
+                    unsafe { lowlat_host_end_connection(handle, id.as_ptr()) };
+                }
+                unsafe { lowlat_host_end_connection(handle, c"a".as_ptr()) };
+                unsafe { lowlat_host_destroy(handle) };
+                return;
+            }
+            assert_eq!(status, LOWLAT_OK);
+            let id_c = std::ffi::CString::new(id.as_str()).expect("no interior nul");
+            assert_eq!(
+                unsafe { lowlat_host_begin_p2p(handle, id_c.as_ptr(), 0, &raw mut ours) },
+                LOWLAT_OK
+            );
+            ids.push(id);
+        }
+        panic!("the guest limit was never reached");
+    }
+
+    /// **An attempt with nothing to address it by is refused**, because every
+    /// later call in the seam finds it by that identifier.
+    #[test]
+    fn an_attempt_without_the_parts_that_identify_it_is_refused() {
+        let handle = started();
+        for spoil in [
+            (|info: &mut lowlat_attempt_info| info.attempt_id = [0; LOWLAT_ATTEMPT_MAX])
+                as fn(&mut lowlat_attempt_info),
+            |info| info.ufrag = [0; LOWLAT_ICE_MAX],
+            |info| info.pwd = [0; LOWLAT_ICE_MAX],
+            // A field with no terminator was overrun by whoever filled it.
+            |info| info.pwd = [b'x' as c_char; LOWLAT_ICE_MAX],
+            |info| info.size = 4,
+        ] {
+            let mut info = attempt("a");
+            spoil(&mut info);
+            assert_eq!(
+                unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+                LOWLAT_ERR_INVALID_ARGUMENT
+            );
+        }
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **A readiness marker carries no address and is still forwarded**, while
+    /// an ordinary candidate without one is refused. A peer may withhold every
+    /// real candidate until it has seen the marker.
+    #[test]
+    fn a_readiness_marker_needs_no_address_and_a_candidate_does() {
+        let handle = started();
+        let info = attempt("a");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_OK
+        );
+
+        let mut cand = lowlat_candidate {
+            size: u32::try_from(core::mem::size_of::<lowlat_candidate>()).unwrap_or(u32::MAX),
+            port: 41000,
+            sync: true,
+            reflexive: false,
+            lan: false,
+            address: [0; LOWLAT_ADDRESS_MAX],
+        };
+        // Accepted with nothing in the address at all.
+        unsafe { lowlat_host_add_candidate(handle, c"a".as_ptr(), &raw const cand) };
+
+        cand.sync = false;
+        put(&mut cand.address, "192.168.1.100");
+        unsafe { lowlat_host_add_candidate(handle, c"a".as_ptr(), &raw const cand) };
+
+        // **An unknown attempt is a race with teardown, not a fault**, so it
+        // is swallowed rather than reported.
+        unsafe { lowlat_host_add_candidate(handle, c"gone".as_ptr(), &raw const cand) };
+
+        unsafe { lowlat_host_end_connection(handle, c"a".as_ptr()) };
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// The seam needs a host. Registering against one that never started is a
+    /// mistake worth naming rather than a silent no-op.
+    #[test]
+    fn the_seam_refuses_a_handle_that_is_not_hosting() {
+        let handle = handle();
+        let info = attempt("a");
+        assert_eq!(
+            unsafe { lowlat_host_new_attempt(handle, &raw const info) },
+            LOWLAT_ERR_NOT_STARTED
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::seam_tests::{approved, started};
+    use super::*;
+
+    /// Read the whole roster, which several tests need.
+    pub(super) fn roster_of(handle: *mut lowlat_host) -> Vec<lowlat_guest> {
+        let mut count = 0u32;
+        assert_eq!(
+            unsafe { lowlat_host_get_guests(handle, core::ptr::null_mut(), &raw mut count) },
+            LOWLAT_OK
+        );
+        let mut room = vec![
+            lowlat_guest {
+                number: 0,
+                permissions: lowlat_permissions {
+                    keyboard: false,
+                    pointer: false,
+                    gamepad: false,
+                    reserved: 0,
+                },
+                owner: false,
+                reserved: [0; 3],
+                attempt: [0; LOWLAT_ATTEMPT_MAX],
+            };
+            count as usize
+        ];
+        assert_eq!(
+            unsafe { lowlat_host_get_guests(handle, room.as_mut_ptr(), &raw mut count) },
+            LOWLAT_OK
+        );
+        room.truncate(count as usize);
+        room
+    }
+
+    /// **Two calls, and the first one is allowed to answer with nothing.** An
+    /// application asks how many before it decides what to allocate.
+    #[test]
+    fn the_count_comes_first_and_the_roster_second() {
+        let handle = started();
+        let mut count = 0u32;
+        assert_eq!(
+            unsafe { lowlat_host_get_guests(handle, core::ptr::null_mut(), &raw mut count) },
+            LOWLAT_OK
+        );
+        assert_eq!(count, 0, "a host with no guests reported some");
+
+        approved(handle, "a");
+        approved(handle, "b");
+
+        let mut count = 0u32;
+        assert_eq!(
+            unsafe { lowlat_host_get_guests(handle, core::ptr::null_mut(), &raw mut count) },
+            LOWLAT_OK
+        );
+        assert_eq!(count, 2);
+
+        let mut room = [lowlat_guest {
+            number: 0,
+            permissions: lowlat_permissions {
+                keyboard: false,
+                pointer: false,
+                gamepad: false,
+                reserved: 0,
+            },
+            owner: false,
+            reserved: [0; 3],
+            attempt: [0; LOWLAT_ATTEMPT_MAX],
+        }; 4];
+        let mut count = 4u32;
+        assert_eq!(
+            unsafe { lowlat_host_get_guests(handle, room.as_mut_ptr(), &raw mut count) },
+            LOWLAT_OK
+        );
+        assert_eq!(count, 2);
+        // **Ordered by number.** A roster that reshuffles itself is one an
+        // application cannot diff against the last one it drew.
+        assert!(room[0].number < room[1].number);
+        assert!(room[0].permissions.keyboard && room[0].permissions.pointer);
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **A buffer too small is filled as far as it goes and says what it
+    /// needed.** The roster moves; a caller that sized its array a moment ago
+    /// must not lose the call for it.
+    #[test]
+    fn a_roster_larger_than_the_buffer_reports_what_it_needed() {
+        let handle = started();
+        approved(handle, "a");
+        approved(handle, "b");
+
+        let mut room = [lowlat_guest {
+            number: 0,
+            permissions: lowlat_permissions {
+                keyboard: false,
+                pointer: false,
+                gamepad: false,
+                reserved: 0,
+            },
+            owner: false,
+            reserved: [0; 3],
+            attempt: [0; LOWLAT_ATTEMPT_MAX],
+        }; 1];
+        let mut count = 1u32;
+        assert_eq!(
+            unsafe { lowlat_host_get_guests(handle, room.as_mut_ptr(), &raw mut count) },
+            LOWLAT_ERR_TOO_SMALL
+        );
+        assert_eq!(count, 2, "it did not say how many there really were");
+        assert_ne!(room[0].number, 0, "the room it had was left unfilled");
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **The roster reaches everybody and is not a message.** A peer has no way
+    /// to ask for one, and it finds itself in the list by number; a host that
+    /// never sends one leaves every guest not knowing what it is.
+    #[test]
+    fn a_roster_reaches_every_guest_and_an_empty_room_is_not_a_failure() {
+        let handle = started();
+        let body = br#"[{"id":1}]"#;
+
+        // Nobody seated: reaching zero guests is what an empty room means.
+        let mut reached = u32::MAX;
+        assert_eq!(
+            unsafe {
+                lowlat_host_send_roster(
+                    handle,
+                    body.as_ptr().cast(),
+                    u32::try_from(body.len()).unwrap_or(0),
+                    &raw mut reached,
+                )
+            },
+            LOWLAT_OK
+        );
+        assert_eq!(reached, 0);
+
+        approved(handle, "a");
+        approved(handle, "b");
+        let mut reached = 0u32;
+        assert_eq!(
+            unsafe {
+                lowlat_host_send_roster(
+                    handle,
+                    body.as_ptr().cast(),
+                    u32::try_from(body.len()).unwrap_or(0),
+                    &raw mut reached,
+                )
+            },
+            LOWLAT_OK
+        );
+        assert_eq!(reached, 2, "the roster did not reach both guests");
+
+        // Past what a peer accepts, refused here rather than at a far end that
+        // says nothing about why it vanished.
+        let huge = vec![b'x'; lowlat_core::control::USER_DATA_MAX];
+        assert_eq!(
+            unsafe {
+                lowlat_host_send_roster(
+                    handle,
+                    huge.as_ptr().cast(),
+                    u32::try_from(huge.len()).unwrap_or(u32::MAX),
+                    core::ptr::null_mut(),
+                )
+            },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// A message aimed at nobody in particular reaches everyone, and one aimed
+    /// at a guest that is not there says so.
+    #[test]
+    fn a_message_reaches_a_guest_or_says_it_could_not() {
+        let handle = started();
+        approved(handle, "a");
+
+        let body = b"hello";
+        assert_eq!(
+            unsafe {
+                lowlat_host_send_user_data(
+                    handle,
+                    LOWLAT_GUEST_ALL,
+                    9,
+                    body.as_ptr().cast(),
+                    u32::try_from(body.len()).unwrap_or(0),
+                )
+            },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            unsafe { lowlat_host_send_user_data(handle, 4242, 9, body.as_ptr().cast(), 5) },
+            LOWLAT_ERR_UNKNOWN_GUEST
+        );
+
+        // **A body past what a peer accepts is refused here**, where the
+        // caller can still do something, rather than at a far end that says
+        // nothing about why it vanished.
+        let huge = vec![b'x'; lowlat_core::control::USER_DATA_MAX];
+        assert_eq!(
+            unsafe {
+                lowlat_host_send_user_data(
+                    handle,
+                    LOWLAT_GUEST_ALL,
+                    9,
+                    huge.as_ptr().cast(),
+                    u32::try_from(huge.len()).unwrap_or(u32::MAX),
+                )
+            },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+
+        // An empty body is a message, not a mistake: the sub-identifier alone
+        // is what some of them mean.
+        assert_eq!(
+            unsafe {
+                lowlat_host_send_user_data(handle, LOWLAT_GUEST_ALL, 9, core::ptr::null(), 0)
+            },
+            LOWLAT_OK
+        );
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod guest_tests {
+    use super::roster_tests::roster_of;
+    use super::seam_tests::{approved, started};
+    use super::*;
+
+    /// **Permissions are recorded here and applied there**, so the roster
+    /// answers with the new ones straight away while the guest's own devices
+    /// pick them up on its next pass.
+    #[test]
+    fn changed_permissions_show_in_the_roster_at_once() {
+        let handle = started();
+        approved(handle, "a");
+        let before = roster_of(handle);
+        assert!(before[0].permissions.keyboard && before[0].permissions.gamepad);
+
+        let perms = lowlat_permissions {
+            keyboard: false,
+            pointer: true,
+            gamepad: false,
+            reserved: 0,
+        };
+        assert_eq!(
+            unsafe { lowlat_host_set_permissions(handle, before[0].number, &raw const perms) },
+            LOWLAT_OK
+        );
+        let after = roster_of(handle);
+        assert!(
+            !after[0].permissions.keyboard && after[0].permissions.pointer,
+            "the roster still reports what signaling said, not what was set"
+        );
+
+        assert_eq!(
+            unsafe { lowlat_host_set_permissions(handle, 4242, &raw const perms) },
+            LOWLAT_ERR_UNKNOWN_GUEST
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **A guest is kicked with a reason, and zero is not one.** A peer carries
+    /// on through a status of zero, so kicking with it tells the guest nothing
+    /// and leaves it exactly where it was.
+    #[test]
+    fn a_kick_needs_a_reason_a_peer_will_stop_on() {
+        let handle = started();
+        approved(handle, "a");
+        let guest = roster_of(handle)[0].number;
+
+        assert_eq!(
+            unsafe { lowlat_host_kick_guest(handle, guest, 0) },
+            LOWLAT_ERR_INVALID_ARGUMENT,
+            "a status a peer ignores was accepted as a reason to end it"
+        );
+        assert_eq!(
+            unsafe { lowlat_host_kick_guest(handle, 4242, -15000) },
+            LOWLAT_ERR_UNKNOWN_GUEST
+        );
+        assert_eq!(
+            unsafe { lowlat_host_kick_guest(handle, guest, -15000) },
+            LOWLAT_OK
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod pad_sink_tests {
+    use super::start_tests::{config, handle};
+    use super::*;
+    use ::lowlat_host::padsink::Report;
+    use lowlat_core::pad::Product;
+    use lowlat_inject::Forwarded;
+
+    struct Polled {
+        status: lowlat_status,
+        guest: u32,
+        pad: u32,
+        type_: lowlat_pad_type,
+        kind: lowlat_pad_report,
+        len: u32,
+        dropped: u32,
+        report: [u8; LOWLAT_PAD_REPORT_MAX as usize],
+    }
+
+    fn poll(handle: *mut lowlat_host, timeout_ms: u32) -> Polled {
+        let mut polled = Polled {
+            status: LOWLAT_OK,
+            guest: 0,
+            pad: 0,
+            // Neither is what the reports below come out as.
+            type_: lowlat_pad_type::LOWLAT_PAD_TYPE_DS5,
+            kind: lowlat_pad_report::LOWLAT_PAD_REPORT_OUTPUT,
+            len: LOWLAT_PAD_REPORT_MAX,
+            dropped: 0,
+            report: [0; LOWLAT_PAD_REPORT_MAX as usize],
+        };
+        polled.status = unsafe {
+            lowlat_host_poll_pad_report(
+                handle,
+                timeout_ms,
+                &raw mut polled.guest,
+                &raw mut polled.pad,
+                &raw mut polled.type_,
+                &raw mut polled.kind,
+                polled.report.as_mut_ptr(),
+                &raw mut polled.len,
+                &raw mut polled.dropped,
+            )
+        };
+        polled
+    }
+
+    /// **The poll answers only a host started with the application as the
+    /// sink**, and refuses rather than waits otherwise; the buffer must hold
+    /// the longest report.
+    #[test]
+    fn the_poll_is_refused_unless_the_application_is_the_sink() {
+        let handle = handle();
+        assert_eq!(poll(handle, 0).status, LOWLAT_ERR_NOT_STARTED);
+        let cfg = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let began = lowlat_common::clock::Time::now();
+        assert_eq!(poll(handle, 500).status, LOWLAT_ERR_NOT_STARTED);
+        assert!(
+            lowlat_common::clock::elapsed_ms(began) < 100.0,
+            "waited out a timeout for a report that cannot come"
+        );
+        assert_eq!(unsafe { lowlat_host_stop(handle) }, LOWLAT_OK);
+
+        let mut cfg = config();
+        cfg.pad_sink = lowlat_pad_sink::LOWLAT_PAD_SINK_APP as u8;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let began = lowlat_common::clock::Time::now();
+        let polled = poll(handle, 30);
+        assert_eq!(polled.status, LOWLAT_TIMEOUT);
+        assert_eq!(polled.len, 0);
+        assert!(lowlat_common::clock::elapsed_ms(began) >= 25.0, "spun");
+        let mut len = 64u32;
+        let (mut guest, mut pad, mut type_, mut kind) = (
+            0u32,
+            0u32,
+            lowlat_pad_type::LOWLAT_PAD_TYPE_DS5,
+            lowlat_pad_report::LOWLAT_PAD_REPORT_OUTPUT,
+        );
+        let mut small = [0u8; 64];
+        assert_eq!(
+            unsafe {
+                lowlat_host_poll_pad_report(
+                    handle,
+                    0,
+                    &raw mut guest,
+                    &raw mut pad,
+                    &raw mut type_,
+                    &raw mut kind,
+                    small.as_mut_ptr(),
+                    &raw mut len,
+                    core::ptr::null_mut(),
+                )
+            },
+            LOWLAT_ERR_TOO_SMALL
+        );
+        assert_eq!(len, LOWLAT_PAD_REPORT_MAX);
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **What a guest's injector forwards comes out as the boundary names
+    /// it**: the guest, the pad, the product, the kind, the report and its
+    /// length; a pad's end with no report.
+    #[test]
+    fn a_forwarded_report_comes_out_named_and_a_pads_end_after_it() {
+        let handle = handle();
+        let mut cfg = config();
+        cfg.pad_sink = lowlat_pad_sink::LOWLAT_PAD_SINK_APP as u8;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let calibration: &[u8] =
+            include_bytes!("../../../core/tests/data/pad/ds4/feature-calibration.bin");
+        let idle: &[u8; 64] = include_bytes!("../../../core/tests/data/pad/ds4/input-idle.bin");
+        let mut feature = [0u8; 64];
+        feature[..calibration.len()].copy_from_slice(calibration);
+        // As the guest thread does it, straight into the handle's queue.
+        let sink = unsafe { &(*handle).report };
+        sink.send(Report::of(
+            7,
+            Forwarded::Feature {
+                pad: 3,
+                product: Product::DualShock4,
+                len: calibration.len(),
+                report: feature,
+            },
+        ));
+        sink.send(Report::of(
+            7,
+            Forwarded::Input {
+                pad: 3,
+                product: Product::DualShock4,
+                report: *idle,
+            },
+        ));
+        sink.send(Report::of(
+            7,
+            Forwarded::Unplugged {
+                pad: 3,
+                product: Product::DualShock4,
+            },
+        ));
+
+        let polled = poll(handle, 1000);
+        assert_eq!(polled.status, LOWLAT_OK);
+        assert_eq!((polled.guest, polled.pad), (7, 3));
+        assert_eq!(polled.type_, lowlat_pad_type::LOWLAT_PAD_TYPE_DS4);
+        assert_eq!(polled.kind, lowlat_pad_report::LOWLAT_PAD_REPORT_FEATURE);
+        assert_eq!(polled.len as usize, calibration.len());
+        assert_eq!(&polled.report[..calibration.len()], calibration);
+        assert_eq!(polled.dropped, 0);
+
+        let polled = poll(handle, 1000);
+        assert_eq!(polled.status, LOWLAT_OK);
+        assert_eq!(polled.kind, lowlat_pad_report::LOWLAT_PAD_REPORT_INPUT);
+        assert_eq!(polled.len, 64);
+        assert_eq!(&polled.report[..64], idle);
+
+        let polled = poll(handle, 1000);
+        assert_eq!(polled.status, LOWLAT_OK);
+        assert_eq!(polled.kind, lowlat_pad_report::LOWLAT_PAD_REPORT_UNPLUG);
+        assert_eq!(polled.len, 0);
+        assert_eq!(poll(handle, 0).status, LOWLAT_TIMEOUT);
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **How long a report takes to reach a parked poll**, from the guest
+    /// thread's push to the application's return, at a wired DualSense's
+    /// rate. Not asserted -- the figure is the machine's -- but printed, for
+    /// the phase's gate (docs/05-host.md section 7.2 promises one
+    /// cross-thread wake). Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn the_polls_wake_is_measured() {
+        use std::time::{Duration, Instant};
+
+        let handle = handle();
+        let mut cfg = config();
+        cfg.pad_sink = lowlat_pad_sink::LOWLAT_PAD_SINK_APP as u8;
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        const REPORTS: usize = 2000;
+        let sink = unsafe { (*handle).report.clone() };
+        let sent: std::sync::Arc<std::sync::Mutex<Vec<Instant>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(REPORTS)));
+        let stamps = std::sync::Arc::clone(&sent);
+        let producer = std::thread::spawn(move || {
+            for i in 0..REPORTS {
+                std::thread::sleep(Duration::from_millis(4));
+                let mut report = [0u8; 64];
+                report[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+                stamps.lock().unwrap().push(Instant::now());
+                sink.send(Report::of(
+                    1,
+                    Forwarded::Input {
+                        pad: 3,
+                        product: Product::DualSense,
+                        report,
+                    },
+                ));
+            }
+        });
+        let mut waits = Vec::with_capacity(REPORTS);
+        for _ in 0..REPORTS {
+            let polled = poll(handle, 1000);
+            let arrived = Instant::now();
+            assert_eq!(polled.status, LOWLAT_OK);
+            let i = usize::try_from(u64::from_le_bytes(polled.report[..8].try_into().unwrap()))
+                .unwrap();
+            let stamped = sent.lock().unwrap()[i];
+            waits.push(arrived.duration_since(stamped).as_secs_f64() * 1e6);
+        }
+        producer.join().unwrap();
+        waits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |q: usize| waits[(waits.len() - 1) * q / 100];
+        println!(
+            "pad report poll wake, {REPORTS} reports at 250 Hz: p50={:.1}us p95={:.1}us p99={:.1}us max={:.1}us",
+            at(50),
+            at(95),
+            at(99),
+            waits[waits.len() - 1]
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// The way back refuses a kind that does not go that way -- a feature
+    /// write among them, which stays on the host -- and a report no pad takes,
+    /// and says when nobody was there to take it.
+    #[test]
+    fn a_report_sent_back_is_checked_at_the_call() {
+        let handle = handle();
+        let report = [0x05u8; 32];
+        let output = lowlat_pad_report::LOWLAT_PAD_REPORT_OUTPUT as u32;
+        assert_eq!(
+            unsafe { lowlat_host_send_pad_report(handle, 1, 3, output, report.as_ptr(), 32) },
+            LOWLAT_ERR_NOT_STARTED
+        );
+        let cfg = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        let input = lowlat_pad_report::LOWLAT_PAD_REPORT_INPUT as u32;
+        assert_eq!(
+            unsafe { lowlat_host_send_pad_report(handle, 1, 3, input, report.as_ptr(), 32) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        let feature = lowlat_pad_report::LOWLAT_PAD_REPORT_FEATURE as u32;
+        assert_eq!(
+            unsafe { lowlat_host_send_pad_report(handle, 1, 3, feature, report.as_ptr(), 32) },
+            LOWLAT_ERR_INVALID_ARGUMENT,
+            "a feature write left the host"
+        );
+        assert_eq!(
+            unsafe { lowlat_host_send_pad_report(handle, 1, 3, output, report.as_ptr(), 0) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        let long = [0u8; 65];
+        assert_eq!(
+            unsafe { lowlat_host_send_pad_report(handle, 1, 3, output, long.as_ptr(), 65) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe { lowlat_host_send_pad_report(handle, 1, 3, output, report.as_ptr(), 32) },
+            LOWLAT_ERR_UNKNOWN_GUEST
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use ::lowlat_host::display::Capturable;
+
+    /// **Each way of not being able to capture keeps its own status.** The two
+    /// are indistinguishable once hosting has failed, which is the whole
+    /// reason for asking beforehand: measured on a real display, an
+    /// unprivileged process in the `video` group enumerates the output and
+    /// reads its framebuffer and still gets no buffer handles, while the same
+    /// binary as root gets them.
+    #[test]
+    fn every_answer_the_preflight_can_give_has_its_own_status() {
+        for (found, expected) in [
+            (Capturable::Yes, LOWLAT_OK),
+            (Capturable::NothingLit, LOWLAT_ERR_NO_DISPLAY),
+            (Capturable::NotReachable, LOWLAT_ERR_DISPLAY_UNREACHABLE),
+        ] {
+            assert_eq!(status_of(found), expected);
+        }
+        // And the live answer is one of them rather than something else.
+        let answer = lowlat_can_host();
+        assert!(
+            [
+                LOWLAT_OK,
+                LOWLAT_ERR_NO_DISPLAY,
+                LOWLAT_ERR_DISPLAY_UNREACHABLE
+            ]
+            .contains(&answer),
+            "the pre-flight answered {answer:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::seam_tests::approved;
+    use super::start_tests::{config, handle};
+    use super::*;
+
+    fn empty_status() -> lowlat_host_status {
+        lowlat_host_status {
+            size: u32::try_from(core::mem::size_of::<lowlat_host_status>()).unwrap_or(u32::MAX),
+            guests: 0,
+            width: 0,
+            height: 0,
+            running: false,
+            audio_active: false,
+            ten_bit: false,
+            reserved: [0; 1],
+            codec: lowlat_codec::LOWLAT_CODEC_NONE,
+            chroma: lowlat_chroma::LOWLAT_CHROMA_NONE,
+            audio_device: [0; LOWLAT_OUTPUT_MAX],
+        }
+    }
+
+    /// **A handle that is not hosting answers too.** An application asking
+    /// what state something is in should not have to know the answer to ask
+    /// the question.
+    #[test]
+    fn status_answers_before_hosting_and_after() {
+        let handle = handle();
+        let mut status = empty_status();
+        assert_eq!(
+            unsafe { lowlat_host_get_status(handle, &raw mut status) },
+            LOWLAT_OK
+        );
+        assert!(!status.running && status.guests == 0);
+
+        let cfg = config();
+        assert_eq!(
+            unsafe { lowlat_host_start(handle, &raw const cfg) },
+            LOWLAT_OK
+        );
+        approved(handle, "a");
+        let mut status = empty_status();
+        assert_eq!(
+            unsafe { lowlat_host_get_status(handle, &raw mut status) },
+            LOWLAT_OK
+        );
+        assert!(status.running);
+        assert_eq!(status.guests, 1);
+
+        // **Zero before a display has been opened**, which is the honest
+        // answer rather than the size that was configured -- there is no such
+        // size, and reporting one would describe a stream nobody is making.
+        assert_eq!((status.width, status.height), (0, 0));
+
+        // And sound the same way: nothing is being read here, whatever it is
+        // configured to do, so the device it is on is nothing rather than the
+        // name that was asked for.
+        assert!(!status.audio_active);
+        assert_eq!(taken(&status.audio_device), Some(""));
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::roster_tests::roster_of;
+    use super::seam_tests::{approved, started};
+    use super::*;
+
+    fn empty() -> lowlat_metrics {
+        lowlat_metrics {
+            size: u32::try_from(core::mem::size_of::<lowlat_metrics>()).unwrap_or(u32::MAX),
+            connected_ms: 0,
+            keyboard_ms: 0,
+            pointer_ms: 0,
+            gamepad_ms: 0,
+            frames: 0,
+            window: 0,
+            stale: 0,
+            cg_events: 0,
+            network_ms: 0.0,
+            control: lowlat_channel_metrics::default(),
+            audio: lowlat_channel_metrics::default(),
+            video: lowlat_channel_metrics::default(),
+        }
+    }
+
+    /// **A guest carries the attempt it was registered under.** Everything
+    /// before a guest is seated is addressed by attempt and everything after by
+    /// number; without the link an application holding one peer per attempt
+    /// cannot tell which peer an event about a guest concerns.
+    #[test]
+    fn a_guest_carries_the_attempt_it_was_registered_under() {
+        let handle = started();
+        approved(handle, "an-attempt-with-a-name");
+
+        let roster = roster_of(handle);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            taken(&roster[0].attempt).unwrap_or_default(),
+            "an-attempt-with-a-name"
+        );
+        unsafe { lowlat_host_destroy(handle) };
+    }
+
+    /// **Never is not zero milliseconds ago.** An application kicking idle
+    /// guests reads these two the same way and must be able to tell them apart:
+    /// a guest that has touched nothing since it arrived is not a guest that
+    /// touched the keyboard as the session opened.
+    #[test]
+    fn metrics_answer_for_a_seated_guest_and_say_never_where_nothing_happened() {
+        let handle = started();
+        approved(handle, "a");
+        let guest = roster_of(handle)[0].number;
+
+        let mut metrics = empty();
+        assert_eq!(
+            unsafe { lowlat_host_get_metrics(handle, guest, &raw mut metrics) },
+            LOWLAT_OK
+        );
+        assert_eq!(
+            metrics.keyboard_ms, 0,
+            "a guest that has sent nothing reported a time it last did"
+        );
+        assert_eq!(metrics.pointer_ms, 0);
+        assert_eq!(metrics.gamepad_ms, 0);
+
+        assert_eq!(
+            unsafe { lowlat_host_get_metrics(handle, 4242, &raw mut metrics) },
+            LOWLAT_ERR_UNKNOWN_GUEST
+        );
+        // The size field is the versioning, and one saying less than the
+        // structure holds means the caller and the header disagree.
+        let mut stale = empty();
+        stale.size = 4;
+        assert_eq!(
+            unsafe { lowlat_host_get_metrics(handle, guest, &raw mut stale) },
+            LOWLAT_ERR_INVALID_ARGUMENT
+        );
+
+        unsafe { lowlat_host_destroy(handle) };
+    }
+}

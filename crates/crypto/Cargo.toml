@@ -1,0 +1,37 @@
+[package]
+name = "lowlat-crypto"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The one entropy source in the workspace. Small, audited, and a thin wrapper
+# over the platform call rather than a userspace generator with state to leak.
+getrandom.workspace = true
+
+# The browser transport's identity: a P-256 key pair in a self-signed
+# certificate, which a peer trusts by SHA-256 digest alone. The same crates,
+# at the same versions, that the handshake library resolves, so nothing is
+# duplicated in the graph.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
+ecdsa = { version = "0.17", default-features = false, features = ["der", "pkcs8", "pem", "algorithm"] }
+x509-cert = { version = "0.3", default-features = false, features = ["builder", "std"] }
+sha2 = { version = "0.11", default-features = false, features = ["oid"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# The record cipher, lent to the core's envelope: AES-GCM from a vetted
+# library that picks the processor's widest AES and carry-less multiply
+# instructions at run time and constant-time software where there are none.
+# About four times the core's portable implementation on a full datagram. The
+# core cannot hold it: it always brings a random source, which the core must
+# be unable to reach. Already in the graph as the signaling TLS provider.
+# Also the keyed hash an identifier tied to a machine is reduced with.
+ring = { version = "0.17", default-features = false }
+# The envelope's construction, which the record cipher implements.
+lowlat-core.workspace = true
+
+[lints]
+workspace = true

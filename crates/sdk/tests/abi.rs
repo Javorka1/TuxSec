@@ -1,0 +1,1201 @@
+//! The C ABI's three mechanical gates ([`docs/06-api.md`]).
+//!
+//! Each one guards something that fails silently: a header that drifted from
+//! the definitions it describes, a header that only compiles in one language,
+//! a panic that crosses the boundary as undefined behaviour, and a symbol
+//! exported without the prefix that makes a mismatch a link error instead of
+//! memory corruption.
+//!
+//! **They run against the built shared object, not against this crate.** That
+//! is the whole point of them: the library form linked into this test answers
+//! for this test's build settings, and what ships is the other one.
+//!
+//! On Windows the same gates run with the platform's own tools -- its C
+//! compiler and its dump of an export table, found in the Visual Studio
+//! installation -- against the library that ships there. On macOS they run
+//! with the system's compiler and symbol lister against a library that
+//! carries the client half alone.
+
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The shared object's file name, as the platform's linker names it.
+#[cfg(target_os = "linux")]
+const OBJECT: &str = "liblowlat.so";
+#[cfg(target_os = "macos")]
+const OBJECT: &str = "liblowlat.dylib";
+#[cfg(windows)]
+const OBJECT: &str = "lowlat.dll";
+
+/// Where the repository is, from where this crate is.
+///
+/// **Not canonicalized**: a canonical path on Windows is in the verbatim
+/// form, which the platform's C compiler cannot open. The manifest's
+/// directory is absolute already.
+fn root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the workspace root is two levels above this crate")
+        .to_path_buf()
+}
+
+/// The profile directory this test was built into, which is also where cargo
+/// puts the shared object.
+///
+/// **Found by name, not by depth.** Where a test executable sits under the
+/// profile directory has changed between cargo versions -- `deps/` in one,
+/// `build/<crate>/<hash>/out/` in another -- and the shared object is put in
+/// the profile directory by both.
+fn artifacts() -> PathBuf {
+    let exe = std::env::current_exe().expect("a running test has a path");
+    exe.ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name == "debug" || name == "release")
+        })
+        .expect("a test executable lives under a profile directory")
+        .to_path_buf()
+}
+
+/// The target triple this test was built for, when one was named.
+///
+/// A build for a named target lands one directory deeper than the target
+/// directory itself, so the triple is the directory between the two. The
+/// target directory is the workspace's unless the environment moved it.
+fn named_target(profile: &Path) -> Option<String> {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root().join("target"), PathBuf::from)
+        .canonicalize()
+        .ok()?;
+    let parent = profile.parent()?.canonicalize().ok()?;
+    if parent == target_dir {
+        return None;
+    }
+    parent.file_name()?.to_str().map(str::to_owned)
+}
+
+/// The flags with any sanitizer request taken out, in either spelling.
+fn without_sanitizer(flags: &str) -> String {
+    let mut kept = Vec::new();
+    let mut tokens = flags.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token.starts_with("-Zsanitizer=") {
+            continue;
+        }
+        if token == "-Z"
+            && tokens
+                .peek()
+                .is_some_and(|next| next.starts_with("sanitizer="))
+        {
+            tokens.next();
+            continue;
+        }
+        kept.push(token);
+    }
+    kept.join(" ")
+}
+
+/// The shared object, which is what every check here is really about.
+///
+/// **Built here, because `cargo test` does not build it.** A test binary
+/// depends on the library form and nothing asks for the shared one, so the
+/// file sitting in the profile directory is whatever some earlier command left
+/// there. That was not a theory: removing the containment from
+/// `lowlat_debug_panic` and running this suite passed, against an object eight
+/// hours old. A gate that tests yesterday's artifact reports on yesterday.
+fn shared_object() -> PathBuf {
+    let profile = artifacts();
+    let built = cargo_into(&profile, &["build", "--quiet", "-p", "lowlat-sdk"])
+        .output()
+        .expect("cargo builds the shared object");
+    assert!(
+        built.status.success(),
+        "the shared object could not be built:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let object = profile.join(OBJECT);
+    assert!(object.is_file(), "{} was not produced", object.display());
+    object
+}
+
+/// The static library, built here for the same reason the shared object is,
+/// and asked for by name: the crate's own list of kinds leaves it out, so
+/// that no other build spends its link on one.
+///
+/// **Always the release build, whatever this test was**, because that is the
+/// one that names its system libraries: optimized whole, it is a single
+/// object that holds the entry points and the directives together, and the
+/// linker reads the directives of the members it takes. A debug build keeps
+/// every crate's objects apart -- half a gigabyte of them -- and the one with
+/// the directives is never taken.
+#[cfg(any(target_os = "macos", windows))]
+fn static_library() -> PathBuf {
+    let profile = artifacts().with_file_name("release");
+    let args = [
+        "rustc",
+        "--quiet",
+        "-p",
+        "lowlat-sdk",
+        "--crate-type",
+        "staticlib",
+    ];
+    let built = cargo_into(&profile, &args)
+        .output()
+        .expect("cargo builds the static library");
+    assert!(
+        built.status.success(),
+        "the static library could not be built:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let library = profile.join(if cfg!(windows) {
+        "lowlat.lib"
+    } else {
+        "liblowlat.a"
+    });
+    assert!(library.is_file(), "{} was not produced", library.display());
+    library
+}
+
+/// cargo, building into `profile` with the outer build's settings.
+fn cargo_into(profile: &Path, args: &[&str]) -> Command {
+    let mut build = Command::new(env!("CARGO"));
+    build.args(args);
+    // The test profile decides which directory this is running from, and the
+    // build has to land in the same one.
+    if profile.file_name().is_some_and(|name| name == "release") {
+        build.arg("--release");
+    }
+    // **Named again when it was named.** Naming the target is what keeps the
+    // flags the outer build was given -- a sanitizer among them -- off the
+    // proc macros, which cargo compiles for the host only when a target is
+    // named. Without it a sanitized derive cannot be loaded by the compiler
+    // and the build fails on a crate it cannot find.
+    if let Some(triple) = named_target(profile) {
+        build.args(["--target", &triple]);
+    }
+    // **Unsanitized, whatever this test was.** The library is opened or
+    // linked by a C harness compiled with no sanitizer runtime, and one built
+    // with one fails on that runtime's own symbols. What these tests check of
+    // it -- its exported names, a panic held at the boundary -- is the same
+    // either way; the library's own tests are what a sanitizer sees.
+    // **Passed on only when it was set**: the variable replaces the
+    // configuration's flags rather than adding to them, even empty, and on
+    // Windows those carry the static C runtime the library ships with.
+    if let Ok(flags) = std::env::var("RUSTFLAGS") {
+        build.env("RUSTFLAGS", without_sanitizer(&flags));
+    }
+    build
+}
+
+/// A scratch directory under the profile, so nothing lands in the source tree
+/// and a second run starts clean.
+fn scratch(name: &str) -> PathBuf {
+    let dir = artifacts().join("abi-gate").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch directory under the profile");
+    dir
+}
+
+/// Generate the header from the definitions, exactly as the committed one was.
+///
+/// **From this crate, which holds nothing but the boundary.** Generating from
+/// a crate publishes every `pub const` in it, which is why the orchestration
+/// lives in `lowlat-host` and not here: a type crossing the boundary is
+/// defined in this crate, because a type from anywhere else cannot be seen
+/// from the generator. Parsing the crate rather than one file is what carries
+/// the feature on a module down to every item in it, so the host half comes
+/// out under `LOWLAT_HOST`.
+fn generate() -> String {
+    let crate_dir = env!("CARGO_MANIFEST_DIR");
+    let config = cbindgen::Config::from_root_or_default(crate_dir);
+    let bindings = cbindgen::Builder::new()
+        .with_crate(crate_dir)
+        .with_config(config)
+        .generate()
+        .expect("the definitions parse");
+    let mut out = Vec::new();
+    bindings.write(&mut out);
+    let header = String::from_utf8(out).expect("the generated header is text");
+    to_doxygen(&realign_wrapped_arguments(&use_typedef_names(
+        &merge_feature_guards(&join_field_guards(&width_under_a_macro(&header))),
+    )))
+}
+
+/// One `typedef enum` for both languages, its width under a macro.
+///
+/// **The generator writes a width as declarations forked on the language and
+/// the C standard**: the enumeration with `: uint32_t` under C++ or C23 --
+/// testing `__STDC_VERSION__`, a macro MSVC leaves undefined in its own
+/// default C mode -- and the name as the integer before C23. This writes
+/// `typedef enum lowlat_status LOWLAT_ENUM_BASE(int32_t) { ... }
+/// lowlat_status;` instead: the width in C++, where the header defines the
+/// macro as it, the platform's enumeration in C, and the tag and the name one
+/// type in both.
+fn width_under_a_macro(header: &str) -> String {
+    const OPEN: &str = "#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L";
+    const CLOSE: &str = "#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L";
+    let lines: Vec<&str> = header.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let Some(name) = line
+            .strip_prefix("enum ")
+            .filter(|_| lines.get(i + 1) == Some(&OPEN))
+        else {
+            out.push(line.to_owned());
+            i += 1;
+            continue;
+        };
+        let width = lines
+            .get(i + 2)
+            .and_then(|width| width.trim().strip_prefix(": "))
+            .filter(|_| lines.get(i + 3) == Some(&CLOSE) && lines.get(i + 4) == Some(&" {"))
+            .unwrap_or_else(|| panic!("the width of {name} changed shape"));
+        out.push(format!("typedef enum {name} LOWLAT_ENUM_BASE({width}) {{"));
+        i += 5;
+        // The enumerators, then the close, which takes the name.
+        while lines.get(i).is_some_and(|line| *line != "};") {
+            out.push(lines[i].to_owned());
+            i += 1;
+        }
+        out.push(format!("}} {name};"));
+        i += 1;
+        // The C declarations of the name follow, which the typedef now is.
+        let declared = [
+            "#ifndef __cplusplus".to_owned(),
+            "#if __STDC_VERSION__ >= 202311L".to_owned(),
+            format!("typedef enum {name} {name};"),
+            "#else".to_owned(),
+            format!("typedef {width} {name};"),
+            "#endif // __STDC_VERSION__ >= 202311L".to_owned(),
+            "#endif // __cplusplus".to_owned(),
+        ];
+        assert!(
+            declared
+                .iter()
+                .enumerate()
+                .all(|(k, want)| lines.get(i + k) == Some(&want.as_str())),
+            "the C declaration of {name} changed shape"
+        );
+        i += declared.len();
+    }
+    let mut rewritten = out.join("\n");
+    if header.ends_with('\n') {
+        rewritten.push('\n');
+    }
+    assert!(
+        !rewritten.contains("__STDC_VERSION__"),
+        "the header tests a C standard's version"
+    );
+    rewritten
+}
+
+/// One guard around a run of fields only one platform has, each field whole
+/// inside it.
+///
+/// **The generator guards a field without its semicolon**, which it writes
+/// after the guard closes, so elsewhere the structure holds a lone `;` -- an
+/// empty declaration, which C does not have -- and each field of a run wears
+/// a guard of its own. This puts each semicolon back on its field and lets one
+/// guard cover a run.
+fn join_field_guards(header: &str) -> String {
+    const GUARD: &str = "#if defined(_WIN32)";
+    let lines: Vec<&str> = header.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line == "#endif" && lines.get(i + 1).is_some_and(|next| next.trim() == ";") {
+            let field = out
+                .last_mut()
+                .expect("a guard closes after the field it guards");
+            field.push(';');
+            // The next field's guard opens at once: the run goes on under this
+            // one.
+            if lines.get(i + 2) == Some(&GUARD) {
+                i += 3;
+            } else {
+                out.push(line.to_owned());
+                i += 2;
+            }
+            continue;
+        }
+        out.push(line.to_owned());
+        i += 1;
+    }
+    let mut joined = out.join("\n");
+    if header.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// One guard around a run of items, not one around each.
+///
+/// **The generator guards every item it derives a feature for, members
+/// included**, so a half comes out as a hundred `#if`/`#endif` pairs, one per
+/// constant, and each enumerator inside an already guarded enumeration wears
+/// its own. This drops a guard opened inside the same guard, and closes and
+/// reopens nothing between two neighbours under the same one, so the header
+/// reads as the two halves it is. Only the feature guards are touched; the
+/// `#pragma`, the C++ fences and the `noexcept` block go through untouched.
+fn merge_feature_guards(header: &str) -> String {
+    // The host half is no Apple build's, so its guards name that too.
+    const GUARDS: [&str; 5] = [
+        "#if (defined(LOWLAT_HOST) && !defined(__APPLE__))",
+        "#if defined(LOWLAT_CLIENT)",
+        "#if (defined(LOWLAT_HOST) || defined(LOWLAT_CLIENT))",
+        "#if (defined(LOWLAT_VDD) && defined(_WIN32))",
+        "#if ((defined(LOWLAT_HOST) && !defined(__APPLE__)) && defined(_WIN32))",
+    ];
+    let lines: Vec<&str> = header.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    // Every open `#if`, feature or not; a feature guard remembers whether it
+    // was emitted (the outermost of its kind) so its `#endif` follows suit.
+    let mut open: Vec<(Option<&str>, bool)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(guard) = GUARDS.iter().find(|g| line == **g).copied() {
+            let already = open.iter().any(|(g, _)| *g == Some(guard));
+            open.push((Some(guard), !already));
+            if !already {
+                out.push(line);
+            }
+        // A guard this does not touch may close with a comment after it.
+        } else if line == "#endif" || line.starts_with("#endif ") {
+            let (guard, emitted) = open.pop().unwrap_or((None, true));
+            match guard {
+                Some(guard) if emitted => {
+                    // Reopened by the next item under the same guard: keep
+                    // the run open instead of closing and reopening it.
+                    let mut j = i + 1;
+                    while j < lines.len() && lines[j].trim().is_empty() {
+                        j += 1;
+                    }
+                    if j < lines.len() && lines[j] == guard {
+                        open.push((Some(guard), true));
+                        // Keep exactly one blank line between the neighbours.
+                        out.push("");
+                        i = j + 1;
+                        continue;
+                    }
+                    out.push(line);
+                }
+                Some(_) => {}
+                None => out.push(line),
+            }
+        } else if line.starts_with("#if") {
+            open.push((None, true));
+            out.push(line);
+        } else {
+            out.push(line);
+        }
+        i += 1;
+    }
+    let mut merged = out.join("\n");
+    if header.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged
+}
+
+/// Spell a type by the name its `typedef` gave it, everywhere it is used.
+///
+/// **The generator ties the tag to the keyword and cannot be asked for one
+/// without the other.** It writes `struct` or `enum` in front of every use of
+/// a type whose tag it emitted, so keeping the tags -- which is what lets an
+/// application forward-declare a handle -- also means `enum lowlat_status
+/// lowlat_host_create(const struct lowlat_host_create_info *)` at every signature and
+/// every field. Both spellings name the same type in C and neither is one in
+/// C++, so the tags stay and the keyword goes wherever the typedef already
+/// says it: everywhere except the `typedef` that introduces it.
+fn use_typedef_names(header: &str) -> String {
+    const REDUNDANT: [&str; 3] = ["struct ", "union ", "enum "];
+
+    let mut out = String::with_capacity(header.len());
+    let mut rest = header;
+    'text: while !rest.is_empty() {
+        for keyword in REDUNDANT {
+            if rest.starts_with(keyword)
+                && rest[keyword.len()..].starts_with("lowlat")
+                && !out.ends_with("typedef ")
+            {
+                rest = &rest[keyword.len()..];
+                continue 'text;
+            }
+        }
+        let ch = rest
+            .chars()
+            .next()
+            .expect("the loop stops when nothing is left");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// Hang the wrapped arguments under the parenthesis they belong to, and keep
+/// the trailing macro on the line that closes it.
+///
+/// **The generator wrapped them against the longer spelling.** Dropping
+/// `struct ` from a return type shortens the first line without moving the
+/// lines that were aligned to its open parenthesis, so every wrapped signature
+/// drifts right by exactly what came out of it. The macro is the generator's
+/// own doing: it puts a postfix on its own line whenever it wrapped, which
+/// reads as a stray statement rather than as part of the declaration.
+fn realign_wrapped_arguments(header: &str) -> String {
+    let mut out = String::with_capacity(header.len());
+    // Where arguments hang from, and how many parentheses are still open.
+    let mut column: Option<usize> = None;
+    let mut depth = 0usize;
+
+    for line in header.lines() {
+        let line = match column {
+            Some(column) if !line.is_empty() => {
+                format!("{}{}", " ".repeat(column), line.trim_start())
+            }
+            _ => line.to_owned(),
+        };
+
+        if line == "LOWLAT_NOEXCEPT;" && out.ends_with(")\n") {
+            out.truncate(out.len() - 1);
+            out.push(' ');
+        }
+        out.push_str(&line);
+        out.push('\n');
+
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for (at, ch) in line.char_indices() {
+            match ch {
+                '(' => {
+                    if depth == 0 {
+                        column = Some(at + 1);
+                    }
+                    depth += 1;
+                }
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            column = None;
+        }
+    }
+    out
+}
+
+/// Say the documentation in the C toolchain's dialect rather than in Rust's.
+///
+/// **Both are load-bearing and neither side can hold both.** `# Safety` is
+/// what `clippy::missing_safety_doc` looks for on an unsafe function and
+/// ``[`name`]`` is how rustdoc links one, so the definitions keep them and the
+/// header is translated, which is what this file is for.
+///
+/// **What it translates to is decided by what renders, not by what is most
+/// precise.** The editor tooling most applications read this header with knows
+/// a fixed set of block commands and drops any other silently, taking the text
+/// under it with it: `@pre` is the accurate word for a caller's obligation and
+/// it disappears, so the safety section becomes `@attention`, which that set
+/// has. A cross-reference is the same trade the other way -- `@ref` links in a
+/// generated site and reduces to undistinguished prose in a tooltip, so a name
+/// keeps the backticks it already had and is code in both.
+fn to_doxygen(header: &str) -> String {
+    let mut out = String::with_capacity(header.len());
+    let mut rest = header;
+
+    while let Some(at) = rest.find("[`") {
+        let (before, tail) = rest.split_at(at);
+        match tail[2..].find("`]") {
+            Some(end) => {
+                out.push_str(before);
+                out.push('`');
+                out.push_str(&tail[2..2 + end]);
+                out.push('`');
+                rest = &tail[2 + end + 2..];
+            }
+            // A bracket that opens nothing is text; keep it and move past it.
+            None => {
+                out.push_str(before);
+                out.push_str("[`");
+                rest = &tail[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+
+    // The heading and the blank line under it become the one command that says
+    // what they meant. **`@pre` is the accurate one and it is not the one to
+    // use**: the editor tooling most applications read this header with drops
+    // any block command it does not know, silently and without rendering what
+    // was under it, and its set has no `@pre`. `@attention` is in it, and in
+    // every documentation generator going back twenty years.
+    let mut folded = String::with_capacity(out.len());
+    let mut lines = out.lines().peekable();
+    while let Some(line) = lines.next() {
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if line.trim_start() == "/// # Safety"
+            && lines.peek().map(|next| next.trim_start()) == Some("///")
+        {
+            lines.next();
+            folded.push_str(indent);
+            folded.push_str("/// @attention ");
+            let body = lines.next().expect("a heading is followed by its section");
+            folded.push_str(body.trim_start().trim_start_matches("/// "));
+        } else {
+            folded.push_str(line);
+        }
+        folded.push('\n');
+    }
+    folded
+}
+
+/// Run a tool and give back what it said, so a failure reports the
+/// diagnostic rather than an exit code.
+fn run(mut command: Command) -> Result<(), String> {
+    let shown = format!("{command:?}");
+    let output = command
+        .output()
+        .map_err(|why| format!("{shown} could not be run: {why}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{shown}\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+/// One of Visual Studio's tools, with the environment it needs: found where
+/// cargo finds its linker, so no developer prompt is needed.
+#[cfg(windows)]
+fn msvc(tool: &str) -> Command {
+    find_msvc_tools::find(std::env::consts::ARCH, tool)
+        .unwrap_or_else(|| panic!("{tool} is not in a Visual Studio installation here"))
+}
+
+/// Compile `source` on its own into `object`, warnings as errors: as C11 or
+/// as C++17, with `define` defined when there is one.
+#[cfg(unix)]
+fn compile_object(
+    source: &Path,
+    object: &Path,
+    cplusplus: bool,
+    define: Option<&str>,
+) -> Result<(), String> {
+    let mut command = Command::new(if cplusplus { "c++" } else { "cc" });
+    if cplusplus {
+        command.args(["-std=c++17", "-x", "c++"]);
+    } else {
+        command.arg("-std=c11");
+    }
+    command.args(["-Wall", "-Wextra", "-Werror"]);
+    if let Some(define) = define {
+        command.arg(format!("-D{define}"));
+    }
+    command
+        .arg("-I")
+        .arg(root().join("include"))
+        .arg("-c")
+        .arg(source)
+        .arg("-o")
+        .arg(object);
+    run(command)
+}
+
+#[cfg(windows)]
+fn compile_object(
+    source: &Path,
+    object: &Path,
+    cplusplus: bool,
+    define: Option<&str>,
+) -> Result<(), String> {
+    let mut command = msvc("cl.exe");
+    command.arg("/nologo");
+    if cplusplus {
+        command.args(["/std:c++17", "/TP"]);
+    } else {
+        command.arg("/std:c11");
+    }
+    command.args(["/W4", "/WX"]);
+    if let Some(define) = define {
+        command.arg(format!("/D{define}"));
+    }
+    command
+        .arg("/I")
+        .arg(root().join("include"))
+        .arg("/c")
+        .arg(source)
+        .arg(format!("/Fo{}", object.display()));
+    run(command)
+}
+
+/// Compile and link `source` into `program`, as C11, warnings as errors.
+#[cfg(unix)]
+fn compile_program(source: &Path, program: &Path) -> Result<(), String> {
+    let mut command = Command::new("cc");
+    command
+        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-I"])
+        .arg(root().join("include"))
+        .arg(source)
+        .arg("-o")
+        .arg(program);
+    run(command)
+}
+
+#[cfg(windows)]
+fn compile_program(source: &Path, program: &Path) -> Result<(), String> {
+    let mut command = msvc("cl.exe");
+    // The objects beside the program, never in the directory the test runs in.
+    let dir = program.parent().expect("a program in a directory");
+    command
+        .args(["/nologo", "/std:c11", "/W4", "/WX", "/I"])
+        .arg(root().join("include"))
+        .arg(source)
+        .arg(format!("/Fo{}\\", dir.display()))
+        .arg(format!("/Fe{}", program.display()));
+    run(command)
+}
+
+/// Every name the shared object exports.
+#[cfg(target_os = "linux")]
+fn exports(object: &Path) -> Vec<String> {
+    let listed = Command::new("nm")
+        .args(["-D", "--defined-only", "--format=posix"])
+        .arg(object)
+        .output()
+        .expect("nm runs; it ships with the linker this toolchain already needs");
+    assert!(
+        listed.status.success(),
+        "nm could not read {}:\n{}",
+        object.display(),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The names come with the leading underscore the system's linker adds to
+/// every C name, which the header's spelling does not have.
+#[cfg(target_os = "macos")]
+fn exports(object: &Path) -> Vec<String> {
+    let listed = Command::new("nm")
+        .args(["-g", "-U", "-j"])
+        .arg(object)
+        .output()
+        .expect("nm runs; it ships with the system's developer tools");
+    assert!(
+        listed.status.success(),
+        "nm could not read {}:\n{}",
+        object.display(),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|name| name.strip_prefix('_').unwrap_or(name).to_owned())
+        .collect()
+}
+
+#[cfg(windows)]
+fn exports(object: &Path) -> Vec<String> {
+    let listed = msvc("link.exe")
+        .args(["/dump", "/exports", "/nologo"])
+        .arg(object)
+        .output()
+        .expect("the linker runs");
+    assert!(
+        listed.status.success(),
+        "the linker could not dump {}:\n{}",
+        object.display(),
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    // A row of the table is three numbers -- the ordinal, the hint and the
+    // address -- and then the name; nothing else in the dump is.
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let ordinal = fields.next()?;
+            let hint = fields.next()?;
+            let address = fields.next()?;
+            let name = fields.next()?;
+            let numbers = ordinal.chars().all(|c| c.is_ascii_digit())
+                && hint.chars().all(|c| c.is_ascii_hexdigit())
+                && address.chars().all(|c| c.is_ascii_hexdigit());
+            numbers.then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// **The header is generated, so it cannot describe something the library does
+/// not do** -- but only if a stale one fails the build, which is this.
+///
+/// Regenerate with `LOWLAT_BLESS_HEADER=1 cargo test -p lowlat-sdk --test abi`.
+#[test]
+fn the_header_matches_the_definitions() {
+    let committed = root().join("include/lowlat.h");
+    let generated = generate();
+
+    if std::env::var_os("LOWLAT_BLESS_HEADER").is_some() {
+        std::fs::create_dir_all(committed.parent().expect("include/ has a parent"))
+            .expect("the include directory");
+        std::fs::write(&committed, &generated).expect("writing the header");
+        return;
+    }
+
+    // **Compared by lines**: a checkout may give the file the platform's own
+    // line endings, which are no part of what the header says.
+    let found = std::fs::read_to_string(&committed).unwrap_or_default();
+    if !found.lines().eq(generated.lines()) {
+        let at = found
+            .lines()
+            .zip(generated.lines())
+            .position(|(committed, generated)| committed != generated)
+            .unwrap_or_else(|| found.lines().count().min(generated.lines().count()));
+        panic!(
+            "{} is stale from line {}. Regenerate it: LOWLAT_BLESS_HEADER=1 cargo test -p \
+             lowlat-sdk --test abi\n committed: {:?}\n generated: {:?}",
+            committed.display(),
+            at + 1,
+            found.lines().nth(at),
+            generated.lines().nth(at)
+        );
+    }
+}
+
+/// **One header, both languages, warnings as errors.**
+///
+/// The translation unit declares nothing of its own, so the only thing that
+/// can produce a diagnostic is the header.
+#[test]
+fn the_header_compiles_alone_as_c_and_as_c_plus_plus() {
+    let source = root().join("crates/sdk/tests/c/alone.c");
+    let dir = scratch("alone");
+    for (cplusplus, define, name) in [
+        (false, None, "as C"),
+        (true, None, "as C++"),
+        // **And with either half hidden**, which is what an application built
+        // against a library carrying one half does: the shared types must
+        // still be there, and nothing of the hidden half may be.
+        (false, Some("LOWLAT_NO_HOST"), "with LOWLAT_NO_HOST"),
+        // On macOS the client is the one half there is, and hiding it
+        // leaves nothing an application could call.
+        #[cfg(not(target_os = "macos"))]
+        (false, Some("LOWLAT_NO_CLIENT"), "with LOWLAT_NO_CLIENT"),
+    ] {
+        let object = dir.join(format!("alone-{}.o", name.replace(' ', "-")));
+        if let Err(why) = compile_object(&source, &object, cplusplus, define) {
+            panic!("the header does not compile {name}:\n{why}");
+        }
+    }
+}
+
+/// **The header after the platform's own headers, included whole**, since
+/// those define plain words as macros that an application's build would
+/// rewrite in this one. Both languages, warnings as errors.
+#[cfg(windows)]
+#[test]
+fn the_header_compiles_after_the_platforms_own_headers() {
+    let source = root().join("crates/sdk/tests/c/after-windows.c");
+    let dir = scratch("after-windows");
+    for (cplusplus, name) in [(false, "as C"), (true, "as C++")] {
+        let object = dir.join(format!("after-windows-{}.o", name.replace(' ', "-")));
+        if let Err(why) = compile_object(&source, &object, cplusplus, None) {
+            panic!("the header does not compile after windows.h {name}:\n{why}");
+        }
+    }
+}
+
+/// **A deliberate panic comes back as a status**, from the object that ships.
+///
+/// Undefined behaviour if it regresses, which is why the check loads the
+/// shared object rather than calling the same code from Rust: building the
+/// library to abort on panic would disable containment everywhere and this
+/// test would still pass if it linked the library form.
+#[test]
+fn a_deliberate_panic_returns_a_status_from_the_shared_object() {
+    let source = root().join("crates/sdk/tests/c/harness.c");
+    let dir = scratch("harness");
+    let program = dir.join(if cfg!(windows) {
+        "harness.exe"
+    } else {
+        "harness"
+    });
+    if let Err(why) = compile_program(&source, &program) {
+        panic!("the harness does not compile:\n{why}");
+    }
+
+    let object = shared_object();
+    let run = Command::new(&program)
+        .arg(&object)
+        .output()
+        .expect("the harness runs");
+    assert!(
+        run.status.success(),
+        "the harness failed against {}:\n{}{}",
+        object.display(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// **The static library links alone into an MSVC program**, its system
+/// libraries named inside it, and holds a panic at its boundary as the shared
+/// object does. Under both C runtimes an application chooses: the release
+/// one, and the debug one with the release one's name set aside, which is all
+/// a debug build adds (06 section 3b). The linker's warnings are errors, so a
+/// conflict between the two runtimes fails here rather than in an
+/// application.
+#[cfg(windows)]
+#[test]
+fn the_static_library_links_alone_and_holds_a_panic() {
+    let library = static_library();
+    let source = root().join("crates/sdk/tests/c/static.c");
+    let dir = scratch("static");
+    for (runtime, set_aside, name) in [
+        ("/MT", None, "release"),
+        ("/MTd", Some("/NODEFAULTLIB:libcmt.lib"), "debug"),
+    ] {
+        let program = dir.join(format!("static-{name}.exe"));
+        let mut command = msvc("cl.exe");
+        command
+            .args(["/nologo", "/std:c11", "/W4", "/WX", runtime, "/I"])
+            .arg(root().join("include"))
+            .arg(&source)
+            .arg(format!("/Fo{}\\", dir.display()))
+            .arg(format!("/Fe{}", program.display()))
+            .args(["/link", "/WX"])
+            .args(set_aside)
+            .arg(&library);
+        if let Err(why) = run(command) {
+            panic!("the static library does not link alone with the {name} runtime:\n{why}");
+        }
+        let ran = Command::new(&program).output().expect("the program runs");
+        assert!(
+            ran.status.success(),
+            "the statically linked program failed with the {name} runtime:\n{}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
+}
+
+/// **The static library links alone into a C program on macOS too**, with
+/// nothing named beside it: the system's frameworks are opened at run time,
+/// so nothing past the C library every program has is on the link line. It
+/// holds a panic at its boundary as the shared object does.
+///
+/// **Three ways, as applications link it**: as C, and as C and as C++ built
+/// with thin link-time optimisation and dead-stripped, as a release build of
+/// either is; compiled as C++ the program throws and catches exceptions of its
+/// own on either side of the contained panic. Each for the oldest system the
+/// client supports, the linker's warnings errors, so a member built for a
+/// later one fails here rather than in an application.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_static_library_links_alone_and_holds_a_panic() {
+    let library = static_library();
+    let source = root().join("crates/sdk/tests/c/static.c");
+    let dir = scratch("static");
+    let ways: [(&str, &[&str], bool, &str); 3] = [
+        ("cc", &["-std=c11"], false, "C"),
+        ("cc", &["-std=c11"], true, "C with thin LTO"),
+        (
+            "c++",
+            &["-std=c++17", "-x", "c++"],
+            true,
+            "C++ with thin LTO",
+        ),
+    ];
+    for (i, (compiler, language, optimised, name)) in ways.into_iter().enumerate() {
+        let program = dir.join(format!("static-{i}"));
+        let mut command = Command::new(compiler);
+        command
+            .args(language)
+            .args([
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-mmacosx-version-min=11.0",
+                "-I",
+            ])
+            .arg(root().join("include"))
+            .arg(&source)
+            // Whatever the language was, the library is an input to the link.
+            .args(["-x", "none"])
+            .arg(&library)
+            .args(["-Wl,-fatal_warnings", "-o"])
+            .arg(&program);
+        if optimised {
+            command.args(["-flto=thin", "-Wl,-dead_strip"]);
+        }
+        if let Err(why) = run(command) {
+            panic!("the static library does not link alone as {name}:\n{why}");
+        }
+        let ran = Command::new(&program).output().expect("the program runs");
+        assert!(
+            ran.status.success(),
+            "the statically linked program failed as {name}:\n{}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
+}
+
+/// **A library carrying the virtual displays alone links as an application
+/// links it** (06 section 3c): built with neither the host nor the client, it
+/// exports every `lowlat_vdd_*` entry point the header declares and nothing of
+/// the other halves, and a program with both hidden links its import library
+/// and reaches the third half.
+///
+/// **Built into a target directory of its own**, which no other gate reads:
+/// in the profile's own it would land on the object they test.
+#[cfg(windows)]
+#[test]
+fn a_library_of_the_third_half_alone_links_as_an_application_links_it() {
+    let profile = artifacts();
+    let target = profile.join("vdd-only-target");
+    // One argument: `cargo_into` adds its own after these.
+    let target_dir = format!("--target-dir={}", target.display());
+    let args = [
+        "build",
+        "--quiet",
+        "-p",
+        "lowlat-sdk",
+        "--no-default-features",
+        "--features",
+        "vdd",
+        target_dir.as_str(),
+    ];
+    let built = cargo_into(&profile, &args)
+        .output()
+        .expect("cargo builds the library of the third half alone");
+    assert!(
+        built.status.success(),
+        "the library of the third half alone could not be built:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let mut out = target;
+    if let Some(triple) = named_target(&profile) {
+        out.push(triple);
+    }
+    out.push(profile.file_name().expect("a profile directory"));
+    let object = out.join(OBJECT);
+
+    let exported = exports(&object);
+    let foreign: Vec<&String> = exported
+        .iter()
+        .filter(|name| name.starts_with("lowlat_host_") || name.starts_with("lowlat_client_"))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "{} exports {foreign:?} of another half",
+        object.display()
+    );
+    let header =
+        std::fs::read_to_string(root().join("include/lowlat.h")).expect("the committed header");
+    let mut declared: Vec<&str> = header
+        .match_indices("lowlat_vdd_")
+        .filter_map(|(at, _)| {
+            let rest = header.get(at..)?;
+            let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+            rest[end..].starts_with('(').then(|| &rest[..end])
+        })
+        .collect();
+    declared.sort_unstable();
+    declared.dedup();
+    assert!(
+        !declared.is_empty(),
+        "the header declares no lowlat_vdd_ function, so this check cannot have proven anything"
+    );
+    let missing: Vec<&&str> = declared
+        .iter()
+        .filter(|name| !exported.iter().any(|exported| exported == **name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} does not export {missing:?}",
+        object.display()
+    );
+
+    let dir = scratch("vdd-only");
+    let program = dir.join("vdd-only.exe");
+    let mut command = msvc("cl.exe");
+    command
+        .args(["/nologo", "/std:c11", "/W4", "/WX", "/I"])
+        .arg(root().join("include"))
+        .arg(root().join("crates/sdk/tests/c/vdd-only.c"))
+        .arg(format!("/Fo{}\\", dir.display()))
+        .arg(format!("/Fe{}", program.display()))
+        .args(["/link", "/WX"])
+        .arg(out.join("lowlat.dll.lib"));
+    if let Err(why) = run(command) {
+        panic!("a program does not link the library of the third half alone:\n{why}");
+    }
+    // Beside the program, so it loads this library and no other.
+    std::fs::copy(&object, dir.join(OBJECT)).expect("the library beside the program");
+    let ran = Command::new(&program).output().expect("the program runs");
+    assert!(
+        ran.status.success(),
+        "the program failed against the library of the third half alone:\n{}{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}
+
+/// **Every exported symbol carries the prefix**, so an application built
+/// against a different version of this library fails to link rather than
+/// finding a function whose arguments have quietly moved.
+#[test]
+fn every_exported_symbol_carries_the_prefix() {
+    let object = shared_object();
+    let exported = exports(&object);
+    assert!(
+        !exported.is_empty(),
+        "{} exports nothing, so this check cannot have proven anything",
+        object.display()
+    );
+    let stray: Vec<&String> = exported
+        .iter()
+        .filter(|name| !name.starts_with("lowlat_"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "{} exports {:?} without the project prefix",
+        object.display(),
+        stray
+    );
+}
+
+/// **The shared library is found through the application's run path** on
+/// macOS: the install name an application's link records is
+/// `@rpath/liblowlat.dylib`, not the path it was built at.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_shared_library_is_found_through_the_run_path() {
+    let object = shared_object();
+    let named = Command::new("otool")
+        .arg("-D")
+        .arg(&object)
+        .output()
+        .expect("otool runs; it ships with the system's developer tools");
+    assert!(
+        named.status.success(),
+        "otool could not read {}:\n{}",
+        object.display(),
+        String::from_utf8_lossy(&named.stderr)
+    );
+    // The file's name on the first line, its install name on the second.
+    let listed = String::from_utf8_lossy(&named.stdout);
+    assert_eq!(
+        listed.lines().nth(1),
+        Some("@rpath/liblowlat.dylib"),
+        "{listed}"
+    );
+}
+
+/// **Nothing reaches the header without the prefix either**, which is the same
+/// rule as the symbol table's and a different mechanism.
+///
+/// The first generated header carried `MAX_GUESTS`, `HOLD_MS` and four more
+/// constants from modules that have nothing to do with the boundary, because
+/// generating from the crate publishes every `pub const` in it. An application
+/// that includes a header like that gets its own `MAX_GUESTS` redefined by
+/// one it never asked for. Generating from the ABI module alone is the fix;
+/// this is what says so when something works around it.
+#[test]
+fn the_header_declares_no_name_without_the_prefix() {
+    let header = std::fs::read_to_string(root().join("include/lowlat.h")).expect("the header");
+
+    let mut declared = Vec::new();
+    for line in header.lines().map(str::trim) {
+        let name = if let Some(rest) = line.strip_prefix("#define ") {
+            rest.split_whitespace().next()
+        } else if line.ends_with(';') && (line.starts_with("typedef ") || line.starts_with('}')) {
+            // `typedef int32_t lowlat_status;` and the closing line of a
+            // struct or enum, which is where its name is.
+            line.trim_end_matches(';').split_whitespace().last()
+        } else if line.split_once(" = ").is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        }) {
+            // An enumerator. These carry the codes now, so they are exactly
+            // the names an application collides with.
+            line.split_once(" = ").map(|(name, _)| name)
+        } else if line.ends_with(");") {
+            // A function declaration. The name is what sits against the
+            // opening parenthesis.
+            line.split('(').next().and_then(|before| {
+                before
+                    .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+            })
+        } else {
+            None
+        };
+        // A closing brace with no name after it is a block ending, not a
+        // declaration: `};` closes an enum whose name was on the opening line.
+        if let Some(name) =
+            name.filter(|name| name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+        {
+            declared.push(name);
+        }
+    }
+
+    assert!(
+        declared.len() >= 6,
+        "only found {declared:?} in the header, so this check cannot have proven anything"
+    );
+    // The handle's own type is the bare project name, which owns the
+    // namespace just as surely as the prefixed names do.
+    let stray: Vec<&&str> = declared
+        .iter()
+        .filter(|name| !name.starts_with("lowlat") && !name.starts_with("LOWLAT"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the header declares {stray:?} without the project prefix"
+    );
+}
+
+/// **The C mirror's own arithmetic, so a field added on one side and not the
+/// other is caught here rather than at a caller's size check.**
+///
+/// A caller stamps `size` from its own `sizeof` and this library refuses
+/// anything smaller than its own, so a mirror that has drifted fails at every
+/// call with one invalid-argument status and names nothing. The number below
+/// is written out from the fields rather than taken from `size_of`, because
+/// taking it from `size_of` would agree with any layout at all. The host
+/// half's, so Linux's.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_status_struct_is_the_size_its_fields_come_to() {
+    use lowlat::abi::{LOWLAT_OUTPUT_MAX, lowlat_host_status};
+    let fields = 4 * 4        // size, guests, width, height
+        + 1 + 1 + 1 + 1       // running, audio_active, ten_bit, reserved
+        + 4 + 4               // codec, chroma
+        + LOWLAT_OUTPUT_MAX; // audio_device
+    assert_eq!(
+        core::mem::size_of::<lowlat_host_status>(),
+        fields,
+        "the status struct is not the size its fields come to; a mirror stamping its own \
+         sizeof will be refused"
+    );
+    assert_eq!(core::mem::align_of::<lowlat_host_status>(), 4);
+}

@@ -1,0 +1,1557 @@
+# 10 - The client
+
+**Status:** designed 2026-09-15, interview of the same day; C1 and C2 built 2026-09-17, C3
+and C4 2026-09-18; C5's decode half planned, built and gated 2026-09-19, its second half
+planned and built the same evening; C7 (the pad reports) 2026-09-20, C8 (the software
+decoder, a decoder chosen mid-session) 2026-09-21, C9 (full chroma on the open stack)
+2026-09-22; C6 (packaging) closes the set, and this document was read against the code
+once more at its closure. §11, the relay, planned, built and closed 2026-09-23 as C10.
+Built by [impl-plan-client.md](impl-plan-client.md).
+
+The client is the other half of the same protocol: it receives what [05](05-host.md) produces.
+Everything below the media -- the wire, the rings, acknowledgement and recovery, connectivity,
+the credentials -- is [01](01-protocol.md) to [04](04-signaling.md) read from the connecting
+side, and the code is the same code: the session is symmetric, and the connectivity engine
+already plays both roles. What is new is what a client does with bytes once they are in order:
+decode them, hand pictures and sound to an application at the right moment, and send its input
+back. This document is that half.
+
+## §1 Scope
+
+**v1 is one video stream, over the native transport, on Linux.** Stream 0 on channel 1, sound
+on channel 2, control and input on channel 0. The client declares all three streams, as every
+peer does, and takes pictures from channel 1 alone; a second stream is display switching, an
+application-level feature over user data ([01 §11.2a](01-protocol.md)) that v1 does not
+build. The second pipe -- the browser transport of [01 §14](01-protocol.md) -- exists so a
+browser can be a guest; a native client has no reason to be one, and the page in
+`examples/web-client` is already the browser client. The attempt information keeps its
+`transport` field for symmetry; a client refuses the web value with a status.
+
+**Windows follows Linux**, as it does for the host: the decoders and the picture handles are
+the platform-specific stages, and the shell's receive path ([02 §6](02-io-shell.md)) is the one
+piece of shared code that changes. *Planned 2026-09-26 as W1*
+([impl-plan-windows.md](impl-plan-windows.md)): the handle there is §4.2, the decoders §5.2.
+
+## §2 Where a client is different from a host, in one table
+
+| | host | client |
+|---|---|---|
+| connectivity role | answers an offer; walks a base port per guest | makes the offer; one socket; allocates a relay when the application configures one (§11) |
+| session | one per guest, all fed by one encode | one |
+| the media path | capture, convert, encode, packetize | reassemble, decode, hand out |
+| the clock | the display's refresh paces the loop | there is no clock: the newest picture is shown when asked for |
+| reference-chain repair | the host's job: a guest that misses one frame is cascaded to the next keyframe ([05 §5](05-host.md)) | none: a client never sees a gap that retransmission will not fill |
+| keyframe requests | answered | sent in exactly two cases (§5) |
+| input | injected | encoded from the application's events (§8) |
+| threads | capture, encode, one guest loop per seat, audio | one receive loop, one decode thread per stream; sound is decoded on the application's call |
+
+The row that matters most is the fourth: **the client has no pacer.** Every client generation
+compared here decodes as fast as pictures arrive, keeps a queue two deep, hands out the newest
+and discards the rest, and aligns to no display. Latency comes from doing that promptly, not
+from scheduling.
+
+## §3 The receive path
+
+The session and its rings are the core's, unchanged ([01 §7](01-protocol.md)). Two sizes are
+the client's to choose, and both follow from what a host is allowed to have outstanding:
+
+- **The video receive ring holds at least 4000 fragments.** A host's per-guest ceiling on
+  outstanding fragments tops out at the peer's ring depth ([05 §5](05-host.md)), and the ring
+  *is* the flow-control window: a ring smaller than the ceiling drops arriving fragments whose
+  slots still hold undelivered data, which stalls the cumulative count on a healthy link and
+  reads as loss. Shrinking it to save memory has been measured to cut throughput threefold.
+- **The access-unit buffer holds the largest message the ring can complete: its depth times
+  a fragment's body, about 4.8 MB** (*corrected 2026-09-17*). A message is one access unit
+  and it arrives whole or not at all; a buffer smaller than the largest keyframe refuses the
+  message without consuming it and the stream is over. But the ring bounds that keyframe: a
+  message has to sit entirely in the ring before it can be taken, and the ring refuses a
+  fragment further than its depth past the reader, so nothing larger than the ring can ever
+  complete. The 16 MiB an established client allocates is room nothing fills, on its ring as
+  on this one. Older client generations hold two megabytes, which is the ceiling a host must
+  keep its keyframes under for them.
+
+**There is no skip.** A gap in the ring is a fragment in flight or in retransmission, and the
+reader waits for it; the sender never frees an unacknowledged fragment short of ending the
+session, and it ends the session on its own delivery deadline before the client's liveness
+deadline would ([01 §9](01-protocol.md)). A client that skipped forward would discard data
+that is about to arrive, feed the decoder a broken chain, and then have to ask the host to
+rebuild its encoder to recover -- the expensive request of §5 -- to repair damage it did
+itself. The core's stall-escape mechanism stays available to the caller and the client's policy
+is to leave it unused.
+
+**Catch-up is over messages that have arrived, and it is keyframe-aligned.** When the reader
+is more than one message behind on channel 1, the receive thread looks ahead through the
+messages the ring holds for keyframe metadata ([01 §11.3](01-protocol.md), bit 6) whose
+picture has also arrived, and skips to the latest such picture, discarding the pictures before
+it. That is the newest client generation's behaviour and it is the transport-level form of
+§4's latest-wins: the reader recovers in one step rather than decoding a backlog it will never
+show. Against a host that sends no metadata messages the look-ahead finds nothing and the
+reader decodes in order. **It runs where the ring is** (*2026-09-17*): the receive thread owns
+the ring and takes access units off it for the decoder's thread, so it is the receive thread
+that looks ahead, and it does so whether or not the decoder is keeping up -- a backlog the
+decoder has not taken never grows past one keyframe interval, because each keyframe's
+arrival discards what came before it.
+
+**The catch-up is a mechanism, not a remedy: it needs a keyframe in the backlog** (*added
+2026-09-16*). This host announces every keyframe it sends, and those are the seating
+keyframe, the ones a request or the gate's cascade produce, and no periodic ones; the
+established host's periodic keyframes exist only when it is configured with an interval. So a
+reader that is behind because its decoder is slower than the stream ordinarily finds nothing
+ahead and decodes in order, the case [§4.1](#41-what-latest-wins-costs-and-what-it-cannot-do)
+describes and the deferred request of [§5](#5-the-decoder-and-when-a-client-asks-for-a-keyframe)
+would answer. What the receive path owes those decisions is the measurement: how many
+messages the reader is behind, and how long the oldest of them has waited, both reported
+([§9](#9-events-status-and-metrics)) rather than acted on.
+
+## §4 Pictures: the queue, and acquire and release
+
+**Depth two, latest wins, the producer never blocks.** The decode thread publishes into a ring
+of four slots; the application holds at most two -- the one it is presenting and the one it
+has just acquired, so a swap has no gap -- one is being decoded into, and one is ready. When a
+decoded picture finds no free slot the decoder overwrites the oldest *ready* slot, never a held
+one: the picture the application has not looked at yet is the one nothing will miss. The
+decode thread is also what drains the transport, so a decode thread that waited for the
+application would back the whole session up into the receive ring; a minimised window must
+cost nothing but the pictures it does not show.
+
+**The slots are sized once and backed late** (*built 2026-09-17*). Each is sized at the
+configuration's ceiling (4096 square by default, lowerable at creation) in the deepest layout
+a decoder here produces, so a rebuild never reallocates and a slot the application holds is
+never pulled from under it; but nothing is allocated at creation or at an attempt -- the
+backing is made on the decode thread at the first picture, demand-zero, and each picture is
+laid out in its slot at its own pitch, so the working set is the pictures actually written
+and never the reserve. An earlier implementation initialised its slots at creation and paid
+a quarter of a gigabyte resident before a picture existed. Here a client at 1080p is about
+140 MB above its resident set at creation, most of it the driver's.
+
+**On Windows the reserve is not charged either** (*built 2026-09-27*, W1.2). That system
+charges memory it has handed out -- commits -- against the machine's memory and page file
+whether it is ever touched or not, so a zeroed allocation of the reserve, which costs nothing
+resident, is charged whole at once: 384.8 MiB at the default ceiling, measured. There the
+slots' address range is reserved and each slot is committed as far as the picture laid out in
+it reaches, growing and never shrinking while the queue lives, so a slot the application holds
+is never decommitted under it; a commit the system refuses refuses the picture whole, as a
+picture past its slot is refused. Four pictures at 1440p are 21 MiB of it. An earlier
+implementation's lazy slots moved its working set and left the whole reserve charged.
+
+**Acquire is the poll.** `lowlat_client_acquire_frame` waits up to its timeout for a picture
+newer than the last one handed out, discards any older ready pictures on the way, and lends
+the newest. A picture stays valid until it is released; the application presents it as often
+as it likes in between, which is what a renderer that re-presents on every iteration needs.
+**A renderer waits in acquire, not in its present** (*2026-09-24*). A present that waits
+for the display's refresh holds the thread that would take the next picture, so a loop that
+presents the picture on screen again and polls afterwards takes a picture arriving
+mid-refresh a refresh late and shows it a refresh after that. Waiting in acquire, the
+picture is drawn the moment it is published and shown at the next refresh, or at once
+without vsync; the one on screen is presented again only when a wait brings nothing. Beside
+an established client on one host, the demo's window trailed by 15 to 30 pixels of a
+dragged window before its loop was turned round, and kept level after, but for a few
+pixels in about one capture in twenty.
+**Every picture says when it arrived** (*minor 16, 2026-09-24*). The session thread stamps
+each message with the pass that completed it, the stamp travels with the unit to the decode
+thread and with the picture into the queue, and the acquire hands it out on the monotonic
+clock an application reads, so the application can time a picture from the network to its
+own present. Measured that way beside the established client above, the user dragging
+windows through both and presents not waiting for the refresh: from arrival to the present
+returning, 1.32 ms at the median and 2.31 at the 99th percentile when the picture is handed
+out as planes -- the read-back and the renderer's upload are most of it -- and 0.67 and 1.37
+ms as a device handle; outside the decode and the copy, the library's own share is about 40
+us. Pictures with this client's pointer motion in flight read the same as the rest, so input
+sent on the session's thread does not hold the video back. A one-frame lag in one capture in
+twenty needs only a mean difference of half a millisecond or so -- a twentieth of a frame at
+the rates a drag runs at -- which is what the planes route's read-back and upload cost; by
+handle the person at the desk saw this client's picture ahead about as often as behind.
+**Release carries an optional fence**: a synchronisation object the application's device
+signals when it has finished reading the picture, so a decoder writing straight into shared
+memory waits on the application's GPU rather than on its CPU. A null fence means "reusable
+now", which is the right answer for a picture that was copied.
+**A departure closes the queue and the next attempt opens it** (*2026-09-25*). Closing wakes
+every waiter so none is stranded by a session that has gone; the next attempt on the same
+handle takes waiters again from its offer on, and lets go of any picture the last session
+left untaken, so its first acquire is never handed the last session's picture. The queue
+had stayed closed: after a reconnect every acquire came back at once, and a renderer paced
+by the wait would have spun. The rest of what a session leaves -- its events, its figures,
+its access units -- is let go at the same moment ([06 §3b](06-api.md)).
+
+**A picture leaves the library one of two ways, and the library chooses which it can offer.**
+As **planes**: pointers, pitches and a format (`NV12`, `P010`, or the 4:4:4 layouts) into
+memory the library owns for the lease, which every renderer can take and which is the path a
+software or read-back decoder produces anyway. Or as a **handle**: a device-level reference
+that the application imports into its own device, with an offset and a pitch per plane. The
+application asks for a kind at creation and is told which it got; a decoder that cannot
+export hands out planes. The kind may also be switched mid-session (*built 2026-09-28*, W1.4,
+§4.2).
+
+**The handle has a kind, and the first kind is an opaque descriptor** (*built 2026-09-19*).
+The vendor interface's decoded picture is not exportable: its pool is the interface's own
+and a mapped picture is a transient pointer. So on that backend the four slots of the queue
+are **exportable device allocations**, one descriptor each, and the backend does one
+device-side copy into the slot in place of the host read-back -- the copy the read-back was
+is gone, and what remains runs at the device's own bandwidth: **at 2560x1440 the read-back
+was 0.5-0.9 ms a picture and the device copy is 0.09 ms**, and the repeats and skips the
+read-back's jitter produced at 120 pictures a second (five of each in some seconds) are
+gone with it. The copy is queued on the backend's own stream behind the interface's map and
+waited for before the picture is unmapped, so acquire returns with the bytes in place and a
+null fence stays correct on this kind; a real fence is a refinement rather than a
+requirement. **The wait sleeps** (*2026-09-25*): it is on an event made to block, recorded
+behind the copies, because a wait in the vendor's context spins by default -- the decode
+thread held a core for the whole copy, and with every core busy it was preempted mid-spin
+and saw the end a scheduling slice late, a 99th percentile of 5-6 ms on two busy cores in
+most runs where the sleeping wait held 1.6-1.8 ms in all. The context's own flags stay as
+they are: the application shares that context, and a context-wide sleep slows the planes
+route's read-back, which the driver stages through its own buffer in chunks and waits on
+each. The descriptor is the kind NVIDIA's GL and Vulkan import as external memory; the
+second kind, a buffer descriptor with its layout modifier, is the open stack's, which can
+export the decoded surface itself with no copy at all but must then hold that surface out
+of the decoder's pool for the lease, which is the fence's job; it comes later.
+
+**Device slots are sized at the stream's size, never at the ceiling.** Device memory is
+real where the host-memory slots' reserve is virtual: full chroma at sixteen bits is 200 MB a
+slot at the ceiling, and a 1080p stream would leave most of it idle. A slot is allocated when
+a picture of a new layout is about to be decoded into it, exported once, and the allocation
+before it is freed then -- which is after the last hold on it was released, because the ring
+lends a slot to the producer only once nothing holds it; so a slot the application holds is
+never pulled from under it, which is the same rule the host-memory slots keep by never
+reallocating at all. The frame carries its slot's descriptor and the allocation's ordinal,
+and **the application's import is keyed by the ordinal**: descriptor numbers are reused once
+closed, so the number alone cannot tell a new allocation from an old one, and an import whose
+ordinal no longer appears may be dropped. The renderer this was built against imports the
+descriptor as a buffer and fills its plane textures from that buffer at each plane's offset
+and pitch, a device-side transfer costing 0.05 ms for two planes at 2560x1440 -- so the
+pitch stays the library's and no tiled-image layout has to be negotiated.
+
+Each picture carries what the header and the bitstream said about it: size, rotation (applied
+by the renderer, not the decoder -- the picture arrives as the display was encoded, and a
+quarter turn is a transform at present time), colour depth, chroma layout, the generation it
+belongs to, and **whether its samples span the full range** (*added 2026-09-24*, minor 15).
+The range is the parameter set's video signal type, read by the library's own readers for
+the hardware backends and asked of the codec library for software; a set that says nothing
+means the video range, as the standard infers. **The client asks and the host decides**
+(*corrected 2026-09-24*; this said nothing on the wire negotiates it): the declaration's
+full-range bit says the application's renderer takes it (§7, [01 §11](01-protocol.md)), and
+a host that acts on the bit codes the full range when every seat declared it. One
+established host does, at every codec and depth, measured at luma 0 to 255 with a fifth of
+its samples outside 16 to 235, and codes the video range when the bit is clear; a host may
+also leave it unmet. Nothing here converts it. The samples
+leave as they were coded and the renderer is told, since a conversion here
+would cost a pass over every picture and spend precision; a renderer that assumes the video
+range draws such a picture with its blacks crushed and its contrast raised, which is how it
+was found.
+
+### §4.1 What latest-wins costs, and what it cannot do
+
+**Latest-wins trades motion evenness for currency, and the trade is deliberate** (*added
+2026-09-16*). The application presents on every refresh whatever it is shown; what moves is
+the source-time step between consecutive presents. With the stream above the display's rate
+the step is two frames with a jitter of one, from the phase between decode completion and
+the poll; with the two rates equal and their clocks unsynchronised, their beat skips or
+repeats one picture per beat period, a periodic hitch; below the display's rate there are
+only repeats. A burst -- a decode stall followed by three pictures in three milliseconds --
+shows the last and drops two. A first-in-first-out queue would smooth every one of these by
+holding pictures, and would then be that many frames late for the rest of the session. The
+wire carries no presentation timestamps (the header has size, rotation and generation), so
+any pacer here can only pace on arrival time, which the network jitters; it would buy
+evenness with latency and nothing else. The rates are the real lever: a stream at the
+display's rate, or an integer multiple above it, is the smoothest a client without a pacer
+gets.
+
+**And it cannot help a decoder that is slower than the stream.** A predicted picture needs
+the one before it, so an undecoded backlog cannot be thinned; it sits in the receive ring,
+grows until the ring is full, and from then on the picture is the ring's depth in the past
+while input acts on the present. No client generation compared here has a remedy: the
+established client warns the user when its queue stays above thirty messages and leaves the
+rate to the host's panel; the newest one can fast-forward only to a keyframe that is already
+in the backlog, which without a periodic keyframe on the host is never there.
+
+**Three decisions were deferred here and are now taken: none of them is in v1** (*decided
+2026-09-19*, at C5's planning, on the numbers below):
+
+- *A presentation pacer in the application, not the library.* Moonlight, an open client for
+  a different protocol, sets the frame rate from the client and offers frame pacing as an
+  option with its trade-off named -- lowest latency or smoothest motion; the same shape fits
+  here as a deeper hold count on acquire, so an application that wants evenness over
+  currency can buffer. Not built: the cadence numbers show nothing a pacer would fix at the
+  rates that matter, and the library stays latest-wins.
+- *A decode-lag keyframe request*, §5 below. Not built.
+- *A presentation-rate hint and a sustainability event*, §9 below. Not built.
+
+What every established client does instead, and what this one does: **the reader's lag is
+the application's warning.** A client whose reader has been thirty or more messages behind
+for sixty consecutive samples tells the person that the host's resolution or rate is too
+high for this hardware, and clears the warning the moment the lag drops under thirty; status
+carries the figure ([§9](#9-events-status-and-metrics)) and the demo draws the warning. A
+decoder slower than its stream has no remedy but fewer frames, and the only lever for that
+which every host honours is the application's own message.
+
+**The numbers, recorded 2026-09-17** (this machine, this host, 1080p H.264 at 120 pictures a
+second, a 120 Hz display, independent motion on the desktop; the C demo's own count of
+presents, new pictures, repeats and skips a second, decided on at C5's planning):
+
+| stream against presentation | pictures | repeats | skips |
+|---|---|---|---|
+| 120 against 120, ten minutes | 118 (mean 116) | 3, ninety-fifth percentile 11, at most 38 | the same |
+| 60 against 120 | 60 | 60 | 0 |
+| 120 against a 60-a-second poll | 60 | 0 | 60 |
+
+The equal case is the beat above: two clocks at the same nominal rate slip one picture
+against each other a few times a second, and each slip is one repeat and one skip. The
+other two are exactly what the paragraph predicts, and neither drops a picture it did not
+have to. The decoder's own time is [§9](#9-events-status-and-metrics)'s.
+
+**The record the decision was made on, this phase's gate** (*2026-09-19*, this machine,
+2560x1440 at 120 pictures a second, ten minutes a run, the preferences walked every hundred
+seconds, two client windows and a spinning test window on the captured desktop): **the
+reader was never more than one message behind** -- at most 16 ms -- on either backend, at
+either depth, by either route, and against the established host over the internet; the
+vendor backend by the handle route ran 120 pictures a second at 0.6-0.75 ms of decode and
+0.09-0.14 ms of device copy with no skips outside the switching second; its planes route
+0.5-1.0 ms of read-back with a few skips a second; the open stack 2.0-3.4 ms of decode and
+1.8-2.4 ms of read-back, 115-120 pictures a second at eight bits and 19 skips a second at
+ten, where the decoder is seventy percent busy and latest-wins does what it should. The
+warning never fired. A switch costs the switching second about forty repeats: the keyframe
+the host is asked for.
+
+### §4.2 On Windows (*planned 2026-09-26*, W1; *built 2026-09-28*, W1.4)
+
+**A picture of the handle kind is one shared texture per plane**, in the legacy form, which a
+renderer on the same GPU in the same process opens by its handle: a luma and a two-channel
+chroma texture at eight and ten bits, three single-channel textures for full chroma. The
+frame carries a handle per plane and the identity of the GPU they are on. The library makes
+them on a device of its own on that GPU, never the renderer's: two users of one device are
+serialised on its lock, and the decode would wait behind the renderer's present. The handle
+kind needs the fence that says a picture is finished, which the system has from Windows 10
+1703; a device without one hands out planes, and the listing says which GPUs hand out
+handles by asking each device, not the system's version.
+
+**The split is one compute pass**, reading the decoded surface and writing the planes
+(*built 2026-09-28*): a thread a chroma sample of the two-plane layouts, which covers four
+luma samples, or one a sample at full chroma. Every sample is read as an integer and written
+as the exact normalised value of the same integer, ten bits into the high bits of sixteen, so
+the planes hold the decoded samples bit for bit -- every committed clip, read back through its
+handles on a second device, on each of the three GPUs. The pass reads the decoder's surface
+array itself where the device lets a shader read it, which every GPU here does, and a
+whole-slice copy of it first where one does not; both are checked on every device. The
+shaders are compiled ahead of time and carried as bytecode, so nothing is compiled at run
+time or at each device's open.
+
+**The picture is finished before it can be acquired, and nothing waits for it on the decode
+thread** -- a picture of the handle kind (*scoped 2026-09-27*, W1.3: a picture read back to
+planes is waited for in its read-back, as on Linux, the wait sleeping on the device's
+progress). The decode thread queues the decode, the split of the decoded picture into the plane
+textures and a signal of the library's fence, all on its own device, and takes the next unit
+at once. The split reads the decoder's output directly where a driver lets a shader read it,
+and copies it into a plain texture first where one does not; each device is probed. A
+picture becomes acquirable when the fence has passed it, which is a read of a value and not
+a call into the driver; the queue's newest picture is its newest finished one; and an acquire
+with a timeout sleeps on the fence on the application's thread. So the application's device
+never waits on the library's, the release fence keeps its one kind, and a renderer imports
+the textures as it would any shared texture. An earlier implementation tried both of the
+other ways, and this is written against what it found: waiting on its decode thread for its
+own device work, it fell behind the stream past 60 ms under contention on an integrated GPU;
+handing a picture out before its device work was known to be done, trusting the driver to
+order two devices, it showed pictures out of order on one vendor's driver.
+
+**As built** (*2026-09-28*), a published slot carries a gate: the value its device's fence
+reaches when the picture is finished. The acquire hands out the newest slot whose gate the
+fence has passed and leaves a newer one still unfinished for the next take; with none
+finished it sleeps on an event the fence sets at the lowest value still outstanding, and a
+close sets it by hand. A consumer on another thread taking pictures as an application would,
+each read back through its handles on a device of its own, found every one a reference
+picture, whole: on all three GPUs, back to back and at 120 pictures a second, and on the
+integrated GPU beside another process holding its video engine at 100 %, where a picture was
+seen finished 6 to 8 ms after it was queued and the decode thread never waited. With the gate
+ignored, 97 of 120 pictures were read before they were finished. The same check found that the
+queue itself could hand out an older picture after a newer one: a slot stolen and published
+again between the consumer's scan and its take was handed out under its older number. It is
+read once the slot is held now, and the model check that found it is kept. (*2026-09-29*: the
+take could also free the newest picture unseen, freeing a slot as older after the producer
+had stolen it and published it again as the newest. A slot's state and its publish sequence
+now share one word, so every exchange compares the publish it looked at; a model check found
+it, and failed first.)
+
+**A picture of textures is written again once released**, as soon as the next picture needs
+its slot. So a null release fence, the only kind, says the application's device has finished
+reading it -- which a renderer that waits on its swap chain's latency after each present has,
+as the example client's does: its last draw of a picture is done before its next acquire and
+release. A renderer that queues further ahead waits for its own device before it releases.
+
+**The GPU is the application's to name, and it names the one it renders on.** A renderer on
+another GPU than the display pays a copy of every presented picture across the bus and loses
+the direct flip, so the display's GPU is where a renderer belongs, and the library follows the
+renderer: a decoder that cannot run on the named GPU hands out planes, never a handle the
+renderer cannot open. (*Measured 2026-09-28*, W1.4: a renderer moved to the Intel card to
+open its textures, the display being on the NVIDIA, took 5.5 ms from the acquire to the
+screen against 1.4 for planes drawn on the display's GPU, and 9.7 ms from the arrival
+against 5.4 end to end. So a decoder on a GPU that does not drive the display is better
+served by planes than by moving the renderer to it.) (*2026-10-27*, W1.9: the example client
+names it so: it draws on the GPU its decoder is named on, else on the system's first adapter,
+and with nothing named creates its decoder there -- by handle always, by planes where a hardware
+decoder is listed there -- so its textures open where they are drawn. Pictures moved to another
+GPU, by its decoder chord or a lost device found again under a new identity, bring its renderer
+after them. Which GPU drives its window's monitor it does not read; that choice is an
+application's own interface's.) **A GPU is named by its identity**
+(*built 2026-09-27*, W1.3), the one the system gives it for the boot, spelled `luid:HIGH:LOW`
+in the listing and taken back as the device; it changes when the GPU is reset or its driver
+replaced, so an application names it again from the listing then and never keeps it. The
+GPUs are listed in the system's high-performance order, and a decoder nobody placed settles
+on the first. A virtual display's adapter, which the system enumerates under the name of the
+GPU it renders on, is not listed: it would show that GPU twice.
+
+**Each slot carries its own backing**, made again when the slot comes back free after the
+session's backing has moved on. One mechanism serves three changes. The session moves to
+another GPU by `lowlat_client_set_decoder`, which a session of the handle kind now accepts: a
+picture still held stays valid on the old GPU until it is released, and the picture resumes
+at the new decoder's keyframe. Planes and handles switch by `lowlat_client_set_frame_kind` at
+the next picture and with no keyframe, since the decoder keeps running and keeps its
+references. And the device lost to a driver update or a reset is made again, and since the
+GPU may come back under a new identity, the application names it again the same way.
+
+**As built** (*2026-09-28*), each backing is a generation, and a gate carries its generation
+beside the fence's value: a picture of a backing the session has moved on from is never
+handed out, so a move waits for nothing -- the picture or two in flight at the move are not
+shown, and a move needs a keyframe anyway. **The frame kind is a preference where the decoder
+changes**: in a session asking for handles, a decoder that hands out none is taken all the
+same and its pictures come as planes, and a move back to one that hands them out returns to
+handles; asked for by name, handles are refused by such a decoder. The vendor's decoder on
+Linux switches kind and device the same way. **A lost device is found again by the library**:
+the GPU comes back under a new identity, so the decode thread looks for the same hardware --
+the maker's and the board's numbers, a virtual display sharing them never taken -- and only
+for it, for five seconds, opens there and asks for one keyframe; pictures then name the new
+GPU, and a renderer whose own device was lost at the same moment opens its textures there. A
+session nobody placed takes the first GPU offered once the five seconds have run, and one
+placed fails the stream then, as before. (*Amended 2026-09-29*: the search took ten seconds
+and let a session nobody placed take another GPU at its first look, a quarter of a second
+in; the GPU that drives the display takes nearly four seconds to come back from a driver
+restart, so such a session stayed on the other GPU for good.) **The
+loss is taken wherever the device first refuses**: a removed device can go on accepting
+decodes and refuse only the hand-over after them, so a take that finds the device gone ends
+the decoder as a decode that does. **A renderer can lose its device while the pictures' GPU
+stays as it was** -- a restart of another GPU was enough -- so it recovers by itself rather
+than waiting for the pictures to name another GPU. Restarting each GPU's driver mid-stream,
+the stream was drawn again within one to three seconds, the longest on the GPU that drives
+the display, whose restart alone took nearly four.
+
+**The vendor's decoder hands out the same textures** (*built 2026-09-29*, W1.5): its pictures
+land in the queue's slots as the system decoder's do, copied there by the vendor's own runtime
+rather than split by a shader, the slot's textures made on a device of the library's own on the
+same GPU, whose fence is signalled behind the copies. The runtime writes a texture only while it
+holds it mapped, and the map and its release are queued on the runtime's stream behind the
+decode, so the decode thread queues a picture's decode, its copies and the signal and takes the
+next unit. The release orders the copies before any work that device issues after it, which is
+why the fence is that device's and is signalled there: signalled ahead of the copies instead, a
+second device read pictures unfinished. A slot made for the vendor's decoder registers its
+textures with the runtime when it is made and keeps the registrations until it is made again,
+so a picture still held survives a move to another decoder as it does between GPUs. **A device
+lost under the vendor's decoder is not looked for**: its runtime does not come back in the
+process that lost it -- restarted mid-stream, the old context refused every call and a new one
+could not be made -- so the stream fails and the session ends as the decoder's failure (§5.2).
+
+**A picture of textures is timed on its device** (*2026-09-30*, W1.5). Nothing on the decode
+thread waits for it, so its decode figure -- what status carries and the host is told -- is the
+device's own time from the take to the fence passing, stamped where the span opens and behind
+the fence's signal, and read at a later take. Until then it was the time the application's
+acquire saw the picture finished, exact only when the acquire was waiting for it: an
+application acquiring on its own cadence showed its cadence as decode. A span is opened by
+handing the queue to the device at once -- left in the runtime's buffer, a mark is stamped when
+the buffer next goes, a picture late -- which cost the submit about 50 us a picture on every
+GPU here, so one picture in eight is timed. The figure leaves out the submit's way to the
+device and the driver's telling a waiting thread, which differ by GPU: in the clip tests, at
+the median, 0.1 ms on the NVIDIA by the system's interface and under 0.07 by its vendor's
+decoder, 0.17 on the Intel card, and from 0.1 to 1.4 ms on the integrated GPU. In a live
+session by the vendor's decoder at 2560x1440 it ran from 0.75 to 2.8 ms between the tenth and
+ninetieth percentiles, the longest in seconds whose own presents also ran long and whatever the
+stream's rate: the GPU busy with other work, the picture waiting its turn -- latency the
+acquire sees as well.
+
+**Measured** (*2026-09-28*, W1.4; 2560x1440 at 30 pictures a second from an established
+host). **Where the renderer is on the GPU that drives the display, the handle is the faster
+route**: in one session with the kind switched every twenty seconds, a picture took 2.2 to
+2.7 ms from its arrival to the screen by handle against 3.5 to 3.6 by planes, its draw and
+present 0.5 to 0.7 ms against 1.3, and ten-minute runs took a quarter of the processor time
+planes take. The presentation's own mode moves both kinds by about a millisecond: ten-minute
+runs that stayed in the slower one took 4.5 ms by handle, so a comparison across runs says
+less than one within a session. Ten-bit and full chroma at both depths arrive by handle on
+the two GPUs that decode them. On the integrated GPU the handle route took more processor
+time than planes, 13 to 15 % of a core against 4 to 6, not yet explained. (*Explained
+2026-09-30, W1.6, and fixed 2026-10-27*: the example client's toolkit opened every plane's
+texture again at every draw, and drawing on one GPU while presenting to another's monitor grew
+the process with every draw, its processor time climbing with it -- the figure was the climb's
+average. It opens a picture's textures once now.)
+
+### §4.3 On macOS (*planned 2026-10-29*, M1; *built 2026-10-30*, the planes at M1.2 and the handle at M1.3)
+
+**A picture of the handle kind is one IOSurface**, retained by the library for the lease.
+VideoToolbox decodes into buffers backed by surfaces from its own pool, and the frame describes
+the surface's planes with its own fields -- the layout, each plane's size and stride -- as it
+does on the other platforms. The application imports each plane into its own device by plane
+index at the format the layout gives it, so it needs no Core Video, and the decoded buffer, its
+pool and its colour attachments stay inside the library. Every graphics interface on the system
+imports a surface: Metal by plane, OpenGL, Vulkan through its Metal layer.
+
+**The lease ends when the application's own GPU work on the picture has completed**, not when
+that work was submitted: the surface goes back to the pool at the release and the decoder writes
+into it again.
+
+*As built (M1.3)*: a picture asked for by handle is the hardware decoder's own buffer held in its
+slot, unlocked, until the ring lends the slot again -- the rule the planes kind keeps, below --
+and the frame carries the buffer's surface, the kind followed per picture. Its allocation is the
+surface's identifier, which an import keeps from naming another: measured, an identifier comes
+back the moment its surface is freed, and never while a texture made from it lives. A plane
+imports in about 20 us on an M2, 30 under the translation layer, where the planes kind's upload
+of the same 1440p picture into textures costs 0.75 to 1.65 ms, 3.0 to 5.1 under the translation
+layer; the decoder's pool holds the pictures held and one more, five surfaces for the queue's
+four. The demo's toolkit imports a picture's planes once per allocation, keeping eight, and its
+present waits for the GPU on the queue it drew on, so a picture it releases at the next acquire
+is no longer being read. On ten-minute legs alternating the kinds every 30 seconds against this
+project's host at 1080p and 60, the process took 25 percent of a core by handle against 35 by
+planes, 31 against 39 under the translation layer, and a picture reached the screen 2.6 to 7 ms
+sooner at the median; the decode measured 0.2 to 1.4 ms slower by handle, likely the system's
+clocks following the lighter load.
+
+**The system's software decoder writes into a buffer it has handed out** (*found 2026-10-30* on
+CI's virtual Mac, where it took every stream, and reproduced on an M2): a picture the queue held,
+retained and locked for reading, changed under it as later pictures were decoded; the hardware's
+buffers stay as handed out. So only the hardware's pictures are lent or exported, below and
+above; a software session's are copied into the queue's own slots, as every other platform's
+software decoder's are, and come as planes to a session that asked for handles.
+
+**A picture of the planes kind is the hardware decoder's own buffer** (*built 2026-10-30*, M1.2), lent to
+the queue's slot being filled, locked for reading from its publish until the ring lends that
+slot to the decoder again, and handed out where its planes lie, without a copy. The ring lends a
+slot only once nothing holds it, so a held picture's buffer is never written; a released one
+waits in its slot, at most the queue's four, and goes back to the decoder's pool when its slot
+takes the next. **Each plane carries its own pitch**: the decoder aligns each plane's rows on
+their own, so at full chroma the chroma's pitch is twice the luma's only where the width allows
+it -- 2560 and 5120 bytes at 1440p, but 320 against 192 at 144 wide -- and the software
+decoder's chroma does not follow its luma at a whole number of rows. **Full chroma is two
+planes**, the luma and both chroma components interleaved at full size, as the decoder writes
+it ([06 §3b](06-api.md), `NV24` and `P410`). Every picture is finished when it is published, so
+nothing is gated. The codec library's pictures go into the queue's own slots, as on Linux.
+
+## §5 The decoder, and when a client asks for a keyframe
+
+**A decoder is built from the stream, not from the configuration.** The first access unit led
+by a sequence or video parameter set builds it, for the codec the unit names, at the depth the
+video header's bit 3 names, and any later unit led by parameter sets rebuilds it -- unless the
+header's bit 5 is set, in which case the unit is fed to the decoder that exists and the
+generation rule below is not applied to it ([01 §11.3](01-protocol.md)). A host that repeats
+parameter sets on every keyframe without setting that bit costs a rebuild per keyframe, and
+the two hosts compared here both repeat them. **Under the video protocol the rebuild is
+explicit instead**: a keyframe-metadata message whose rebuild bit is set tears the decoder
+down before the keyframe it announces, and every keyframe carries bit 5; a metadata message
+is consumed and never decoded (*amended 2026-09-16*). This host sends the pair to a guest
+that declares the protocol ([05 §6.1a](05-host.md)).
+
+**A client asks a host for a keyframe in exactly two cases**, and both are sent as opcode 13
+with the reinitialisation argument set:
+
+1. Its video configuration changed -- a different codec, colour or decoder was requested -- and
+   the decoder was torn down for it.
+2. Its decoder reported a fault it cannot recover from, and was destroyed before the request
+   went out, so the next access unit starts a fresh one. (*Amended 2026-09-30*: a fault met
+   handing a decoded picture out -- its split or its read-back refused -- is judged as one met
+   decoding, a fatal one ending the session. It was a lost picture alone, so a decoder failing
+   every hand-out streamed nothing with nothing asked.)
+
+There is no periodic refresh, no request at start-up (the host's own start sends a keyframe),
+and no request on a gap (§3). Above all, **the request is not gated by time**: a request that
+is dropped rather than deferred while a throttle is active leaves the decoder waiting for a
+keyframe that never comes, because a decoder starved of one reports "need more data", not a
+fault, and nothing re-arms the request. **And the request is an encoder rebuild on the other
+side**, not a picture: the established host tears its encoder down and builds it again on
+every one, with a rate reset and a keyframe after ([01 §11.5](01-protocol.md)). This host
+answers a request that changes nothing with a keyframe alone; a client cannot assume that of
+any other host, so it asks only when it must.
+
+**The request and the teardown are one act, and there is at most one per fault** (*corrected
+2026-09-16*). A decoder that reports a fault is destroyed and the request goes out once; after
+that, every access unit that cannot build a decoder -- anything not led by a parameter set --
+is ignored without a request, and an access unit that decodes to nothing is not a fault. So a
+burst of bad units costs one request, which on the established host is one encoder rebuild,
+never a storm; and a request is never sent while there is no decoder to be at fault. An
+earlier draft here asked on the first fault and rebuilt only when faults persisted, which
+sends a request per bad unit; against a host that rebuilds its encoder on every request that
+is the storm, and it is not what any client does.
+
+**A third trigger, for a reader that has fallen behind, was considered and is not built**
+(*recorded 2026-09-16*, *decided 2026-09-19*; the record stays because the shape is
+non-obvious). The two cases above are the established rule and they leave the slow-decoder
+case of [§4.1](#41-what-latest-wins-costs-and-what-it-cannot-do) without a way out: the
+backlog has all arrived, the decoder is sound, and nothing in it is a keyframe to skip to. A
+request sent when the reader is more than a threshold behind, no announced keyframe is ahead
+in the ring, and none went out in the last two seconds, gives the catch-up of
+[§3](#3-the-receive-path) something to land on: the picture snaps to the present at the cost
+of a keyframe from this host and of an encoder rebuild, every two seconds while the lag
+lasts, from the established one. It is a divergence, and a correct one on this protocol --
+an instantaneous refresh resets references, so nothing is lost by abandoning arrived
+pictures -- but it does not cure a decoder that is slower than the stream; only fewer frames
+do, which was §9's event. **The lag number, recorded 2026-09-17, which decided it**: under the simulator, against
+this host's framing with a keyframe every 300 pictures, a decoder at half the stream's rate
+falls 159 messages behind at the deepest and the catch-up discards 611 pictures over 1317
+frames to land on each keyframe; a decoder that keeps up is never more than two behind.
+Live against this host (which announces its keyframes and sends none periodically) the
+reader was at most one message behind for ten minutes.
+
+**A picture whose generation is older than the one the host last announced (opcode 29) is
+stale**, from an encoder that no longer exists; the decoder is torn down before it is fed, so
+that the new generation's keyframe, which carries its own parameter sets, builds a fresh one.
+
+**A format change is a rebuild that re-feeds the unit once** (*2026-09-17*). A decoder that
+reports the stream's format changed under it has not decoded that unit; it is torn down, a
+fresh one is built for what the header names, and the same unit is fed again, so the picture
+that changed the format is not lost. A second report on the same unit is a fault in the
+backend, not a change in the stream. A backend that cannot be built at all ends the stream
+with the stage named rather than asking the host for keyframes it would fail on the same way.
+
+### §5.1 Backends, Linux, in order
+
+| backend | reached through | hands out |
+|---|---|---|
+| VA-API | the driver's own interface, loaded at runtime | planes by read-back, full chroma included where the driver decodes into a layout the library reads (*2026-09-22*, C9); the surface's own buffer descriptor, later |
+| NVDEC | the vendor's decode interface, loaded at runtime | planes by a device-to-host copy; an exportable slot filled by a device copy (§4) |
+| software | the machine's own libavcodec, loaded at runtime and only when it is an LGPL build (*built 2026-09-21*, C8) | planes, converted from the decoder's own layout during the copy |
+
+The choice is the application's, by kind and render node, as the listing reports them;
+unset, the first render node the open stack decodes on, then the vendor interface on any of
+its devices, then software, so on a machine with both hardware interfaces the vendor
+backend is chosen by naming it -- or by asking for handles, which only the vendor backend
+exports -- and a machine with any hardware decoder never reaches software. With a render
+node named, the automatic order tries the open stack on that node, then the vendor's
+interface on the card behind it, then software (*corrected 2026-09-21: it stopped after the
+open stack, and the handle kind with a node named took any vendor device*). The device is
+named as a render node for either hardware backend; the vendor's resolves it to the card
+behind it; for software it may name the directory the pair was found in. **What can be
+opened is listed** (*2026-09-19*): a fixed table of slots -- the open stack on each of eight
+render nodes, the vendor's device by ordinal, the codec library last -- each probed exactly
+as creation probes it and alone, with what it decodes, its size limits and whether it
+exports a handle, so an application shows a menu or picks by capability rather than
+guessing at a name; a slot with nothing behind it says so and why (*corrected 2026-09-22*:
+the first shape re-probed the whole machine on every call). Each row carries a label for a
+menu -- the interface and the card's maker, `VA-API [Intel]`, `VA-API [AMD]`, `NVDEC
+[NVIDIA]`, `libavcodec [LGPL]` -- and the driver's own words beside it (*2026-09-22*, minor
+13). Nothing is linked: a machine
+without any of the three refuses with the stage named, exactly as a host without an encoder
+does. Nothing this library loads writes to the application's standard error: the open
+stack's own messages go to the library's log, per display.
+
+**Software decode is the machine's own libavcodec, and only an LGPL one** (*decided
+2026-09-21*, [impl-plan-client.md](impl-plan-client.md) C8). Nothing is shipped or built:
+the pair (`libavutil`, `libavcodec`) is looked for in the environment (`LOWLAT_FFMPEG_DIR`,
+`LOWLAT_FFMPEG_VERSION`), beside the running executable, then the dynamic linker's own way,
+majors 4 through 9 with the highest that opens winning, and before any other entry point
+is called it is asked its licence; a pair that does not answer `LGPL` is closed at once and
+reported as such, so on a distribution whose build is GPL the software row does not exist
+and the copyleft rule of [impl-plan.md](impl-plan.md) gate 4 holds by construction. **A
+library built with the `gpl-libavcodec` feature takes a GPL pair as well** (*added
+2026-09-21*): the default build never does; a build that opts in is its maker's combination,
+to which the GPL's terms apply, and it says so through `lowlat_features` so an application
+can tell the two builds apart; a pair answering `nonfree` is refused by every build. No
+header is pinned: the surface relied on is the same on every major accepted and is checked
+at load against the library that loaded; everything numbered that has moved between majors
+is resolved by name. The decoder's three-plane pictures leave in the same four formats the
+hardware backends hand out, converted in the copy that hands them out, so no fifth format
+reaches the application and no flag says where in sixteen bits a ten-bit sample sits: it is
+in the high bits whatever decoded it.
+
+**As built** (*2026-09-21*): a codec counts as decoded only if its decoder opens, not if its
+name is known -- a pair at hand carries an H.264 decoder that refuses to open without a
+device behind it, and the listing must not promise it. The library's pixel formats are
+resolved by name because they are numbered differently on a 4.x pair than on 5.x and later
+(measured: the ten-bit formats sit two higher there). Slice threading, capped at four and by
+the machine's parallelism, and nothing else: the low-delay flag was measured on every
+committed clip and changed nothing, so it is not set. **The workers never outnumber the
+machine's threads, and no thread of the library's is raised above the application's**: the
+library runs inside the application's process, and workers past the cores, or above the
+window's own thread, starve the message pump on a two-core machine and read as the
+application hanging -- a rule written down (*2026-09-22*) with its test, after a client
+generation compared here shipped exactly that fault. Every committed clip decodes bit-exact
+through an LGPL 7.1 pair and the second codec's through an 8.x one, full chroma and ten-bit
+included, with one documented exception: **a stream that reorders more than it declares
+loses a picture at each depth the library discovers** -- a picture arriving for an earlier
+place than the last one put out is dropped and the buffer deepened -- where the library's
+own readers hold such a picture; a stream that declares its reordering, or does not reorder,
+loses none, and no host compared here sends the undeclared kind. The output delay is the
+stream's own: none for a stream without bidirectional pictures, its declared depth otherwise.
+The conversions at 2560x1440 cost 74 us (NV12), 168 (P010), 147 (three planes at eight bits)
+and 554 (three planes at sixteen), measured on the development machine; the per-unit path
+allocates nothing on this side. Ten minutes from this host at 2560x1440 H.264, 120 pictures
+a second with a moving scene: decode 1.8 ms at the median and 2.2 at the 95th percentile,
+2.7 at most; the conversion 0.16 and 0.19 ms; the reader at most one message behind; the
+whole client process at 31 percent of one core and 290 MB resident. Ten minutes of HEVC
+ten-bit the same way: decode 2.98 ms at the median and 3.46 at the 95th percentile, the
+P010 conversion 0.42 and 0.71 ms, 120 pictures a second decoded throughout, 55 percent of
+one core, 360 MB resident. From the established
+host over the internet, at its own cadence and bitrate (few, large pictures on a still
+desktop, up to 60 KB each), decode 2.8 ms at the median and 7.9 at the 95th percentile:
+the software decoder's time follows the bits in a picture, not the rate.
+
+**Full chroma on the open stack, where the driver's layout is one the library reads**
+(*built 2026-09-22*, C9). The open-stack backend refused every range-extended stream because
+no device it was built on could verify the surface it would read back. A discrete Intel
+part can: its driver decodes HEVC Main 4:4:4 at eight and ten bits into packed layouts --
+V, U, Y and a fourth byte per sample, and a word per sample with ten bits each of U, Y and
+V -- and the four committed full-chroma clips come back bit for bit through the
+range-extension parameter structures and an unpacking in the read-back copy, into the same
+two full-chroma formats the vendor's and the software backend hand out. The capability is
+reported only where the driver offers, for the profile, a layout the library reads (planar,
+or the two packed ones), so a part that lists the profile with another layout is not asked
+for it; the stream's own parameter set settles depth and chroma, the declaration only
+guesses, and a stream the range extensions allow but no profile here takes -- half chroma,
+the extension tools on a 4:2:0 stream -- is refused outright as before.
+
+**One decoder is chosen at creation and there is no automatic fallback to another**
+(*2026-09-19*, *amended 2026-09-21*). An established client offers the second codec and
+both colour axes as preferences and, when its hardware cannot decode what arrives, quietly
+moves to a software path; here the preference is masked by capability before it is
+declared (§7), so what arrives is what was declared, and a stream the built decoder cannot
+take -- which can only be one the client did not declare -- ends the session with the
+decoder's status and the stage named. A quiet switch to a slower decoder ships a degraded
+stream without telling anyone, and the application cannot choose what it does not know
+about. **The application may choose, mid-session** (*built 2026-09-21*, C8):
+`lowlat_client_set_decoder` names another kind and node, is refused with the stage when it
+does not open and changes nothing then, and otherwise is one act -- the declaration
+re-masked by the new decoder's capability, the running decoder torn down, the new one
+opened on the decode thread, and exactly one keyframe request with the reinitialisation
+argument, the first of the two request cases of §5 -- so the picture resumes at the next
+keyframe and the queue never closes. **The request is the replacement's, made once it
+exists**: the old decoder is torn down without asking, the new runtime opened, and the new
+decoder asks as its first act, so a keyframe never arrives for a decoder that is still
+opening and a runtime that fails to open costs the host nothing; the units that arrive
+meanwhile are dropped by the rule that ignores everything but a parameter-set-led unit
+while no decoder exists. The frame kind is the queue's shape and stays the creation's: a
+session of the handle kind refuses the call, because its device slots are bound to the
+device (*planned for W1*: each slot carries its own backing, and the call is accepted,
+§4.2). A decoder that cannot serve the frame kind is refused where it is asked for, never
+answered with a frame of another kind. Measured against this host at 2560x1440, the three
+backends walked every hundred seconds, five moves: each answered by exactly one keyframe
+(the host's log shows one reinitialisation per move and nothing else), the picture back
+within the second, the move to the vendor's costing about 35 pictures for its runtime's
+opening -- some three hundred milliseconds -- the move to software 9 and to the open stack
+2, and nothing behind by more than one message before or after any of them. Against the
+established host over the internet the same five moves cost one encoder build each on that
+host's own log -- six builds in all, the connect's and one per move, nothing else.
+
+**The creation-time probe builds a real decoder per combination** (*2026-09-19*) of codec,
+chroma and depth, and destroys it, rather than trusting a capability query: the vendor
+interface's query has reported a combination the device then failed to create, inside the
+driver, where nothing catches it. A device that fails a combination fails it at creation,
+in the probe, with the stage named, and never mid-stream in the application's process; and
+what the probe found is what the declaration is masked with.
+
+**The library reads the bitstream itself** (*built 2026-09-17*). The device interfaces on this
+platform decode a picture from its parameters and its slices; reading those out of the stream
+is not theirs. So the library parses both codecs' parameter sets and slice headers in full,
+derives the picture order, keeps the decoded picture buffer, builds the reference lists, and
+hands the driver the picture, quantisation-matrix and slice parameters it asks for, with the
+slice data beside them. That is most of the decoder; the backend beneath it is the device's
+context, a fixed pool of surfaces the picture buffer indexes, and the read-back. Nothing is
+allocated per unit: the parser's state, the picture buffer and the parameter staging are
+fixed arrays sized by the standards, and a unit that needs more than they hold is refused,
+never truncated. A stream that declares nothing about its reordering is held back only as
+far as it proves it must: a bidirectional slice or a jump in the picture order holds one
+picture, a picture that arrives late holds one more. The order counts that follow the frame
+number run on across its wrap (*2026-09-25*): a count that restarted there made every later
+picture read as a late one, and such a stream stopped for sixteen pictures and then ran
+sixteen behind.
+
+**The read-back is the cost of planes** (*measured 2026-09-17*, this machine, 1080p, the
+open-stack driver): about 2 ms a picture live, as much as the decode itself, and nearly all
+of it the driver's own mapping of the surface rather than the copy out of it -- the copy is a
+quarter of a millisecond, and a streaming-load copy that makes it a twentieth moves the live
+figure six percent, so it was measured and not taken. The lever is the handle path of §4,
+which has no host copy; it arrived with the second backend (*2026-09-19*: at 2560x1440 the
+vendor backend decodes in 0.6 ms and its read-back costs 0.5-0.9 ms, the open stack's 2.1
+and 2.0; with the handle the read-back becomes a 0.09 ms device copy).
+
+**The vendor backend is driven from the same readers** (*built 2026-09-19*): the picture and
+slice parameters its interface takes are filled from the jobs the open-stack backend
+stages, the interface's own parser unused -- it would be a second reader and a second
+picture buffer beside the ones every clip is checked against. Every committed clip decodes
+bit for bit on both backends, full chroma included on the vendor's.
+
+**Full chroma is the second codec's, in the range-extensions profile, and the readers read
+it** (*built 2026-09-19*): the HEVC reader admits that profile at 4:2:0 and 4:4:4, eight
+and ten bits, and reads both extension syntaxes, whose fields the devices' picture
+parameters carry. H.264 stays at eight-bit 4:2:0, which is every device's whole answer for
+it. Two planar layouts join the two that exist, with the third plane already in the
+picture's shape. On the open stack the profile is asked for and refused where the device
+lacks it, which is every device this was built on; no read-back is written for a surface
+layout nothing here can verify, and the capability stays false until a device says
+otherwise.
+
+### §5.2 Backends, Windows, in order (*planned 2026-09-26*, W1)
+
+| backend | reached through | hands out |
+|---|---|---|
+| D3D11 video | the system's video decoding interface on any vendor's device, driven by the library's own readers | planes by read-back; one shared texture per plane (§4.2) |
+| NVDEC | the vendor's decode interface, loaded at runtime, as on Linux (W1.5); first on an NVIDIA GPU | planes by a device-to-host copy; shared textures filled by a device copy (§4.2) |
+| AMF | AMD's own decoder, loaded at runtime, in its low-latency mode, driven by the library's own readers (W1.6); first on an AMD GPU where the runtime has that mode | planes by read-back; shared textures filled by the split (§4.2) |
+| VPL | Intel's own decoder, loaded at runtime from where the display driver installs it, with its older runtime for the parts the current one does not reach (W1.7); second on an Intel GPU, measured no faster | planes; shared textures filled by the split (§4.2); the older runtime planes alone |
+| software | an LGPL libavcodec pair, loaded at runtime | planes |
+| the system's decoder | the platform's own media framework, in software only (W1.8); last | planes: H.264 eight-bit 4:2:0, HEVC eight and ten-bit 4:2:0 |
+
+Unset, the order is the table's, on the GPU the application names, or on each GPU offered
+in turn where it names none -- **both hardware decoders tried on a GPU before the walk leaves
+it** (*amended 2026-09-30*: a maker's own decoder failing on the first GPU had moved the
+session to another maker's on the next, ahead of the system's interface on the first). The
+system's interface comes first because it is one backend on every vendor's device and is fed
+the same jobs the other hardware backend is, as the open stack is on Linux; then the vendor's;
+then software.
+(*Amended 2026-09-29*, W1.5: on an NVIDIA GPU the vendor's decoder comes first, having
+measured faster end to end there, below.)
+The two vendors' own decoders go after NVDEC once they are built, except on an AMD GPU, where
+AMD's comes first (*decided 2026-09-28*, W1.6): the system's interface proved short there on
+speed, below. Each puts a second reader and its own buffering in front of the same hardware,
+so they are built where the system's interface proves short on a device -- a missing
+profile, a driver fault, speed -- and not before, with Intel's older runtime for the parts
+its newer one cannot reach. (*Amended 2026-09-28*, W1.7: Intel's is built all the same,
+though the system's interface decoded every clip on the Intel card, so that every Intel part
+has its vendor's runtime, the older ones included; on an Intel GPU it comes first only if it
+measures faster than the system's interface.) The pair keeps D14's rule and is found in the
+directory the application names or beside the application, by the platform's versioned
+names. The system's decoder needs nothing installed for H.264 and the system's HEVC
+extension for HEVC, and comes last, because eight-bit 4:2:0 is all it decodes. (*Amended
+2026-10-01*, W1.8: HEVC at ten bits too; it comes last as the one decoder on the processor
+that needs nothing put on the machine, 4:2:0 alone, below.)
+
+**The pair first** (*built 2026-09-27*, W1.2). Until the hardware backends are built the
+table is the pair's one slot: the automatic choice settles on it, and the open and vendor
+kinds and the handle kind are refused as not in the build. On the development machine's
+processor, from an established host at 2560x1440, it decodes H.264 in 4.4 ms at the median
+and 6.9 at the 95th percentile and HEVC in 7.0 and 10.0, the whole process -- the renderer
+included -- using 15 to 27 percent of one core.
+
+**The system's interface** (*built 2026-09-27*, W1.3). The decoder is fed the jobs the
+readers stage for the open stack and the vendor's decoder, so the parsers and picture buffers
+every clip is checked against carry over and only the device half is new: a decoder per
+stream shape and size, a surface array the picture buffer's slots index, the slices in the
+short form -- each slice's place in the bitstream, the device reading its header itself --
+and the scaling lists in the coded order where the readers keep them raster, a list left
+raster decoding without an error to the wrong picture. A picture is read back by a copy into
+a staging texture on the device and a map of it, whose wait sleeps on the device's progress;
+on one vendor's driver the map spins about 60 us of its wait before it sleeps. Full chroma is
+decoded where the device builds the profile into the packed layouts the open stack's
+read-back already unpacks. **At eight bits it is unpacked on the device instead** (*2026-09-28*,
+W1.4), by the handle kind's split into three plain planes that are read back as they are: at
+2560x1440 the copy out fell from 1.3 to 0.5 ms on the NVIDIA and from 1.6 to 0.4 on the
+Intel card, a millisecond a picture with the wait included. At ten bits the three planes are
+half as many bytes again as the packed layout, and on the Intel card's narrower link the
+read-back's copy of them cost two milliseconds more than the unpacking saved, so ten bits
+are unpacked by the processor as before. A sleeping wait for the read-back's copy, on the
+fence rather than in the mapping, was measured and not kept: its calls cost more processor
+time than the one driver's mapping spins. Every committed clip decodes bit for bit on an
+NVIDIA, an Intel and an AMD integrated GPU, full chroma on the NVIDIA and the Intel and
+refused as fatal on the AMD, which has no such profile; the declaration is masked by that, so
+a stream never arrives that the decoder would refuse. The device on each is the library's
+own. Nothing is allocated per unit.
+
+From an established host at 2560x1440, ten minutes each, the read-back's wait (the decode
+and the copy) and the copy out at the median, the whole process's share of one core:
+
+| GPU | H.264 wait / copy | HEVC wait / copy | arrival to present | core |
+|---|---|---|---|---|
+| NVIDIA RTX 5060 | 1.8 / 0.17 ms | 2.1 / 0.15 ms | 3.2-3.5 ms | 11 % |
+| Intel Arc A380 | 3.4 / 0.14 ms | 3.0 / 0.14 ms | 5.2-5.4 ms | 5 % |
+| AMD integrated | 8.9 / 0.15 ms | 11.8 / 0.20 ms | 10.9-14.9 ms | 4-6 % |
+
+The software pair on the same stream decoded in 4.4 and 7.0 ms at 22-27 % of a core. From a
+second host at 1920x1080 with the full range, on the NVIDIA: HEVC ten-bit 1.5 ms, full
+chroma 2.1 ms at both depths, the packed layouts' unpacking 0.7 and 1.1 ms of copy. A
+decoder moved mid-session between both GPUs and software, four moves, each back within the
+second. Beside another process saturating the AMD's video engine the wait held 4.8 ms at the
+median and 9.4 at the worst, the reader never more than one message behind.
+
+The Intel card was fitted after the other two were measured. On a clip at 1440p it decodes
+H.264 in 2.7 ms and HEVC in 2.3 back to back, and in 3.4 and 2.9 with a gap between pictures:
+no low clock of the AMD's kind below. Its kernel type reads as the discrete GPU of a hybrid
+pair, beside the AMD's integrated one, and the system's high-performance order is then the
+NVIDIA, the Intel card and the integrated GPU, so a decoder nobody placed still settles on
+the NVIDIA.
+
+**The vendor's decoder** (*built 2026-09-29*, W1.5) is Linux's, fed the same jobs, on an
+NVIDIA GPU named by its identity -- its compute device found by the adapter it is -- or the
+first of the vendor's GPUs offered. Where the driver has the newer entry points (the 610
+series on, on both platforms; *corrected 2026-10-18*: on Windows 596.49 has them too and 576.88
+does not) it decodes into surfaces of the backend's own, each picture's decode queued on the
+backend's stream and its planes copied out behind it on the same stream: nothing waits on the
+decode thread for a picture handed out as textures, and a picture read back to planes waits
+for its decode, asleep, then for the copy. (*Amended 2026-10-18*: until then the copy waited
+out the decode itself -- a copy into the application's memory returns only once it is done --
+so the decode thread spun through both and both were filed as the read-back, the decode
+reading about 2 us. At 2560x1440 and 120 pictures a second the take's CPU fell from 1.03-1.09
+to 0.41-0.42 ms at the median, its wall time 20 us longer for the wake.) Elsewhere it maps the
+decoder's own surface, the map waiting for the decode, and leaves it mapped until the copies
+out of it have passed. The surfaces are made wider and taller than a small picture needs: at
+the coded size the driver refused a surface whose width is not a multiple of 64 samples, and
+decoded into one 128 rows tall with its chroma misplaced, without an error. Full chroma always
+maps, since the backend's own surfaces would hold its two chroma planes interleaved, which no
+copy splits. Every committed clip decodes bit for bit either way, on Windows and on Linux, and
+through the textures read back on a second device. It hands out planes and handles alike: how
+it decodes follows the driver, never the kind.
+
+**On an NVIDIA GPU it comes first.** Against the system's interface on the same GPU, in one
+session per codec and kind with the decoders alternating every twenty seconds, 2560x1440 at 30
+pictures a second from an established host, a picture reached the application sooner in every
+case, arrival to acquired at the mean:
+
+| stream | by handle | by planes |
+|---|---|---|
+| H.264 | 2.02 ms against 2.57 | 1.51 ms against 2.26 |
+| HEVC | 1.62 ms against 2.64 | 1.57 ms against 2.42 |
+
+and the screen 0.7 to 1.3 ms sooner. Alone for ten minutes a stream, by handle, a picture was
+acquired 1.6 ms after its arrival and on the screen 2.4 ms after, the whole process using 3 % of
+a core; by planes 1.6 and 3.0 ms at 7 %, the read-back into the application's memory holding
+the decode thread 1.2 to 1.4 ms. Ten-bit and full chroma at both depths arrive by handle, with
+the full range, from a second host; at full chroma, alternating as above, the vendor's decoder
+took 1.84 ms to the system's 2.43. Two clients on the one machine, each on the vendor's decoder
+of the same GPU, ran side by side clean. The vendor's interface has no low-latency mode of the
+AMD's kind. The GPU's clock follows its load -- at this rate it changed state every few
+seconds, the video clock between 1.0 and 2.4 GHz -- and a higher clock took about half a
+millisecond off a picture's mean; the changes themselves did not make the rare late picture.
+
+**The AMD's video engine runs at a low clock under one decode** (*found 2026-09-27*). Fed a
+1440p clip back to back it decodes HEVC in 5.9 ms and H.264 in 4.6; with any idle gap between
+pictures, 8 ms or 16, 12.6 and 8.6 -- the live figures, where a stream of 120 pictures a
+second left the reader up to 267 messages behind. The driver's power policy reads a decode
+that idles between pictures as a light load; a second stream busy enough keeps its clock up,
+through the vendor's own runtime or through this same interface alike, and halves the time.
+Recorded, not pursued at first: a decoder nobody placed goes to the high-performance GPU.
+*Followed up 2026-09-28*: the vendor's own decoder has a low-latency mode its session asks
+for. Decoding a 1440p HEVC clip alone at 30 or 60 pictures a second it takes 3.2 ms of the
+engine a picture, where this interface takes 9.2 to 9.9 and the vendor's decoder in its default mode
+9.0 to 10.0. The mode lifts the asking session only -- this interface's decode beside such a
+session at a trickle is unchanged -- and the interface has no such mode on this device, whose
+further configurations differ only in encryption. So W1.6 builds the vendor's decoder, first
+on an AMD GPU.
+
+**AMD's decoder** (*built 2026-09-30*, W1.6) is given the library's own device on the GPU and
+fed each unit whole. In its low-latency mode it hands a picture out as soon as it has read the
+unit, the decode still running, and in decode order; so the library's readers read every unit
+too, for the stream's shape and for the order pictures leave in, and hold each picture's
+surface until its turn. The split into the slot's textures and the read-back are queued behind
+the decode on the same device, and the library's fence signalled behind them, so nothing waits
+for the decode: a picture of textures is handed out when the fence passes, and a picture read
+back to planes costs the one wait the read-back's mapping makes. Left to itself the runtime
+takes some thirty units ahead of the engine and then spins, so before the next unit goes in,
+no more than two split pictures may be unfinished -- a sleep on the fence otherwise. Ten bits
+decode into the runtime's ten-bit layout: its eight-bit one decodes a ten-bit stream wrongly
+without an error. The runtime initialises a decoder at sizes its engine cannot decode -- H.264
+at 8192 square, where the system's interface stops at 4096 on the same device -- so the
+table's row takes the device's limits from the system's interface. A device lost under it is
+found again on the same GPU and the runtime made again there: restarting the GPU's driver
+mid-session cost one second and twelve skipped pictures. Every committed 4:2:0 clip decodes
+bit for bit by planes and through the textures, in the order the system's interface lets the
+same clip out in; full chroma is refused, the GPU having no such profile, and the declaration
+masked by it. *Open*: a stream larger than the engine decodes fails at each keyframe here,
+where the system's interface refuses it once. *Settled 2026-10-27:* **the engine's limit is
+asked of the system's interface on the same device**, a decoder built there at the stream's
+coded size and dropped before the runtime's is initialised, so a stream larger than the engine
+decodes is refused at its first picture as the system's interface refuses it: H.264 4112 wide on
+the integrated Radeon of the development machine and of a laptop, where 1920x1088 builds. It
+costs 1.5 to 8 ms once per decoder built. *Amended 2026-10-26:* **the decoder is
+initialised at the size the stream shows, not its coded size.** An older runtime, 1.4.31 on a
+laptop's integrated Radeon, answered every unit of a cropped stream -- a 1080-line picture is
+coded at 1088 -- that its size had changed when initialised at the coded size, so a 1920x1080
+stream decoded nothing and asked the host for a keyframe at every unit; 1.4.37 takes either.
+A cropped clip of each codec is committed beside the others, and every decoder here decodes
+them bit for bit. *Open*: ten-bit HEVC on that runtime ended the process mid-clip, once in
+the runtime and twice in an abort; not followed further. *Settled the same day:* **ten-bit HEVC
+is decoded by the runtime's ten-bit component**, which its headers call superseded: 1.4.31's
+other one, given a ten-bit stream, corrupts the process's memory whether or not the
+low-latency mode is on, where the ten-bit one decodes every ten-bit clip bit for bit in that
+mode; 1.4.37 decodes them either way.
+
+**On an AMD GPU it comes first**, where its runtime has the low-latency mode. Against the
+system's interface on the same GPU, in one session per codec and kind with the decoders
+alternating every twenty seconds, 2560x1440 at 30 pictures a second from an established
+host, arrival to acquired at the median, and the decode on the device by handle:
+
+| stream | by handle | by planes | decode |
+|---|---|---|---|
+| H.264 | 4.7 ms against 8.7 | 5.8 ms against 9.7 | 2.8 ms against 7.9 |
+| HEVC | 6.1 ms against 11.7 | 7.3 ms against 12.7 | 4.2 ms against 10.5 |
+
+and the present call 3.6 to 5.3 ms sooner. The system's interface alone fell behind when the
+host sent faster, 80 pictures a second and more, where AMD's decoder kept up. Alone for ten
+minutes a stream, a picture was acquired 4.8 ms after its arrival for H.264 and 6.3 for HEVC
+by handle, 5.6 and 7.2 by planes, the whole process using 4 to 7 % of a core by planes. Ten-bit
+from a second host with the full range arrived in 4.4 ms by handle and 4.9 by planes, where the
+system's interface on the same GPU took 8.5; full chroma asked arrived as 4:2:0 at the depth
+asked. The kind switched fourteen times in one session, clean.
+
+**Intel's decoder** (*built 2026-09-30*, W1.7) is found by the GPU itself: its display driver
+names the runtime's folder in the display device's own key, the device present whose hardware
+numbers are the GPU's, and the runtime is opened there by its full path. The current runtime is
+given the library's own device on the GPU with the device's lock on, before anything else: a
+device without it, or one handed over once the session has touched the hardware, is refused
+and the runtime decodes on a device of its own, which the backend refuses in turn by checking
+the first picture's device. It makes its decode calls on that device's context, on the calling
+thread, inside its decode call; so the split into the slot's textures and the read-back are
+queued behind the decode on the same device, the library's fence signalled behind them, and
+nothing waits for the decode, as with AMD's. Asked for decode order, it hands out each unit's
+picture from that unit's own call; the library's readers read every unit too and let the
+pictures out in the stream's order. Fed faster than its own completion follows the device, a
+millisecond or two behind, it declines a unit without taking it, which is offered again a
+millisecond later; at a stream's pace this does not happen. The runtime would start a thread a
+core and is asked for one. Parameter sets sent in a unit of their own are kept and given to
+the next decoder built. Every committed clip decodes bit for bit by planes and through the
+textures, full chroma at both depths included, in the order the system's interface lets the
+same clip out in. A device lost under it is found again on the same GPU and a session of the
+runtime made again there: restarting the GPU's driver mid-session cost about a second and at
+most two skipped pictures. **The older runtime** is reached where the driver names no current
+one, on the GPU by its place in the plain enumeration -- one of the first four -- and hands out
+planes alone, decoded into memory of the backend's own and waited for in the read-back;
+H.264 and 4:2:0 HEVC at both depths where the runtime has them built in -- a runtime that
+decodes HEVC only through a plugin offers H.264 alone. On a 2015 integrated GPU only the older
+runtime reaches, found through the runtime's own registry list, every H.264 clip decodes bit
+for bit; from an established host at 1440p a picture was acquired 15.5 ms after its arrival,
+against 15.8 through the system's interface on the same GPU, and the GPU's driver restarted
+mid-session left the session going.
+
+**On an Intel GPU it comes second.** Against the system's interface on the Intel card, in one
+session per codec and kind with the decoders alternating every twenty seconds, 2560x1440 from
+an established host, arrival to acquired at the mean, and the decode on the device:
+
+| stream | by handle | by planes | decode |
+|---|---|---|---|
+| H.264 | 3.16 ms against 3.12 | 4.20 ms against 4.13 | 2.33 ms against 2.32 |
+| HEVC | 2.44 ms against 2.41 | 3.49 ms against 3.48 | 1.58 ms against 1.58 |
+
+-- the same engine behind both, no faster. So the automatic order does not build Intel's
+decoder on an Intel GPU unless the system's interface does not open there (*2026-10-01*: it
+was probed first and then passed over). Alone for ten minutes a stream, a picture was
+acquired 3.3 ms after its arrival for H.264 and 2.6 for HEVC by handle, 4.1 and 3.7 by planes,
+the whole process using 4 to 6 % of a core. From a second host with the full range, ten-bit
+arrived in 2.2 ms by handle and 3.4 by planes; full chroma in 2.9 ms by handle at eight bits
+and 3.0 at ten, and 7.2 by planes at ten, where the packed layout is unpacked on the
+processor. The kind switched fourteen times in one session, clean.
+
+**The system's decoder** (*built 2026-10-01*, W1.8) is the platform's media framework, in
+software: its own H.264 decoder on every edition that has the framework, and the HEVC
+decoder of the system's extension where that is installed and licensed -- a package of the
+system's store, made only through the framework's own enumeration, which refuses it where its
+licence is missing. It is loaded from the system's directory alone and started once for the
+process, never shut down, and the process's multithreaded apartment is kept alive with it, so
+the library's decode thread and an application's thread alike can make and drive a decoder
+and no thread of the application's is put into an apartment by the library. No device is
+given to either decoder, so both decode on the processor, and a machine with no GPU decoder
+at all still has one. It has a kind of its own, `LOWLAT_DECODER_SYSTEM`, and the table's last
+slot, `MF [Microsoft]`, whose words are each decoder's module version or why it did not open
+([06 §3b](06-api.md)).
+
+**Every sequence parameter set is read before the decoder sees its unit.** The decoders take
+what their types allow and fail inside: H.264 at ten bits or of full or 4:2:2 chroma hangs the
+H.264 decoder inside its output call, never returning, and H.264 cropped from the left or the
+top is written to the wrong place, the crop's offset named and not applied; so these are
+refused as fatal, with the declaration masked so that a host never sends them. HEVC is taken
+at eight and ten bits, 4:2:0 alone; its depth picks the output's layout, since the HEVC decoder
+handed a ten-bit stream with an eight-bit output decodes every picture wrongly without an
+error, and a picture whose layout is not its stream's is refused rather than copied. The
+parameter set also says the size the decoder is made for, which the HEVC decoder needs before
+its first unit, and the visible picture and range handed out.
+
+**One picture out of each unit's own call.** Asked to hand pictures out as soon as they can be
+decoded, the H.264 decoder does; the HEVC decoder's parser waits for the next unit's start
+before it ends a picture, which put every picture a unit late and a picture of several slices
+never out at all, so every unit is ended with an access unit delimiter, which changes nothing
+else. One input buffer and one output buffer are made and used again: the input written only
+once the decoder has said it needs more, since it holds the last unit until then, and the
+output's length cleared before each call, without which a buffer used again is refused; a
+buffer made per picture cost half a millisecond at 1440p in page faults. The output is made
+again only when the stream's size changes, which the decoder follows itself, a picture never
+lost to it. The decoder stores a picture at its coded size -- 1088 rows for 1080, a width not a
+multiple of sixteen rounded up -- so rows are copied by its own stride and the chroma read
+after its coded height; a copy at the visible width reads every such picture wrongly. Each
+decoder starts a worker thread a processor by default: HEVC is given two, which decoded a
+1440p picture faster than sixteen (4.1 ms against 4.6) at 42 % of the processor time, and
+H.264 half the processors, the default's speed at less. Every committed eight-bit 4:2:0 clip
+and every ten-bit HEVC clip decodes bit for bit and in the stream's order; nothing is allocated
+per unit.
+
+From an established host at 2560x1440, ten minutes each, a picture was acquired 5.1 ms after
+its arrival for H.264 and 6.0 for HEVC, decoded in 3.9 and 5.6, the whole process using 30 % of
+a core. In one session per codec with every decoder alternating every twenty seconds, arrival
+to acquired at the mean:
+
+| stream | the system's decoder | the LGPL pair | the system's interface, Intel card |
+|---|---|---|---|
+| H.264 | 4.60 ms | 4.24 ms | 4.07 ms |
+| HEVC | 4.93 ms | 6.07 ms | 2.88 ms |
+
+-- so it stays after the pair, which also decodes full chroma, as the order has it. Ten-bit
+with the full range from a second host arrived in 3.6 ms. On a 2015 dual-core laptop without
+the HEVC extension the table offers H.264 alone and an HEVC preference is masked to it; there
+every H.264 clip decodes bit for bit, and a 1440p stream at sixteen pictures a second was kept
+up with at 21 ms a picture, where the GPU's own decoders took 8.
+
+### §5.3 Backends, macOS, in order (*planned 2026-10-29*, M1; *built 2026-10-30*, M1.2)
+
+1. **VideoToolbox**, the system's decoder: the hardware where the Mac has it and the system's
+   software decoder where it does not, for H.264 and HEVC; ten-bit and full chroma where it
+   answers that it decodes them, asked at run time rather than read from the system's version,
+   so a Mac declares only what it decodes (D11's preferences). No GPU vendor's own decoder exists
+   on macOS. *As built*: its frameworks are opened by path at run time, so an application that
+   never decodes loads none of them and the static library links with nothing named. What it
+   decodes is asked once, of sessions made from parameter sets the library carries at both
+   depths and both chromas, the hardware first and the software decoder where the hardware
+   refuses; the listing's words say which serves what. **A session the system chose that fails
+   its first picture is the hardware refusing too**: the status is logged, and the software
+   decoder takes the picture again and the stream from there; a stream it refuses as well is
+   refused as before. Met on a virtual Mac running an x86_64 process under the translation
+   layer, where such a session failed every first picture and a software-only one decoded every
+   clip. The output is pinned to the eight
+   two-plane layouts of both ranges, depths and chromas, so every picture comes in a layout the
+   frame names. **Pictures come back in the order they were decoded**, whatever the session is
+   asked, so their order is the library's reader's (§5.1); they come back on the framework's own
+   thread even from a call that waits, and cross to the decode thread through a hand-over that
+   orders itself. A session survives a rebuild that brings the same parameter sets back, as
+   each keyframe of a host's does: a process's first costs 50 to 78 ms, a new one about 4 after
+   it. Measured on an M2: every reference clip bit for bit on both architectures; the software
+   decoder gets the multi-slice H.264 clip wrong, 12 of its 24 pictures, and is the only one of
+   the two that decodes MBAFF. **The decode's speed follows the process's load** (*measured at
+   M1.4, 2026-10-30*): 2560x1440 decoded a picture every 16 ms, as a 60 Hz stream comes, took
+   4.0 to 4.8 ms at the median for H.264 and 6.2 to 7.4 at 4:4:4 ten-bit, against 1.9 to 2.0 and
+   2.4 with one thread kept busy beside it, on both architectures; back to back, 2.2 and 3.4.
+   Nothing else moved it -- the session's real-time and power-efficiency properties, the
+   decoding thread's class or a real-time policy for it, a latency-critical activity, a spin
+   around each decode, or a thread busy two thirds of the time -- so the chip clocks the decode
+   from the processor's sustained load, and a lighter client decodes slower: the handle kind's
+   slower decode at M1.3, and the translation layer's faster one. A core kept busy to hold the
+   clock up is not taken. A decode figure on this hardware is compared only at equal load.
+2. **The LGPL pair** on D14's terms, as on Linux (§5.1): nothing shipped, loaded at run time,
+   only an LGPL build, and a GPL one only in a build that allows it. A Mac's own pair is a
+   package manager's, and a bare name never reaches Homebrew's directory on Apple Silicon
+   (measured: the dynamic linker's own fallback is `/usr/local/lib` and `/usr/lib`), so the walk
+   is the variable, the application's directory, then the package managers' library directories
+   by full path, the architecture's own first -- `/opt/homebrew/lib`, `/usr/local/lib`,
+   `/opt/local/lib` -- with the files named `libavcodec.N.dylib`. A package manager's build for
+   one architecture does not open in a process of the other (measured under the translation
+   layer), so an x86_64 process finds a pair only where one was built for it.
+
+## §6 Sound
+
+Channel 2 carries fifteen bytes of header and one packet: the channel mask, samples per
+channel, the rate, a codec byte, and the channel count ([01 §11.4](01-protocol.md)). The
+codec byte is read: **2 is uncompressed PCM and is handed out as it is; anything else is Opus**
+and is decoded. A change in mask, codec or count rebuilds the decoder.
+
+**The library orders and decodes; the device paces** (*revised 2026-09-18*, at C4's
+planning; an earlier draft put a playback window in the library). The receive loop copies
+each packet once, off its ring into a pool of 32 slots, and stamps it with its arrival;
+`lowlat_client_acquire_audio` takes the next one in order and decodes it **on the caller's
+thread** into the caller's buffer -- one packet a call, signed sixteen-bit stereo at 48 kHz,
+as many frames as the packet held (960 for a host at 20 ms; at most 8000, the uncompressed
+ceiling), with the packet's age at hand-over reported in status. A full pool drops the
+newest packet and counts it, which is a reader that has stopped calling; nothing here
+waits for the right moment, because nothing here has the clock that decides it.
+
+That clock is the application's device, and its buffer is the **playback window**: sound
+is queued on it as packets arrive and it plays from a floor and flushes at a ceiling --
+too empty is a gap, too full is latency -- so the floor is the latency and the pair is the
+budget against drift and jitter, in each direction. A desktop client runs about 75 ms to
+150; a phone or a browser about twice that, paying latency for coarser periods and worse
+paths. The host's source is the clock ([05 §9](05-host.md)), so the window drifts against
+the device's at the rate of their difference and resyncs on the order of once every twelve
+to fifty minutes (*measured 2026-09-18*: 40 ppm between this machine and the established
+host's, the desktop window flushing every 35 minutes); no client can remove that, a client
+that tries by resampling to the device makes a feedback loop, and a library that ran a
+second window over the device's would only flush against it. A decoder is built from the stream's own header and rebuilt
+when its mask, codec or channel count changes; a stream that is not stereo at the
+protocol's rate is refused per packet and counted. The pipeline hop between the wire and
+the device -- one wake and one decode, a fraction of a millisecond -- is not where the
+latency is.
+
+**The microphone goes the other way, on the control channel** (*built 2026-10-12*, minor 25;
+the wire is [01 §11.4b](01-protocol.md)). The application hands over sixteen-bit mono samples
+at 48 kHz from its device, in whatever lengths the device delivers; the library cuts them into
+frames of ten milliseconds on the caller's thread, because a host takes whole frames and drops
+a remainder, and passes them through a ring of two hundred milliseconds to the session thread,
+which sends one message a frame. **The encoding follows the stream's own declaration**, as it
+does on every established client: uncompressed when the client declared uncompressed sound,
+compressed otherwise -- in the codec's transform mode alone, never its speech or hybrid one:
+the mode with the least delay, four milliseconds under the others, and one every receiver
+decodes whole. *(First chosen because this library's earlier decoder read the speech mode's
+hybrid packets for a voice at a tenth to a half of their level; the decoder that replaced it
+on 2026-10-12 reads them as the reference does.)* **The host decides whether it takes
+one**: every session starts with the microphone taken, a host's `"0"` stops it and anything else
+lets it go on, and the library raises an event on each change, refuses the samples while the
+answer is no and forgets the partial frame with it, so a device left open costs nothing on the
+wire. That answer is the one application message the library reads rather than hands over.
+The cost is the wire's: a message of 1932 bytes every ten milliseconds whatever it carries,
+head-of-line with the input on the reliable channel ([05 §9.6](05-host.md)) -- the reason a host
+says no when it is not taking one.
+
+## §7 Initialization and the control vocabulary
+
+The client sends the fourteen-key initialization of [01 §11.5](01-protocol.md), whose `_flags`
+is stream 0's declaration, then the diagnostics opcode with every bit clear, then opcode 13
+for **streams 1 and 2 only**, with the same flags and the reinitialisation argument clear --
+which is what the host stores per stream; stream 0 never sends one at start (*corrected
+2026-09-16*; an earlier draft said all three). Nothing waits on an acknowledgement: the
+secondary declarations follow the initialization in order on the same reliable channel, and
+the host's own seating of the guest produces the first keyframe. From then on the client
+reads channel 0 for:
+
+| opcode | what the client does |
+|---|---|
+| 9 cursor | decodes the picture if one came or is named from the cache, and raises a cursor event with it at native size, the hotspot in its pixels, the *suppressed* flag and the position in window units; a name the cache does not hold delivers the rest without a picture; the forget bit empties the cache; the first stream only |
+| 10 disconnect | records the status the host gave and ends; zero is not an ending ([01 §11.2](01-protocol.md)) |
+| 16 blocked | raises the blocked or unblocked event |
+| 17 user data | hands the body to the application with its sub-identifier, opaque ([01 §11.2a](01-protocol.md)); except sub-identifier 18, the host's answer on the microphone, which the library reads (§6) |
+| 20 rumble | raises the rumble event for the pad named, the two motors as eight-bit values |
+| 21 encode latency | stores the host's video figure (kind 1) for the stream named; the sound's (kind 2), which names stream 0, is not that stream's and is not kept (*amended 2026-10-18*: an established host sends it every hundred sound packets, zero from some, and status showed it as the video's until the next video report) |
+| 25 guest list | hands the body to the application with the recipient's own number, opaque; the number goes into status |
+| 27 stream ended | raises the stream event with the reason |
+| 28 host mode | stores it |
+| 29 encoder generation | stores it per stream, for §5's staleness rule |
+
+Anything else is ignored. **A clean departure is opcode 10 with a zero status**, given a
+moment on the reliable channel before the session goes away; a client that breaks sends
+nothing, and a host learns it from its delivery deadline.
+
+**The pointer's picture is decoded here and scaled nowhere here** (*built 2026-09-19,
+evening*). The picture travels as a PNG ([01 §11.2](01-protocol.md)); the library inflates
+and unfilters it -- 8-bit RGB or RGBA, non-interlaced, up to 512 square, which decoded is
+the 1 MiB an established client's buffer holds -- and anything else is refused with the
+picture dropped and the position, the flags and the hotspot still delivered. The
+initialization declares that this client caches, so a host names a picture it sent before
+by the checksum of its bytes rather than sending it again: the library keeps a hundred by
+checksum, empties the cache when the host's forget bit says its own is empty, delivers a
+name it does not hold as an update without a picture (counted in status), and takes the
+size and hotspot of a name that carries no size from what was stored with the picture. The
+decoded picture is handed to the application from a buffer the handle owns, valid until
+its next poll, so no application sizes a scratch buffer at the ceiling of a picture it
+sees a few times an hour; and **the picture already delivered, named or sent again, travels
+as its checksum alone** (*built 2026-09-19*): this host repeats the name on many updates
+that change nothing about the picture, and decoding it on each would be work for nothing
+-- the application keeps the picture it was given. **Scaling is the application's**: an established client scales
+the pointer by the viewport it drew into, or by its display's scale, so a pointer from a
+host at twice the scale shows at the size it has in the picture and shrinks with a
+letterboxed window. The library cannot do that -- it does not own the toolkit's cursor, and
+a display server draws a cursor at the size it was given -- so it hands over the native
+picture with the hotspot in its pixels, and the application resamples the two together by
+the ratio of its rectangle to the picture, the same ratio [§8](#8-input) maps positions
+through. The suppressed flag -- the pointer withheld because the host is being driven by
+touch -- is delivered as itself and is not relative mode ([§8](#8-input)); the application
+hides its own pointer for it.
+
+**The guest list is opaque to the library.** Its own number arrives in the message's
+header and is all the library needs: permissions gate nothing on this side, because the
+host drops what it does not permit and a stale list would only refuse input the host would
+take; and the figures in the body are the application's panel ([§9](#9-events-status-and-metrics)).
+So the body goes to the application unread, with the recipient's number beside it, and the
+application finds itself, reads what it wants and drops a body it cannot read -- as it does
+with any application message. An earlier draft had the library parse the list for the
+client's own permissions; that put a reader for one application's schema into a library
+whose host half sends the same schema blind, for nothing the library would act on.
+
+**What the declaration says is a preference masked by capability** (*2026-09-19*). The
+application names what it would like -- the second codec, ten-bit colour, full chroma -- in
+the video block of the attempt's configuration; the library ANDs that with what the decoder
+it opened at creation decodes (§5.1) and declares the result in the initialization's flags
+and the two secondary declarations, with the wire's own implication that depth and chroma
+imply the second codec and neither is declared without it. **The fourth preference is the
+range** (*minor 17, 2026-09-24*): the application says whether its renderer takes the full
+range, and the library declares that as asked, since the decoder decodes either range alike
+and converts nothing, so there is nothing of it to mask. Defaults off: a client of ours at its
+defaults asks for H.264 in the video range, which a renderer that never reads a picture's
+range draws right, and full chroma at ten bits is nearly twice the bytes of the same picture
+at eight-bit 4:2:0 -- neither is a choice the library makes for the application. A change mid-session
+goes out as the encoder configuration with the reinitialisation argument, paired with the
+decoder's teardown -- the first request case of §5. What the stream then turns out to be is
+the decoder's to follow, from the header and the parameter sets, and status carries all
+three: asked, declared, decoded.
+
+**The client reports its decode time on a time cadence, both kinds** (*2026-09-19*). Every
+two seconds from the moment the session is established, the session thread sends opcode 21
+twice in the argument order a client uses ([01 §11.1](01-protocol.md)): the video kind with
+the decode thread's smoothed figure for decode and hand-over per picture, and the sound kind
+with the figure `acquire_audio` smooths on the application's thread, each an exponentially
+weighted average with a tenth's weight on the newest sample, in microseconds, zero until
+something has been timed and sent anyway. A time cadence rather than a count of pictures,
+so a still desktop still reports, as this host does in the other direction. The message
+does one more thing: the round-trip estimate samples only when the host acknowledges
+something this client sent, and after the start-up burst a client that sends nothing keeps
+its first estimate for the whole session; a report every two seconds is what keeps it live.
+
+## §8 Input
+
+The application reports what happened in its window; the library turns it into the wire's
+vocabulary ([01 §11.1](01-protocol.md)) and applies the rules every client applies
+(*revised 2026-09-18*, at C3's planning):
+
+- **The application says where it drew the picture.** `lowlat_client_set_viewport` takes the
+  rectangle, in the same units as the positions the application reports, and that is the
+  whole of what the library knows about the window: no fit is computed here, because
+  stretching, shrinking, a percent scale and a rotated picture are all the application's
+  ways of producing one rectangle, and a display scale factor never enters because the
+  rectangle and the positions share a space by construction. The picture's own size comes
+  from the stream's header, so the two ends of the ratio have different owners and the
+  application cannot describe the picture wrongly. A zero rectangle means there is nothing
+  to aim at, and absolute motion is not sent until one is set.
+- **Pointer positions are transformed into the picture's own pixels.** A window position is
+  mapped through the rectangle into the picture, in the orientation the picture is shown
+  (a rotated stream's coordinates are swapped back), then clamped to the picture; a position
+  one short of the far edge is bumped onto it so the far edge is reachable. **Relative
+  motion is sent as the device reported it**, whatever size the picture is drawn at: a
+  delta is the hand's motion in the mouse's own counts, not a distance in the window, and
+  the host moves its pointer by it as by a mouse of its own (*corrected 2026-09-24*: this
+  said deltas were scaled by the ratio of the picture to the rectangle, and so they were
+  until then; a picture stretched to a larger window dragged and aimed slower than the
+  hand, which a person noticed dragging a window beside an established client. An
+  established client scales only relative motion its toolkit made up from a device that
+  reports positions, a tablet or a remote pointer, whose steps are the window's pixels; an
+  application with such motion scales it before handing it over).
+- **A button press outside the picture is not sent; its release always is**, so a drag that
+  leaves the window ends cleanly on the host. The guard is evaluated at the press's own
+  position, which the application reports with the press.
+- **Losing focus is the application's to report**, as the release-all message, so nothing
+  stays held on a host whose window is no longer in front. Pads are centred by that, not
+  unplugged ([05 §7](05-host.md)).
+- **Keys are usage codes and the modifier mask is the event's own**, in the wire's bit
+  numbering; the application supplies both, because only its toolkit knows the lock state a
+  host reads for lock-key synchronisation. A code of zero is dropped. A held key's repeats
+  are forwarded as presses; a host tolerates them.
+- **Pads are sent as whole states**, one message per state the application reports, with an
+  unchanged state for the same identifier not repeated; or as single button and axis
+  changes. The host takes both and does not require one.
+- Pen and touch are deferred, as they are on the host.
+
+**A DualShock 4 or a DualSense is sent as its own report** (*C7, 2026-09-20*; the
+wire is [01 §11.1](01-protocol.md) and §11.2, the surface [06 §3b](06-api.md)). The
+application hands the library the input report exactly as the device delivered it, USB or
+Bluetooth form, under a pad identifier of its choosing, with the product named; everything
+else is the library's:
+
+- **The standard state is derived from the report and sent beside it**, the report first,
+  deduplicated as a whole state is. A host that reads reports has its slot and drops the
+  state; a host that does not has a sixteen-button pad and nothing else. The application
+  never sends a state for a report pad, and the library refuses the other family for an
+  identifier until it is unplugged.
+- **The Bluetooth form is normalised to the USB form** on the way in (the identifier and
+  checksum stripped, the calibration report's Bluetooth identifier rewritten), the transport
+  remembered per pad, and what comes back is re-framed with the identifier and checksum a
+  wireless pad expects. The host sees one form. *Since M1.4 (2026-10-30)*: **a wireless
+  DualSense takes no light write after it connects until a report of its own resets its
+  lights**, which no host writes -- a host writes to a USB pad, which needs none -- and a reset
+  in the same report as a colour drops the colour (measured: the lightbar and the player lights
+  stayed on the pad's own blue through eight colour writes a second apart, and took every one
+  after a lone reset). So once a connection -- a pad back on another transport being a new one
+  -- at the first input report with the pad's clock past its connection's light animation (3.4
+  s; the clock counts from power-on), the library hands the application that reset as a write
+  of its own, and behind it the host's last light write from before, which the pad ignored;
+  the host's writes are framed as they are. The application writes them in order, as any other.
+- **Feature reports go first.** Calibration and firmware, read from the pad by the
+  application and sent under the same call before the first input report; the host's
+  driver asks for them when the device appears and scales the motion sensors by the
+  calibration one, so a default there is a gyro that drifts. Any subset is accepted; the
+  pairing report is the host's ([05 §7.2](05-host.md)).
+- **A DualShock 4 travels twice**: its whole report in the form only a host that reads
+  products takes, and the ten-byte touch block an established host's DualShock mode reads,
+  so that host gets the touchpad too ([01 §11.1](01-protocol.md) says why the whole report
+  cannot be framed as the established one is).
+- **What the host's device was written comes back as an event**, the output report or a
+  feature write, in the pad's own framing, lent until the next poll; the application writes
+  it to the pad. The rumble event still arrives when a host sends the rumble message (an
+  established host in DualShock mode does), and the application decides what to write for
+  it -- its own motor-only report, keeping the lightbar it last wrote, is the right answer.
+- **Whether to send reports at all is the application's policy.** An established host reads
+  a DualSense's report only in a mode its owner set, and the library cannot tell one host
+  from another -- nor can the demo, since the host list names the same build for every
+  host, so the demo sends reports when told to (`LOWLAT_PAD_RAW`) and states otherwise.
+  Tried against an established host (2026-09-21): in its DualSense mode a DualSense works
+  whole, both ways -- buttons, motion, touch, rumble, the lights; in its DualShock mode a
+  DualShock 4 works but for the motion sensors, which that mode never reads
+  ([impl-plan-client.md](impl-plan-client.md) C7). This library's own host reads the whole
+  report for both products, so the motion sensors of either reach it, on the device it
+  presents or through the application's sink alike ([05 §7.2](05-host.md)).
+
+The demo reads its pads through SDL (*2026-10-13*; until then through its toolkit, which has
+no HID path on Linux, and a raw node it opened itself): SDL's gamepads give the states, and a
+pad sent as reports is read through SDL's HID layer, on every platform, and never opened as a
+gamepad, since SDL writes its own lights on a pad it opens. The toolkit is told to leave
+controllers alone: on Windows it would otherwise write a lightbar of its own on a PlayStation
+pad's first report.
+
+**Relative mode is the host's to announce and the client's to enter.** The cursor message
+carries it in either of two bits; on the transition the library raises an event and the
+application confines and hides its pointer -- a warp on the transition out, to the position
+the event carries in window coordinates, not on every update, or the pointer fights the
+application's own motion.
+
+**On macOS** (*M1.4, 2026-10-30*, the demo's toolkit; [impl-plan-macos.md](impl-plan-macos.md)):
+the window never hears a key let go while Command is held -- the system's dispatch drops the
+release -- so the toolkit's event loop hands it to the window itself; Command goes to the host
+as the GUI key, as an established Mac client sends it, the system's own Command chords never
+reaching the window and its losing the focus releasing everything; and the window reports Caps
+Lock as the lock's state, so each change goes as a tap, the press at once and the release
+100 ms later, both with the mask carrying the new state (*M1's gate, 2026-10-31*): a host that
+toggles on a press alone took the window's form, down as the lock went on and up as it went
+off, as one change every two presses, and a press and release sent at once tapped a host that
+taps itself to the mask twice, the release arriving before its own tap had landed. A captured pointer is the system's to let go:
+it gives the pointer back when the window loses the focus and takes it again on its return.
+The host's cursor is drawn at its pixels on the screen's, which on a 2x display is half its
+size in points, its hotspot with it.
+
+**Between the application's thread and the session's** the messages travel a fixed ring; a
+full ring drops the newest message and counts it, and never blocks the caller. A ring that
+fills is a session thread that is not running, and by then what the host holds is its own
+release-all problem.
+
+**The application may send a message of its own** (*2026-10-12*, minor 24): a header with no
+body, its opcode and three arguments sent exactly as given, for a host that understands more
+than the protocol does on an opcode the protocol already has. It crosses the same ring as the
+input, so it keeps its place among the keys sent before and after it, which a message on any
+other queue would not. The library reads none of it: on an opcode the library also speaks,
+nothing the library keeps for that opcode changes -- a message on the pad unplug's opcode
+forgets no pad -- and a host that does not know the message reads the opcode's own meaning,
+which is the application's to weigh. The opcodes the library sends for the session itself, and
+those whose message has a body, are refused ([06 §3b](06-api.md)).
+
+**The application's event loop must not be paced by its display** (*found at C3's gate*). A
+toolkit that reads one pad event per pass of its loop delivers a moving stick at the loop's
+rate, and a loop that presents with vsync runs at the display's; the kernel's queue then
+fills and plays on for seconds after the hand stops. Presentation belongs on a thread of its
+own, paced by the display through `acquire_frame` and present, while the event loop runs at
+the toolkit's own cadence -- the shape every established client has, and the shape the
+application's sound thread takes too (§6): a long wait on `acquire_audio`, the packet straight
+onto the device.
+
+## §9 Events, status and metrics
+
+Events are polled ([06 §5](06-api.md)): candidate found, established, ended with an outcome,
+cursor, relative mode, blocked, rumble, user data, the guest list, stream ended, host mode.
+Status carries what the session is doing and what the decoder is: the round trip, how far
+behind the reader is, the decode and hand-over times, the queue depth, the host's encode
+time as it reported it, the sound figures, the declaration and the stream, and this
+client's own number in the room.
+
+**The client's metrics have a shape of their own** (*built 2026-09-19, evening*; an
+earlier draft put them on the host's structure). The host's per-guest figures are a
+sender's -- fragments put on the wire, the resends it took on a negative acknowledgement
+and on its timeout, its congestion events, its window and stale count -- and a receiver can
+measure none of them; reporting zeros under those names would describe the wrong end. What
+a receiver can count, per channel: the fragments that **arrived**; those that arrived
+**late**, behind a later fragment, which on this transport is a retransmission or a
+reorder; **duplicates** and **out-of-window** drops; the **negative acknowledgements it
+sent**; bytes and messages. And **a recent-loss figure**: late arrivals over arrivals in
+each one-second sample, folded into an average with a thirtieth's weight on the newest
+sample, so it reads over about thirty seconds and settles at the path's loss rate rather
+than at the session's total. Per session, the round trip and how long the session has been
+up. The host's own figures for this guest -- what it sent, what it resent, its rate and its
+round trip -- reach the application through the guest list ([§7](#7-initialization-and-the-control-vocabulary)),
+so one panel's two sides are the host's `lowlat_metrics`, as the host reports them, and the
+client's `lowlat_client_metrics`, as the client measures them; the pairs that describe one
+path from its two ends are the round trip, the rate, the decode time the host re-publishes
+against the one the client reports, and the negatives the client sent against the resends
+the host took on them (related, not equal: one negative can name several fragments).
+
+**A presentation-rate hint, and an event when the decoder cannot sustain the stream, were
+considered and are not built** (*recorded 2026-09-16*, *decided 2026-09-19*; the shape is
+kept). There is no wire-level channel for the rate a
+client can take that any host honours: the initialization's `refreshRate` is a literal 60
+from every established client and no host reads it, the decode time of opcode 21 is only
+re-published, and one encode serves every seat, so a host cannot thin frames for one guest
+without breaking its reference chain -- temporal layering in the encoder is the only
+per-guest frame-rate lever, and that is a host phase of its own. The lever every host
+honours is `encoderFPS` in the application protocol, which is the application's message
+([01 §11.2a](01-protocol.md)) and stays so. What the library can own is the decision:
+`lowlat_client_set_config` takes the application's presentation rate (its display's refresh,
+or zero for unknown), status carries the rate the decoder can sustain, and an event says when
+it cannot sustain the stream, with the rate the library recommends; the application relays
+that as `encoderFPS` in one line, and it works against an established host exactly as it
+does against this one. Decided with the lag trigger of [§5](#5-the-decoder-and-when-a-client-asks-for-a-keyframe):
+the numbers below show a decoder that keeps up, and the reader's lag in status is the
+application's warning ([§4.1](#41-what-latest-wins-costs-and-what-it-cannot-do)).
+**The decoder's own numbers, recorded 2026-09-17** (this machine's open-stack decoder,
+1080p H.264): decode about 2.0 ms a picture at the median and 2.3 at the ninety-fifth
+percentile, read-back about the same, so a 120-picture stream costs the decode thread about
+half its time; the demo's cadence is the display's whatever the stream does.
+
+## §10 Threads
+
+One receive loop (the shell's), which owns the session and its rings and hands access units
+to a decode thread per stream through a pool by index -- one copy, off the ring, and never
+another by the library (the driver's interface takes the slice data as a buffer of its own,
+which is a second copy inside the driver and not one this design can remove); and nothing
+that presents or plays: presentation is the application's thread calling acquire
+(*corrected 2026-09-17*: an earlier draft had the decode thread draining the ring, which is
+the established client's shape and needs a lock on the session that nothing here takes), and
+sound is decoded on the application's thread inside `acquire_audio` (*corrected 2026-09-18*:
+an earlier draft had a sound thread; a decode of a twentieth of a millisecond earns no
+thread, and the second hand-off it would need is the one wake and copy the design saves).
+The decode thread never blocks the receive loop: a full pool leaves the backlog in the
+receive ring, where the catch-up of §3 sees it; the sound pool never blocks it either, it
+drops. The software decoder's slice workers are the one addition, capped by the machine's
+parallelism (§5.1). Every rule of [02](02-io-shell.md) applies -- raw wakes for raw waits,
+no elevated priority inside the library, teardown that wakes every waiter -- and one more of
+the application's thread: **a call that waits holds nothing another call needs** (*2026-09-25*:
+a departure had held the handle through its grace and both joins, half a second in which
+input, status and acquire made on any other thread waited too; the attempt is taken out
+under the lock now and left outside it).
+
+**On macOS the threads keep the class they start in** (*measured at M1.4, 2026-10-30*, an
+M2): every thread starts at the default class, whatever its creator's. A wake through the
+address wait takes about 10 us at the median and 20 at the 95th percentile idle, at every
+class; with every core busy, a default-class wake's 95th percentile reached 2.3 ms where a
+user-interactive one stayed near 3 us. But a short burst every 16 ms -- a client's
+per-picture shape -- runs on the efficiency cores at every class, the real-time policy
+included, and no class moves the decode (§5.3). So no class is raised inside the library,
+which keeps every rule of [02](02-io-shell.md); a client is seldom on a machine with every core
+busy.
+
+## §11 The relay
+
+*Planned, built and closed 2026-09-23 as C10 ([impl-plan-client.md](impl-plan-client.md)),
+minor 14. The rules are [03 §7](03-connectivity.md); this section is the client's side of
+them.*
+
+**The client allocates the relay, and the host never learns there is one.** An application
+that cannot reach a host directly -- a probe timeout, or a host it knows sits behind one
+forwarded port -- configures a relay with the attempt: the server as `host:port`, resolved like
+the reflexive servers, and a username and password. The credential is never logged and is
+cleared when it is dropped.
+
+**A relay configured makes the attempt a relay attempt**, and a relay attempt is relay-only:
+the socket talks to the relay alone, the attempt's candidate events carry the relayed address
+and then the readiness marker and nothing else, and every check goes through the relay. The
+relayed address goes out marked as a server-reflexive candidate, and its event is raised only
+once the relay's own address is permitted, so a host on the relay's machine has its first
+check pass.
+
+**The relay is one more framing on the same socket**, not a second transport: recognised by
+its source before anything is classified, unwrapped there, and wrapped on the way out for
+everything bound to the relayed peer -- checks, their answers and records alike -- so no answer
+can leave outside it. Its renewals are timers among the session's own, on the receive loop's
+thread, and nothing waits on the relay.
+
+**What the application sees.** Status carries the relayed address and whether the path is
+relayed. Three outcomes end an attempt the relay failed -- unreachable, refused, lost
+([03 §9](03-connectivity.md)) -- and the library retries none of them. A clean leave releases
+the allocation, **after the departure**: the relay's own requests leave ahead of anything else,
+so a release made at once would let the relay go before the departure crossed it, and it is
+made once the departure has had its grace instead. The session thread raises the relayed
+address the pass it becomes ready rather than on the reflexive candidates' slower cadence,
+because the pass that readies the relay may be the last for a while.
+
+**The media follows the host.** Once there is a path, media goes to wherever the host's
+authenticated records come from, and a channel is bound to it; a host whose traffic leaves
+through its own translator is checked at one address and speaks from another.
+
+**What it costs**: one more hop, whose far leg is local to the host's machine -- 0.8 ms of
+round trip against a direct session on the same pair, measured before this was written with an
+earlier implementation; 27 ms at the median through the same relay with this one -- and 4 bytes
+a datagram on the client's leg once the path is bound to a channel, 36 before that.
+
+**Over TCP** (C11, built 2026-10-17; [03 §7.4](03-connectivity.md)). An application whose
+relay over UDP is unreachable may make the same attempt with the relay's carrier set to TCP
+([06 §3b](06-api.md)). It is the same relay attempt -- the same candidate, the same order, the same
+outcomes -- over one stream to the relay instead of a datagram socket, and it opens no datagram
+socket at all: the handle keeps its port, and the gateway's mapping is not asked for. What it
+costs depends on the relay. Through a relay on the host's own machine a ten-minute session with
+motion ran at the rate and round trip it had over datagrams, every picture whole, at about ten
+times the recovery traffic. Through a public relay service the host's rate fell to between a third
+and 40 percent of its rate over datagrams, as stalls of up to half a second turned into the
+session's own resend storms; the picture held. It is the last rung, not a quality option. The
+demo takes the carrier from `LOWLAT_RELAY_CARRIER`.

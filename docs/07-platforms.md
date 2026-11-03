@@ -1,0 +1,1110 @@
+# 07 - Platforms
+
+**Status:** **resolved by measurement 2026-08-15** (§3.1). The capture backend, frame
+variant, process topology, and privilege requirement are settled; §3.2 lists what is not.
+
+## §1 Matrix
+
+| | Status |
+|---|---|
+| Linux host | primary target |
+| Windows host | planned, after Gate B |
+| Clients | any platform with an existing client; nothing to install |
+| macOS | this project's client only, planned 2026-10-29 ([§13](#13-macos)); never a host |
+
+Platform-specific code is confined to `lowlat-capture`, `lowlat-audio`, `lowlat-inject`, and the platform
+receive strategy in `lowlat-net` ([02 §6](02-io-shell.md)). Everything else is portable by
+construction, because the protocol core is `no_std` and touches no operating system.
+
+## §2 The Linux capture problem
+
+Windows has one answer for desktop capture that handles the lock screen, elevation prompts,
+and unattended boot. Linux has four partial answers, and the differences between them are
+product differences rather than implementation details.
+
+| | scanout | compositor-mediated | X11 | virtual display |
+|---|---|---|---|---|
+| unattended, no session | yes | **no** | partial | yes |
+| login screen | where the greeter presents through the display device (measured: a Wayland compositor does, one vendor's X driver does not) | **no** | only if the greeter is X11 | not applicable |
+| any compositor | yes | yes | **no** | not applicable |
+| mirrors a physical screen | yes | yes | yes | **no** |
+| zero-copy buffer export | yes | yes | only with a vendor path | yes |
+| pointer-hidden signal | **no** | yes | yes | **exact** |
+| privilege | high | low | low | module load |
+
+Read the columns as products, not as implementations:
+
+- **scanout** reads the composited framebuffer directly from the display device. It is
+  compositor-agnostic because it sits below the compositor, which is what gives it the login
+  screen and unattended operation. It costs elevated privilege and it cannot see the pointer's
+  requested visibility ([05 §8.2](05-host.md)).
+- **compositor-mediated** is the sanctioned path: the compositor hands over a stream with
+  cursor metadata attached. It is correct, low-privilege, and it works on every modern
+  desktop. It is also bound to a live user session and its first use requires an interactive
+  grant, which is exactly the thing a machine you connect *back* to cannot provide.
+- **X11** is easy and complete, and it is a dead end. Every major distribution now defaults to
+  a Wayland session. **It is also the one thing scanout cannot see on one vendor's driver**,
+  measured 2026-09-10 across a login: an X server on that vendor's own driver presents
+  through the driver's private path, and every plane of the display device reads empty
+  while the panel shows the picture. A Wayland compositor on the same card presents through
+  the device and is captured; so is X on the open driver of another card. The default login
+  screen on the distribution measured is X, so a host on that vendor's card shows nothing at
+  its login screen until the greeter is moved to a Wayland compositor -- a configuration
+  matter, and the one this project recommends.
+- **virtual display** creates a display that is not attached to any monitor. Either as a
+  kernel-provided virtual device that the user's existing compositor extends onto, or as a
+  session we run ourselves. It has no greeter problem because there is no greeter, and no
+  privilege problem beyond loading a module.
+
+### §2.1 The pointer signal is not a tiebreaker
+
+At first reading, scanout losing the pointer-hidden signal looks fatal, since relative pointer
+mode is not a niche feature for this product.
+
+It is not fatal, because **the signal is only needed when a session exists**. An application
+hides the pointer to take over input. That requires an application, which requires a logged-in
+session. On a greeter or an idle unattended machine there is nothing to put into relative mode.
+
+So the resolution is a **session-side probe**: when a user session is present, a helper inside
+it reports pointer state to the daemon over the channel in
+[§5.1](#51-the-session-helper-and-the-channel-it-speaks-on). When no session is present, the daemon reports the pointer as
+shown and relative mode never engages, which is correct rather than degraded.
+
+That keeps scanout viable without weakening the cursor rules in [05 §8](05-host.md).
+
+**Measured 2026-08-19, and the helper is now required rather than preferred.** The tempting
+shortcut is to drive relative mode from what scanout *can* see: the hardware pointer plane
+either carries a pointer or it does not, and it stops carrying one exactly when an application
+hides it. On a real desktop that holds for mouselook and for a video player, both of which are
+wanted. It also holds for a case that is not wanted at all: **a pointer that has merely grown
+too large for the plane is drawn into the main image instead**, so the plane empties while the
+pointer is still on screen and still being used. Shaking the mouse to find the cursor does it.
+
+So the two signals are genuinely different states and neither substitutes for the other:
+
+| signal | source | what it is for |
+|---|---|---|
+| a pointer is being composited | the hardware plane, visible to scanout | whether to draw one for a guest ([05 §8](05-host.md)) |
+| an application hid the pointer | session state, above this backend | whether to put a guest into relative mode |
+
+Driving relative mode from the first would lock a guest's pointer because they shook the mouse,
+which is worse than not offering the feature. The helper is the only source of the second.
+
+### §2.2 The virtual display path is the same code
+
+A kernel-provided virtual display presents as an ordinary display device, so **the scanout
+capture backend reads it with no changes**. One backend serves two products: mirror a physical
+screen, or run a headless display at a resolution the client asks for.
+
+The headless case is also the strongest one for cursor handling, because a session we own
+gives exact pointer state rather than an inferred one.
+
+It is also the safest to bring up first, for a reason that has nothing to do with design: a
+software virtual display driver has no vendor-specific buffer export behavior, so it sidesteps
+§3 entirely.
+
+## §3 The open question, and what closes it
+
+**Scanout capture depends on exporting the display device's framebuffer as a shareable buffer,
+and that path is historically weakest on the proprietary NVIDIA driver**, which is the primary
+development target.
+
+This is the highest-risk assumption in the Linux plan. It is not resolvable by reading, and it
+is not worth designing around in either direction until measured.
+
+**The probe**, to run on bare metal before Phase 9 begins:
+
+1. Confirm the display device exposes a modesetting interface at all, which on this driver
+   requires the modesetting option to be enabled at module load.
+2. Enumerate the active display pipeline and fetch the current framebuffer.
+3. Export it as a shareable buffer handle.
+4. Import that handle into the compute context the encoder uses, and encode one frame.
+5. Repeat with a software virtual display driver as the control.
+
+### §3.1 Result, measured 2026-08-15
+
+**Scanout is the v1 capture backend.** Probed on Debian 13, kernel 6.12, a Ryzen 8845HS with
+integrated RDNA 3 graphics on the open driver, running a KDE Plasma Wayland session at
+2560x1440.
+
+Every step passed once one mistake was removed:
+
+| Step | Result |
+|---|---|
+| modesetting interface | present; the open driver needs no opt-in |
+| enumerate pipeline, fetch framebuffer | works, with the elevated capability |
+| export as a shareable buffer | **works, read-only only** |
+| encode on the same device | confirmed, 1080p60 |
+
+**Export must be read-only.** Requesting write access makes the driver refuse a scanout buffer
+outright, on every plane, including a plain linear cursor buffer. A capture path has no reason
+to write to a framebuffer, so this costs nothing, but it presents as a total and
+undiagnosable failure if you ask for it. The standard command-line capture tool does ask for
+it, which is why that tool cannot capture this machine at all.
+
+Three properties of the real framebuffer the backend must handle, none of them assumed by the
+design as written:
+
+- **It is 10-bit, and that is not predictable.** The compositor scans out `ABGR2101010`, not
+  an 8-bit format. Colour conversion must accept 10-bit input even while the encoder emits
+  8-bit ([05 §3](05-host.md)), and it argues for bringing 10-bit encode forward from its
+  deferred position. *Amended 2026-10-28:* nor is the word's order. GNOME scanned out
+  `XRGB2101010` on an AMD APU, the same packing with blue lowest, and before it was mapped the
+  first capture failed at import and a guest was sent no picture; both orders import, and a
+  layout with no equivalent is refused naming its format.
+
+  **Do not infer the scanout format from anything above it.** Asking the X server reports
+  depth 24, because that is the visual X clients draw into; under a Wayland session the X
+  server is itself a client several layers above the buffer that reaches the display. The
+  format is the compositor's choice and it changes when high dynamic range is toggled, a
+  display is swapped, or the compositor restarts. **Read format and modifier from the kernel
+  on every framebuffer change** and handle what comes back. A backend that probes once at
+  startup and caches will produce correct output until the day it silently produces
+  garbage.
+- **It is multi-plane and compressed.** The primary framebuffer reports three buffers with
+  differing pitches under a vendor compression modifier. Import must be modifier-aware and
+  carry every plane; treating it as one linear buffer produces garbage.
+- **The cursor is a separate plane**, linear and 8-bit, exactly as [05 §8.1](05-host.md)
+  assumes.
+
+**The render node cannot be used for this.** It refuses plane enumeration outright. Capture
+needs the card node plus the elevated capability, which settles the privilege question in
+§6.
+
+### §3.2 Result on the second vendor, measured 2026-08-17
+
+**Export works there too.** Probed with the same program on the development workstation, whose
+display is driven by a discrete GPU on that vendor's **open kernel modules** (610.57.04),
+2560x1440 under the same compositor:
+
+| Step | Result |
+|---|---|
+| modesetting interface | present; the compositor is running on it |
+| enumerate pipeline, fetch framebuffer | works, with the elevated capability |
+| export as a shareable buffer | **works** |
+
+The buffer differs from §3.1's in a way the import path has to handle, and it is the opposite
+of what the first result led us to expect:
+
+- **One buffer, not three.** The primary framebuffer reports a single buffer with a pitch that
+  is exactly the width times four. The multi-buffer, differing-pitch case in §3.1 is one
+  vendor's compression scheme, not a general property of scanout.
+- **A vendor tiling modifier, and allocation padded past the visible height.** The exported
+  size divides out to more rows than the display has, so the buffer is tiled rather than
+  linear. It cannot be read as a plain image at its pitch.
+- **10-bit again, on completely different hardware.** The same packed 32-bit 10-bit-per-channel
+  format as §3.1. Two vendors, two drivers, one conclusion: **treat 10-bit scanout as the
+  normal case rather than the exception**, which is what D7 already assumes.
+
+So both entries in §11's export row are now closed for the drivers that matter here. What
+remains unmeasured is that vendor's **classic** kernel module, which this machine does not run
+and which is not on the path to Gate B.
+
+The virtual-display control could not run: the software virtual driver is not built for this
+kernel. §2.2's claim is therefore untested, and now less load-bearing.
+
+### §3.3 The scanout format changes while you watch, measured 2026-08-19
+
+§3.1 said to read format and modifier from the kernel on every framebuffer change, and named
+the triggers as swapping a display, toggling high dynamic range, or restarting the compositor.
+All three are rare, which makes the rule easy to read as a precaution.
+
+**It is not a precaution. The format changes several times a minute in ordinary use.** A
+fifteen-minute session on the development workstation recorded **twelve** format changes, and
+the trigger was a user entering and leaving fullscreen -- including in a browser:
+
+```
+2560x1440 ABGR2101010  modifier 0x0300000000606014  pitch 10240   composited desktop
+2560x1440 ABGR8888     modifier 0x0300000000606014  pitch 10240   a fullscreen surface
+```
+
+The compositor scans out ten-bit for the desktop it composes, and hands a fullscreen
+application's own eight-bit buffer straight to the plane instead. Modifier and pitch are
+unchanged, because both formats are thirty-two bits per pixel; **only the interpretation of the
+bytes moves**, which is the failure mode with no symptom. A backend that probes the format once
+at startup produces a correct picture until the moment somebody presses F11, and then produces
+a wrong one with nothing logged.
+
+Three consequences the pipeline has to carry:
+
+- **The import is rebuilt on a format change, not the session.** This is the `Lost` contract
+  from [05 §2](05-host.md), and it now has a frequency attached.
+- **The conversion accepts both packed depths.** Ten-bit input is the normal case (§3.1, §3.2)
+  and eight-bit is what arrives whenever an application is fullscreen, which is most of the
+  time anyone is playing something.
+- **A rebuild must not cost a keyframe.** At this rate, a reinitialization that forces one
+  would put a visible hitch on every fullscreen toggle.
+
+## §4 Input
+
+Input injection is the one platform question with no tradeoff. **The kernel input layer is the
+answer on every Linux display stack**, and it is the capability that display-server-level
+injection structurally cannot match: it works identically on X11, on Wayland, at the greeter,
+and inside a session we own.
+
+- One virtual device per guest, created at connect and destroyed at disconnect.
+- Keyboard, pointer buttons and wheel, relative motion, and absolute motion as a separate
+  device, since absolute and relative pointers cannot share one device cleanly. **The absolute
+  one is shaped exactly as an absolute mouse** (the three primary buttons, X and Y, the wheels,
+  the scan-code type), because the kernel's joystick handler takes any other device with an
+  absolute axis: the side buttons are the relative pointer's whichever pointer moved last
+  (*14.5, 2026-09-21*; the reason is under [§4.2](#42-gamepads-and-the-two-device-layers)).
+- Absolute coordinates map to the output's geometry at injection, rotation-aware.
+- Device creation needs write access to the input device node. The daemon gets it through a
+  group and a rule, not through running as root ([§6](#6-privileges)).
+
+### §4.1 A created device is not a usable one
+
+**The kernel publishes the device in under half a millisecond and the display stack takes
+between one and three tenths of a second to start delivering from it.** Events written into
+that gap are accepted by the kernel and go nowhere. Measured on a real desktop session by
+creating a device and injecting one key per step at increasing delays, then reading back what
+the display server actually delivered:
+
+| what was created | first delay whose event arrived |
+|---|---|
+| one keyboard, keys only | 100 to 150 ms |
+| one keyboard, keys and indicator lights | 200 ms, every run |
+| **the three devices a guest really gets** | **200 to 260 ms** |
+
+**The last row is the one to design against**, and it is nearly double the first. The delay
+scales with how many devices the system has to process at once, not with any one device, so a
+figure measured by creating a single keyboard understates the case that actually ships.
+
+Three consequences, and the first two are cheap.
+
+- **Do not declare indicator lights.** A device claiming them costs roughly twice the setup
+  time, because the display server configures keyboard state for it. An injection device has no
+  use for them: nothing reads its lights.
+- **Create the device when the guest is admitted, not when its first input arrives.** The wait
+  then overlaps connectivity and session initialization, which take longer than it does, and
+  costs nothing observable. A device created on demand puts the whole delay in front of a
+  keystroke somebody is waiting for.
+- **Hold events until the deadline rather than dropping them.** The first keystroke of a session
+  arriving a fraction of a second late is not noticeable; the first keystroke vanishing is, and
+  it presents as a network fault.
+
+**There is no readiness signal to wait on instead**, and two candidates were tested rather than
+dismissed. A host cannot ask whether a consumer has opened its device, and the consumer writes
+nothing back: a keyboard that declares indicator lights is the one case where the display server
+might reply on the same descriptor, and across six runs it never did. The second candidate is
+better and still fails: the device's event node is created owned by the system alone and is
+granted to the group part way through the window, which is observable. It is a **precondition,
+not a signal** -- the grant lands at 50 to 82 ms and does not predict delivery, with the same
+51 ms grant preceding delivery at 200 ms in one run and 230 ms in another.
+
+A fixed wait is the only portable answer, which is the argument for starting it as early as
+possible rather than for making it shorter. It is set **above** the worst measured case rather
+than at it, because the two errors are not symmetric.
+
+**The delay is not the display server's, so it is not the display server's to differ on.**
+Timing two endpoints in the same run -- a display-server client, and the input library a
+compositor consumes -- gives 140 to 230 ms and 100 to 260 ms respectively. They are the same
+within the noise of two processes being scheduled, so **the display server adds nothing
+measurable** and the whole cost sits in device discovery, which every display stack shares.
+
+That is a better answer than measuring the same thing twice would have been: it says the figure
+travels, rather than that two figures happened to agree. A compositor session would still show
+whether its own device setup costs anything on top, but it does not set the number.
+
+Compositors discover the device through the normal input stack, so no compositor cooperation is
+required and nothing needs to be configured per desktop environment.
+
+### §4.2 Gamepads, and the two device layers
+
+Linux offers two ways to publish a virtual controller, and **which one is right is decided by
+the controller being emulated, not by preference.**
+
+| Layer | What it publishes | Suits |
+|---|---|---|
+| kernel input layer | buttons and axes directly, with an identity of our choosing | an Xbox 360 pad |
+| kernel HID layer | a report descriptor the kernel's own driver then binds | a DualShock 4 or DualSense |
+
+**An Xbox 360 pad must go through the input layer**, because it is not a HID device at all: it
+speaks a vendor protocol on a vendor-class interface, and its kernel driver binds on the USB bus
+rather than the HID one. There is nothing for the HID layer to present.
+
+**A DualShock 4 or DualSense must go through the HID layer**, because the whole point of
+emulating one is that applications recognise it as one. Presented as a report descriptor, the
+kernel's own driver claims it and supplies the correct button map, the touchpad as its own
+device, motion, battery, and lights and rumble as ordinary output reports. Published through the
+input layer instead you get the button layout and none of the identity, which is the part that
+was wanted.
+
+**v1 emulates the Xbox 360 pad only.** A peer sends one button layout regardless of what it is
+holding, so a second emulation buys identity and nothing else, and the identity is not free: the
+kernel driver interrogates a device of that family during setup and will not attach to one that
+cannot answer. That is worth doing and is not worth doing first.
+
+**Amended 2026-09-20: the HID layer is Phase 14.** The premise changed: a peer holding a
+DualShock 4 or a DualSense can send the device's own report ([01 §11.1](01-protocol.md)),
+which carries what the sixteen-button layout cannot -- the touch contacts, the motion
+sensors, and back the other way the lightbar and the trigger effects -- so the second
+emulation buys capability after all. The interrogation is answered from the peer's own pad,
+with a default for what it did not send ([05 §7.2](05-host.md)). The pad presents its own
+model's descriptor and identity and the kernel's driver binds it; the hidraw node that
+appears is what the common game launcher and the controller libraries open to reach the
+features the driver does not expose, so **the seat-access rule for that node matters as
+much as the device node's**: the launcher ships one keyed on the vendor and product, which
+matches a virtual device with the same identity, and the package ships one of its own for a
+host without the launcher (`70-lowlat-pads.rules`, keyed the same way, so the real pad is
+granted alongside). **The service's device policy has to name the HID node** beside the
+input one: it is a second character device of the same class, and a closed policy that
+allows the first alone refuses the second (measured), which reads as every report pad
+failing to be created.
+
+**What reads the virtual pad, and what each needs** (learned at the Phase 14 gate,
+2026-09-21). The kernel's driver claims it, so a consumer sees the real thing: the event
+nodes, the raw node, force feedback on the pad's event node, all of it answered from the
+peer's pad. Three things about the consumers themselves are worth knowing before a gate is
+called failed. The common game launcher drives the pad through its own SDL over the raw node
+(input, lightbar and rumble alike), and rumbles a controller only once that controller's
+rumble setting has been toggled on in its calibration page; its "identify" ping writes
+nothing to the pad before that. A browser's Gamepad API on Linux vibrates only a pad whose
+joystick node number is below four -- it looks the device up by that number against the
+API's slot cap -- so every joystick node ahead of the virtual pad counts: a DualSense's
+motion sensors take one, and so did the host's own absolute pointer until it was shaped
+exactly as an absolute mouse (14.5: three buttons, not five; verified on the input layer --
+no joystick node, still a pointer to the input library). And on a machine
+that is host and client at once, the launcher owns the physical pad and the virtual one
+together, so a report relayed from the virtual pad and the launcher's own report to the
+physical pad can cancel each other's rumble; no real deployment has both pads on one machine.
+The pad's speaker is not this layer's at all: a DualSense's is a USB audio device (or a
+Bluetooth audio profile) beside its HID interface, so it belongs to the machine the pad is
+plugged into -- the client's, whose application may play the session's sound through it --
+and the virtual pad here has none.
+
+**A virtual pad has to borrow a real controller's identity.** Everything that reads a gamepad
+decides what its buttons mean by looking the bus, vendor, product and version up in a table:
+browsers, the common controller libraries, and every per-title mapping people share. A device
+with an identity nobody has heard of is delivered as a bag of numbered buttons and axes, and no
+amount of correct input makes it usable. So the pad presents the Xbox 360 controller's, and
+**the mapping that selects is verified against what the device actually emits** rather than
+assumed: buttons zero to ten in kernel-code order, axes zero to five, direction pad on the first
+hat. Borrowing an identity whose mapping did not match would be worse than borrowing none,
+because everything would look recognised and half the buttons would be wrong.
+
+Identification does not have to be given up for it. The **physical-location string** carries
+which guest and which pad, which is what that field is for, so a device listing shows the model
+and the location shows the session.
+
+**The HID layer's device node carries the same packaging obligation as the input layer's**
+([§6](#6-privileges)): no distribution grants access to either by default, so a second backend
+means a second rule.
+
+*On Windows* (*2026-10-22*, planned as W4) the same split holds: the Xbox 360 pad on a virtual
+bus, and the DualShock 4 and the DualSense on the host's own HID driver
+([11 §2](11-drivers.md)) -- there only where the owner sets it, since a HID pad never reaches a
+game that reads only the Xbox pad's interface, where on Linux the kernel's own driver makes the
+pad readable by everything.
+
+## §5 Process topology
+
+The topology follows from §3, and this is the coupling worth seeing before the capture
+decision is made rather than after.
+
+**Scanout or virtual display:**
+
+```
+lowlatd            system service, owns capture, encode, inject, media
+   |
+   +-- unix socket, peer-credential authenticated
+   |
+lowlatd session    user session, the same binary in its session role, optional
+lowlatd tray       user session, the same binary in its tray role, optional
+```
+
+**Compositor-mediated:**
+
+```
+lowlatd            system service, owns encode, inject, media
+   |
+   +-- unix socket + buffer handle passing
+   |
+lowlat-session     user session, owns capture, REQUIRED
+```
+
+The difference matters: in the first topology the session-side components are optional and the
+stream survives a logout. In the second, capture lives in the session, so a logout ends the
+stream and the daemon becomes a coordinator rather than the thing doing the work.
+
+**The tray is never load-bearing in either.** It attaches, shows state, kicks guests, changes
+configuration, and detaches. Closing it does nothing to the stream. That was the design intent
+from the start and it survives the capture decision either way.
+
+Buffer handles pass over the socket as file descriptors, so even the split topology stays
+zero-copy.
+
+### §5.1 The session helper, and the channel it speaks on
+
+**A system service cannot reach a desktop session, and the two ways it might are both
+wrong.** Measured on a live session:
+
+| route | result |
+|---|---|
+| the session's message bus | refused: the bus authenticates by peer identity and drops a service |
+| the compositor's own socket | reachable, but the protocol differs per compositor and one of the major ones offers none at all |
+| starting a process inside the session | works, and requires the service to discover a session, drop privilege and guess a desktop |
+
+So the service does not reach into the session at all. **The session side connects outward**,
+to a socket the service already listens on. That removes the problem rather than solving it:
+nothing discovers a session, nothing drops privilege, nothing has to know which desktop is
+running. It also arrives with an identity, because a local socket carries the peer's
+credentials.
+
+**One binary, two roles.** The helper is `lowlatd` invoked in its session role, not a second
+program. The reason is version skew: the two sides speak a private protocol that changes
+whenever either does, and one build cannot disagree with itself. The role is chosen by the
+first argument and by nothing else -- **never by a flag that may appear anywhere in a command
+line**, because a service and a session agent run at different privilege and a file that can
+be talked into the wrong one is a security defect rather than a bug.
+
+**The tray is the same binary in a third role, for the same reason.** It was to be a separate
+program because it would link a user-interface toolkit, which has no business inside a system
+service's binary; it links none. The desktop's own panel draws it: the tray describes a status
+notifier item over the session bus -- a handful of properties, a menu as a tree the panel asks
+for when it opens, and an event when something in it is clicked -- and the panel does the
+drawing. What it costs is the marshalling for that, which is a page on top of the session bus
+client the helper already has. What it buys is that the two sides of a private protocol ship
+in one file. One desktop family serves the protocol natively and another only through an
+extension; where nothing on the bus registers items, the tray says so and registers the moment
+something does.
+
+**It is one channel with two roles, not two channels.** The tray needs the same two directions
+the helper does -- state pushed as it changes, and questions that get one answer -- so it
+speaks the same framing and announces its role in the first frame. What differs between the
+two is authorisation rather than transport, and that difference is the whole of it: a helper
+makes statements about its own session and is trusted with exactly that, while a tray acts on
+the host, and kicking a guest is not something any local user may do.
+
+#### What it is for
+
+Five things need session state, and none of them can be answered below it:
+
+| customer | shape | what is lost without a helper |
+|---|---|---|
+| relative pointer mode (§2.1) | a signal, pushed on change | the feature; a guest is never put into relative mode |
+| the idle inhibitor | a lease, held while asked | the screen may blank during a session |
+| the display layout, and its orientation | a signal, pushed on change | the backend's own reading is used, and it is only ever right about the desktop as it was when the display opened; a turned display streams on its side |
+| the clipboard | an ownership, held | a guest's text is dropped and the desktop's never leaves |
+| the display mode and rotation | a request, with one answer | a guest asking for a size or a turn is refused with a reason |
+
+**The mode row was struck on 2026-08-21 and is back on 2026-09-10, on a measurement.** The
+display device admits one client and refuses every other, a service included; that was the
+ground for not relaying a request, and it is still true. What was not measured then is that
+the client it admits takes requests: asked over the compositor's own output-management
+protocol, the session set a real mode on the device in 0.19 s and a turn in 0.03 s. So the
+request goes where a person's own display settings already send it, and nothing here holds the
+device. **It is a request of the helper and of nothing else**: the stream follows whatever the
+display becomes, exactly as before, and the application layer above the SDK is what asks.
+*Amended 2026-10-20 ([impl-plan-windows.md](impl-plan-windows.md) W3.10):* **a request is an
+owner's alone**, on both platforms -- an established client offers a size, a turn and a rate to
+an owner alone, and a guest's other requests are refused with a line -- and on Windows, where the
+host runs in the session, the daemon puts it itself: through the system's display configuration,
+never saved, a size the display does not list refused as the helper refuses one; through the
+display driver's controller for a monitor of its that no program holds; and not at all on a
+monitor another program plugged.
+
+**The orientation is the layout's business, not the mode request's.** A display the session has
+turned is drawn turned into a framebuffer that keeps its landscape shape, so scanout captures
+the picture on its side and the device reports no turn at all. The session's transform arrives
+on the same events that place the output, and the stream declares it in the video header; the
+peer turns the picture back and maps its pointer in the desktop's orientation. A host with no
+session declares the picture flat, which is the honest reading of nothing and right whenever
+the picture is.
+
+#### The layout is a signal, not a question
+
+**It was written down as a question and that is wrong.** Where the captured
+output sits in the desktop is not needed at a moment of this host's choosing;
+it has to be right whenever a guest moves its pointer, which is continuously.
+A host that asks once has an answer that is correct until somebody plugs in a
+display, and then silently wrong: the absolute axis is spread over the whole
+desktop, so a desktop that grew leaves every position scaled by the ratio
+between the old extent and the new one, and the far part of the screen cannot
+be reached at all.
+
+**The connection is the subscription.** A session re-describes an output when
+it moves and announces one that appears, but only to a client that is still
+there, so a query that opens, reads and closes can learn the layout and can
+never learn that it changed. The helper holds that connection open and reports
+what changed; a service with no helper keeps the one-shot reading, which is
+right for the one-output case it was always right for.
+
+**Events are not changes.** A session re-sends every field of an output it
+re-describes, most of them unchanged, so what is reported is a layout compared
+against the last one rather than the arrival of anything.
+
+#### The clipboard is an ownership, not a value
+
+Copied text looks like the one thing on that list a service could do for itself, and it is the
+one that most needs something living in the session.
+
+**Putting text on a clipboard is announcing that you own the selection.** The bytes are not
+handed over then; they are asked for later, when somebody pastes, in a request back to whoever
+claimed it. That is true of the privileged selection protocol on one display stack and of X
+selections on the other. **A program that sets the clipboard and exits takes the clipboard with
+it**, so there is no one-shot form of this: the thing that wrote it has to still be there when
+the paste happens. Watching for changes is the same shape from the other end, a subscription
+that lasts exactly as long as the thing holding it.
+
+It can appear to work without any of that, because a desktop's own clipboard manager may keep a
+copy of what it saw. That is a property of somebody's configuration and not of the design, and
+building on it means a feature that works on one desk and not the next.
+
+The mechanism differs per desktop as well -- a privileged selection protocol here, an X
+selection there -- which is the same reason the rest of this section exists. **It is announced
+rather than assumed**: a helper says whether its session has one, and a session that has none is
+answered honestly instead of waited on. One mechanism ships today, and a desktop with a
+different one needs its own behind the same capability rather than a change anywhere above.
+
+**The policy, though, is not the helper's and not the boundary's.** Copied text travels as an
+opaque application message ([01 §11.1](01-protocol.md)), so the library never sees it and the
+service decides who may have it.
+
+| `guest_clipboard` | a guest's clipboard reaches the desktop | the desktop's clipboard reaches a guest |
+|---|---|---|
+| `off` | no | no |
+| `send` | yes | no |
+| `both` | yes | yes |
+
+**The names are the guest's point of view**, which is the point of view the setting is named
+for, and which way round they read is load bearing: `send` is a guest sending its clipboard
+here. **Anything else is `off`** -- absent, empty, misspelled, or a value from a newer version
+-- so that a typo cannot open a clipboard and a configuration this build does not understand
+fails closed.
+
+**The two directions are not equally dangerous, which is why there are three values and not
+two.** The half a guest receives ships whatever the person at the machine copied, and that
+includes what a password manager put there. The half a guest sends puts its text on the
+desktop's clipboard, where a person still has to choose to paste it. One switch would mean
+letting a guest paste a link into your machine also hands them everything you copy, so the
+milder direction is available on its own.
+
+**The dangerous direction is not available on its own**, which is the asymmetry the values
+carry: a guest that is shown this desktop's clipboard can already be given text, so a value
+between `send` and `both` would name a stricter arrangement than it delivers.
+
+**An owner is `both` by default.** Ownership arrives relayed from signaling and is never read
+from the peer ([04 §3](04-signaling.md)); the four values above name what a *guest* may do,
+and a peer that owns the machine is not one.
+
+**The desktop's clipboard is read on change and no more often than every 50 ms.** A selection
+changes in bursts -- an editor rewrites it several times while one copy settles -- and a host
+that sent each one would put a burst of application messages on the wire to describe a single
+copy.
+
+Nothing new bounds the size: copied text is an application message and is already refused above
+the ceiling those carry.
+
+#### Who may connect, and where
+
+**Any local user may connect, and that is a deferral rather than a position.** The cost is
+worth naming rather than discovering: on a machine with more than one person logged in at once,
+any of them can read the guest list, kick a guest and change the stream's settings -- by hand or
+from a script, without being the person the session belongs to. On the machine this is for there
+is one human and the cost is nil, which is why it waits rather than why it is right.
+
+**Three things keep it a deferral.** The peer's credentials are read and recorded on every
+connection, so a host action always says who asked for it. Authorisation has one place to
+happen, where a connection announces its role, so a criterion is a comparison rather than new
+plumbing. And the requirement is written here rather than left in somebody's memory: **being
+local is not a criterion**, and the two candidates are the user who owns the session being
+streamed and a group an administrator puts people in.
+
+**The helper needs none of this**, which is the difference this section opened with. A helper
+makes statements about its own session and is trusted with exactly that, so its credentials
+already bound what its claims can mean: rule 4 below. Only the acting role -- kicking a guest,
+changing a stream -- wants a criterion beyond being connected.
+
+**None of this is the guest permission model and it must not grow into one.** What a *guest*
+may drive, whether it owns the machine, and whether it needed approval at all are decided by
+signaling and arrive relayed -- never from the peer itself, which is the whole reason they are
+relayed ([04 §3](04-signaling.md)). Approval and ownership are settled there, above this
+program, and nothing on this channel adds to them or argues with them. A local client is a
+different question with a different answer, and the two must not be made to look alike.
+
+**The socket is at a known path**, and the reason is a consequence rather than a preference.
+The session-side programs are started by the session, since nothing below it can start them
+(the table above) -- as user units that are part of the graphical session's target, so a login
+starts them and a logout ends them -- so nothing is in a position to hand either a private
+path; and a tray
+started by hand -- which is how a person gets one back after closing it -- is started by
+nobody at all. A path it cannot find is a tray that cannot connect, and asking the service to
+start another one needs the channel it is missing. So the path is known, a tray started by
+hand simply connects and is the tray, and no protocol for asking to be restarted has to exist
+at all. A private path would put secrecy where a credential belongs, and would cost exactly
+the tray somebody starts by hand.
+
+**A session-side program exiting means nothing to the stream.** The service does not depend
+on them: a tray that is closed is not a tray that is missed, and a session that ends takes
+both with it while the stream carries on. Nothing is restarted into a session that is no
+longer there.
+
+**A tray shows the host and acts on it, and the service tells it rather than being asked.**
+What the host is doing -- which output, at what size and rate, coded how, and who is seated --
+is pushed to every tray when it changes and to a tray the moment it connects, so a menu opened
+at any time describes the room as it is. The actions are a kick of a seated guest and a change
+to the stream's rate ceiling, each a frame the service acts on from the loop that owns the
+guests, and each recorded with the connection's credentials on the line. A change asked for by
+a tray goes through the same reader a guest's own request does, so what a tray may change is
+what a guest may change, by one rule. There is no reply to an action: the state that comes
+back is the acknowledgement, and a request that changed nothing says why on the service's log.
+A guest arriving or leaving is also a desktop notification, put up by the tray through the
+session's notification service; it announces a media path coming up or going down, never a
+seat taken or an attempt abandoned, and never what was already there when the tray first looked.
+
+#### The rules that matter more than the encoding
+
+1. **The stream never depends on the helper.** No frame waits on it, no encode consults it,
+   and a helper that dies mid-session disturbs nothing. This is the same rule the tray has
+   always had, and it is what keeps a logout survivable.
+2. **Absent is not degraded.** With no helper the answers are the honest ones: the pointer is
+   reported shown, so relative mode never engages; no idle lease is held; the picture is
+   declared flat; a mode request is refused and the guest is told why. Nothing guesses.
+3. **The service never blocks on it.** Every request carries a deadline, and a helper that
+   stops answering is dropped rather than waited for. An unbounded wait on a process in
+   somebody's session is an unbounded wait on somebody's session. One request is outstanding
+   at a time, a second is refused rather than queued, and the answer is read by the loop that
+   asked, on its next pass, from the same queue the session's signals arrive on. *Amended
+   2026-10-28:* the service's writes too, to a tray as well as a helper. A write waits at most
+   100 ms for room, a frame cut short by it at most twice that, which it needs only once a
+   buffer's worth has gone unread, and a program that has not taken it is then dropped; before,
+   one that stopped reading could stall the service's loop, which writes while holding what
+   that loop needs. The session's side holds the same deadline toward the service, and a frame
+   it could not send ends its connection, which it then makes again.
+4. **A helper speaks only for itself.** The peer's credentials, not its claims, say which user
+   is on the other end, and its statements apply to that user's session and no other. It is
+   never asked to do anything it could not do on its own behalf, so it carries no privilege
+   worth taking.
+5. **One helper to a session, newest wins.** A reconnect replaces its predecessor rather than
+   joining it, because two answers to "is the pointer hidden" is not a state anything can act
+   on.
+6. **Both directions, and they are not symmetric.** The session pushes signals as they change;
+   the service asks questions and gets one answer. A signal is never a reply and a reply is
+   never assumed.
+
+#### The channel
+
+Length-prefixed frames on a Unix stream socket: a fixed-width little-endian length, then a
+body. The first frame each way is a version, a role and what the sender can do; a version that
+is not understood ends the connection rather than being worked around, because both sides ship
+in one file and the only way to see a mismatch is a stale process -- continuing with one is how
+a stale process becomes a wrong answer.
+
+**The body is JSON, and the reason is not convenience.** The rate is a handful of messages a
+second at its worst, so nothing here is paying for it, and what it buys is that a wrong answer
+can be read out of a log rather than reconstructed from a hex dump, which is the same reason
+the opaque messages this host passes between a guest and an application are logged as the
+exact bytes that were sent ([01 §11.1](01-protocol.md)). It also needs nothing added: the
+serializer is already in this program. The framing is ours, so a denser body is a change of
+one function if a reason for one ever appears. **The fixed-width discipline the wire protocol is written to does not apply here**:
+that rule exists because the wire has to match a format this project does not own, and this
+channel is private and versioned by its own build.
+
+**No remote-procedure-call library.** What one would supply is serialization and request and
+reply plumbing; what it would not supply is any of the work -- the peer's credentials, the
+deadline on every request, one helper to a session, and the file descriptors the
+compositor-mediated topology would pass. It would also arrive with an executor, which this
+project keeps to signaling alone ([00-overview.md](00-overview.md) D3); a socket carrying a
+few messages a second does not need a runtime to read it.
+
+The channel is local and carries no media, so it has none of the congestion apparatus the wire
+protocol has. Buffer handles are a separate matter and belong to the compositor-mediated
+topology above, not here.
+
+## §6 Privileges
+
+The daemon runs as a dedicated system user, never as root.
+
+| Resource | Access |
+|---|---|
+| display device | supplementary group for the device class, plus a rule for the render node |
+| input device node | supplementary group plus a rule granting the daemon write access |
+| HID device node | the same, and only once a controller needing that layer is emulated ([§4.2](#42-gamepads-and-the-two-device-layers)) |
+| framebuffer export | **`CAP_SYS_ADMIN`, and group membership is not enough** -- see below |
+
+The unit grants the minimum that works, denies device access by default and allows the two
+device classes explicitly, and runs with a private temporary directory, no new privileges, and
+a read-only system tree. It lives in `packaging/` with the account it runs as and the rule that
+opens the input node.
+
+### §6.1 Scanout needs a broad capability, and that is a product decision
+
+**Measured.** The same binary, on the same display, at three privileges:
+
+| | answer |
+|---|---|
+| a member of the `video` group | **the display is unreachable** |
+| the same, plus `CAP_SYS_ADMIN` | it can host |
+| root | it can host |
+
+**The capability is the whole of the difference.** Everything before the buffer handles works on
+group membership alone: the device opens, its connectors enumerate, the lit plane is found. What
+is refused is the handle set of the framebuffer being scanned out, and every later stage -- the
+import, the export, the pointer read -- fails on its absence with the same answer an empty
+desktop gives. That is why the pre-flight reads the handles rather than checking whether a plane
+is lit, and why it tells "nothing is lit" apart from "this process may not read what is".
+
+**This is documented here rather than buried in the unit file** because a remote desktop daemon
+holding `CAP_SYS_ADMIN` is a meaningful attack surface, and it is the reader's decision to take
+or refuse. Refusing it is a working configuration: the daemon still selects outputs, still reads
+modes, still caps the encoder's rate, and reports that it cannot reach the display rather than
+failing somewhere deep in a stream.
+
+**It is a capability rather than a group because of what it gates**, which is reading another
+process's buffers out of the display controller. No group confers that, and no distribution
+ships one that does.
+
+*Amended 2026-10-28 (the maintainer's decision):* the unit's bounding set also carries
+`CAP_SYS_NICE`. The kernel asks for it before it grants the conversion's queue a raised
+priority ([05 §3](05-host.md)), which is what keeps a game on the same GPU from holding the
+stream on its last picture. Beside `CAP_SYS_ADMIN` it widens little. Without it the service
+runs as before, its conversion at normal priority, and says so once.
+
+## §7 Audio
+
+**Closed 2026-08-22, and the session question turned out not to arise.** The sound server is
+per-session -- its socket sits in that session's own runtime directory, which is private to the
+user -- but a service already privileged enough to reach the directory **is admitted to the
+socket and is never challenged for a credential**. Measured both ways, with and without the
+session user's authentication cookie: identical. So audio is reached exactly as the desktop
+layout is reached in §2.1 -- find the session's socket, open it -- and **no helper is required
+for it**.
+
+- **The PulseAudio client interface, loaded at runtime**, is what this host speaks. PipeWire
+  serves it as well as PulseAudio does, so one path reaches both, and it is a handful of symbols
+  out of two shared libraries rather than a linked dependency: a machine without them has no
+  audio rather than a service that will not start. The native PipeWire interface is the
+  alternative, and it buys a smaller capture period than the graph's own -- which is worth
+  nothing while a packet is 20 ms of it.
+- **The device is the default output's monitor**, which the server will name on request, so
+  finding it costs no enumeration. A named device is checked against the enumeration first,
+  because **a name that does not resolve is substituted rather than refused** ([05 §9.3](05-host.md)).
+- **A kernel loopback device is not needed** and is not used. It was the fully
+  session-independent option and its cost was a module and manual routing on the user's machine.
+
+**What the platform will not do**, both measured rather than assumed:
+
+1. **A capture does not follow the default output.** The device is resolved once, when the stream
+   is connected; changing the default afterwards leaves the capture on the old one. Following it
+   is this host's work, not the server's ([05 §9.3](05-host.md)).
+2. **There is no per-application exclusion.** Capturing everything except one named program is an
+   operating-system call on another platform and has no equivalent here, which is why this host
+   does not offer it ([05 §9.5](05-host.md)).
+
+### §7.1 The guest microphone as a device
+
+**A guest's microphone arrives decoded ([05 §9.6](05-host.md)); making it a capture device that
+other programs can select is a different problem, and it is the application's**
+([06 §13](06-api.md)). The library owns neither the session, the naming, nor the lifetime. What
+follows is what the two platforms make possible, because the shape differs enough to change who
+owns the timing.
+
+**Linux: a pipe-backed source, measured 2026-08-26.** One module load creates a device that
+programs list as a microphone rather than as a monitor, and feeding it is a write of raw
+sixteen-bit samples to a FIFO -- mono at 48 kHz, which is what the wire already carries, so
+nothing converts. It needs **no dependency this host does not already have**: the module is
+loaded over the same client interface §7 already speaks, and the write side is a file. Measured
+end to end on PipeWire's PulseAudio server: samples written to the pipe read back from the source
+at full amplitude with no gaps.
+
+**The obvious alternative does not work, and it fails quietly.** A null sink declared as a
+virtual source *is* offered as a real source, but it is not a sink, so a stream cannot be pointed
+at it by name: the session manager moves that stream to the default output instead, and the
+device stays silent while something else gets louder. Feeding one means linking ports through the
+native interface, which is a second sound library and a routing decision the session manager can
+override.
+
+**Linux leaves the timing with us.** A capture device is read on the sound server's clock and
+packets arrive on the network's, so writing only when a packet lands underruns and crackles. That
+costs a short prime before the first write and silence written rather than nothing on a gap --
+the same shape as the receive side of any jitter buffer, and the part worth measuring rather than
+assuming.
+
+**Windows inverts that.** A virtual capture device there is a kernel-mode driver, which makes it
+a signing and distribution problem rather than a coding one: it must be code signed to load at
+all. The drivers that exist are third-party and installed separately -- AudioRelay's microphone
+is one -- and **they carry the jitter buffer and the sample clocking inside the driver**. So the
+host's side of it is small and unglamorous: open the device handle and hand it fixed-size buffers
+of PCM through an IOCTL. The timing that Linux leaves to us is already handled behind that
+handle.
+
+**So this host ships no driver on either platform.** On Linux it can create the device itself,
+from what it already links. On Windows it can drive a device somebody else installed, and if
+nobody installed one there is no microphone -- which is a deployment answer rather than a
+missing feature. (*Amended 2026-10-14*: that is the microphone's answer, not the host's. On
+Windows the host ships one driver, a display of its own for a host with no monitor
+([impl-plan-windows.md](impl-plan-windows.md) W3); a capture device for the microphone is
+still somebody else's.)
+
+## §8 GPU and encoder
+
+- Hardware encode requires an NVIDIA GPU and a current driver. The encoder library is loaded at
+  runtime, so its absence is a missing backend rather than a failed start.
+- **A runtime library, once loaded, stays loaded for the life of the process** (*2026-09-19*),
+  and the process makes one instance of the graphics interface and keeps it. Every pipeline
+  build used to open the vendor runtimes and the graphics loader afresh and close them at the
+  teardown; the vendor's driver carries thread-local storage that must live in the static area
+  the C library sets aside at start, that area is given back only in stack order, and builds
+  that interleave the loads and unloads leave holes in it until, after ten to twenty builds,
+  the driver refuses to load -- "cannot allocate memory in static TLS block" -- and its device
+  vanishes from every enumeration for the rest of the process's life. That read as the
+  display having no compute interface and ended every guest with the encoder's status. A
+  driver is not built to be unloaded in the first place; keeping it is the correct shape,
+  not only the cure.
+- The compute interoperation path that imports capture buffers is what makes the pipeline
+  zero-copy ([05 §2](05-host.md)). It is the same path §3 probes.
+- Software encode requires no GPU and is the continuous integration path
+  ([impl-plan §Phase 11](impl-plan.md)).
+- Open-stack hardware encode for other vendors comes after there is hardware to test on.
+- **Device identifiers are discovered at runtime and never persisted.** They change across
+  reboots and driver reloads, so a configuration file naming one is a configuration file that
+  breaks.
+
+## §9 Development environment
+
+Phases 0 to 8 need no display hardware, which is why the phase plan is ordered as it is
+([impl-plan](impl-plan.md)).
+
+A virtualized Linux environment on a Windows host is sufficient for all of them: the kernel
+input device node is present, so injection is testable against real devices rather than mocks;
+hardware encode is available; and outbound networking is real, so connectivity works against
+real peers.
+
+What such an environment cannot provide is any display device at all, which is the direct
+argument for capture being a trait with a synthetic implementation from the first commit rather
+than a late abstraction.
+
+Namespace-based network fixtures ([08-testing.md](08-testing.md)) also run there, which matters
+because a developer network provides exactly one address-translation topology and the
+connectivity engine must handle six.
+
+## §10 Windows
+
+After Gate B. The differences are contained:
+
+- Capture through the platform duplication interface, which handles the session, lock screen,
+  and elevation cases that motivate §2 on Linux. (*Amended 2026-10-14*: on a host with no
+  monitor, from a display driver of the host's own instead, read straight from the system's
+  buffer -- [impl-plan-windows.md](impl-plan-windows.md) W3.)
+- Injection through the platform batch input call, which requires interactive session context.
+  A service must therefore run capture and injection in the interactive session, mirroring the
+  split topology in §5. (*Amended 2026-10-14*, at W2's planning: not split. The whole host is
+  one process of the system account in the console session, which the service starts and
+  starts again across session changes -- [impl-plan-windows.md](impl-plan-windows.md) W2.)
+- Timer resolution must be raised explicitly ([02 §2](02-io-shell.md)).
+- Completion-port receive rather than batched polling ([02 §6](02-io-shell.md)).
+- Shared texture handles use the legacy form, not the modern one, for cross-process
+  compatibility. (*Amended 2026-10-14*: not between the host and its own display driver. The
+  system's buffer and the fences that order it cross as the modern form, the only one a fence
+  has.)
+- A guest's microphone becomes a capture device only through a signed kernel-mode driver, which
+  this host does not ship and does not need to write ([§7.1](#71-the-guest-microphone-as-a-device)).
+- Sound through a loopback of the default output, which delivers nothing while nothing plays,
+  so the host keeps a silent stream open on the same output, and follows the default through the
+  system's own device notifications (*added 2026-10-15*, [05 §9](05-host.md),
+  [impl-plan-windows.md](impl-plan-windows.md) W2.4). Unlike Linux, the system can capture
+  everything but one program; that is deferred (W2.6).
+- A display driver of the host's own (*planned 2026-10-15*,
+  [impl-plan-windows.md](impl-plan-windows.md) W3): a user-mode indirect display driver, so a
+  test certificate the machine trusts loads it with no test mode, and a release is signed from
+  CI's build by a signing service for open-source projects. It is installed, updated and removed
+  by a script of its own, which the machine's administrator runs, never by the service (*amended
+  2026-10-22*), and needs Windows 10 1903. Its control interface admits any interactive user, a
+  monitor bound to the handle that plugged it or kept until removed; its frames reach only a
+  process that can take handles from the driver's own -- the system account (*amended
+  2026-10-16*, [11 §1.2](11-drivers.md)) -- and never the library's boundary. Kept monitors
+  come back at start from a file in a folder of its own under the program-data directory, which
+  users may write and the driver's account may read, beside the host's configuration that only
+  the system account and administrators read. An arrangement of displays that only the virtual
+  one can satisfy is never saved, or a later boot waits on the driver. The design is
+  [11](11-drivers.md).
+- An input driver of the host's own (*planned 2026-10-22*,
+  [impl-plan-windows.md](impl-plan-windows.md) W4): a user-mode filter above the system's virtual
+  HID framework, presenting a keyboard, a mouse, a DualShock 4 and a DualSense whose input the
+  system takes as a device's, signed and installed as the display driver is, by a script of its
+  own (*amended 2026-10-22*). Its control interface admits the system account and administrators
+  alone, since its devices' input reaches the secure desktop and the console's session. The
+  application switches a guest's keyboard and mouse onto it, the batch input call staying the
+  default -- `lowlatd --virtual-input` at start (*built 2026-10-26 for the keyboard*, W4.1); the
+  owner sets whether a pad sent as its reports is presented as its product; the Xbox 360 pad stays
+  on the virtual bus. The design is [11 §2](11-drivers.md).
+- **What needs a driver needs it installed** (*added 2026-10-22*). Nothing of the host installs
+  its drivers -- not the service's install, not the host, not the library: the machine's
+  administrator runs each driver's script, once, again to update it, and with `-Remove` to take it
+  away. The host's own display -- the output `virtual`, `virtual_fallback`, `virtual_width`,
+  `virtual_height` and `virtual_hz`, the library's third half, `lowlatd display` and `lowlat-vdd`
+  -- works only where the display driver is installed, and the input devices -- `virtual_input`
+  and `virtual_pads` -- only where the input driver is ([06 §3](06-api.md)). Without the display
+  driver, a stream asked for `virtual`, or for the fallback with nothing lit, plugs nothing, says
+  why once and waits as for any display that is not scanning out, its guests ended when that wait
+  runs out; the third half's open answers `LOWLAT_ERR_VDD_ABSENT`, and the commands say the driver
+  is not installed. Without the input driver, `virtual_input` switched on is refused, and a pad
+  sent as its reports is played as the Xbox pad, said once. A driver installed while the host runs
+  is taken up without a restart: the display at the host's next attempt to plug it, the input
+  devices the next time `virtual_input` is switched on -- for `lowlatd`, whose flag switches it at
+  start, its next start. Both scripts make the driver's root device and install its package with
+  nefcon, an open-source device tool shipped beside them with its licence, since the system's own
+  tool cannot make a root device.
+- The service (*reviewed 2026-10-17*, [impl-plan-windows.md](impl-plan-windows.md) W2.5): the
+  daemon's second role, under the service manager, which starts the host in the console's session
+  and starts it again when that session changes or the host fails, deciding on every pass rather
+  than on each notification. `lowlatd install` copies the programs into the program-files
+  directory -- a program the system account runs must be writable by administrators alone -- makes
+  the program-data folder readable by the system account and administrators alone, since the
+  configuration it holds is the host's environment and carries the signaling secret; `uninstall`
+  removes the service and the programs and keeps the configuration. **Neither touches a driver**
+  (*amended 2026-10-22*; until then the display driver was installed from beside the program and
+  removed with the service). The secure attention call is allowed in the machine's
+  policy only for the length of each call. The login tool writes the configuration and restarts
+  the service; Python is a prerequisite here, as the ViGEm bus is. The host advertises Windows,
+  the system's major version, the computer's name and a random identifier kept beside its
+  configuration, so a listing does not become a fingerprint of the machine. *Checked
+  2026-10-18:* where the host outlives a change of session or the service stops, each seated
+  guest is told the host system is changing; **a host ended with its session says nothing** --
+  at a logoff, and at a shutdown, whose sessions end before any service hears of it -- and its
+  guests wait for their own timeout. That is a known gap, deferred: the system tells a session's
+  end to a window, and of a program in the session to services alone through the console, and
+  this host has no window.
+
+None of this reaches the protocol core, the IO shell's logic, or the public API.
+
+**Where the differences live** (*added 2026-09-26*). Each platform-specific stage is a module
+chosen when the crate is built, under the same names on every platform, never a trait
+dispatched at run time: the shell's system calls, the display and the encoder built on its
+device, the census of what those could code, the input devices a guest's input lands on, the
+decoders a client opens and their table, and (*since W2.0*) the daemon's side of the desktop
+session -- the helper and the tray on Linux, and neither on Windows, where the host itself
+runs in the session. The code above each module -- the loops, the seam,
+the policy -- is written once, and a platform is ported by writing its modules
+([impl-plan-windows.md](impl-plan-windows.md)).
+
+**The client's half** (*planned 2026-09-26*, W1; [10 §4.2, §5.2](10-client.md)). The client
+decodes through the system's own video decoding interface, driven by the library's readers,
+on the GPU the application renders on, and hands a picture out as one shared texture per
+plane in the legacy form, which a renderer in the same process opens. A renderer belongs on
+the GPU that drives its display: one on another GPU pays a copy of every presented picture
+across the bus and loses the direct flip. The library and the demo link the C runtime
+statically, so neither asks the machine for a redistributable.
+
+## §11 Open items
+
+| Item | Status |
+|---|---|
+| framebuffer export, open stack | **closed**: works, read-only (§3.1) |
+| framebuffer export, second vendor | **closed**: works, single tiled buffer (§3.2) |
+| capture backend | **closed**: scanout |
+| frame variant | **closed**: multi-plane, modifier-bearing, 10-bit capable |
+| process topology | **closed**: system service, session helpers optional (§5) |
+| guest microphone as a device | **open**: the Linux route is measured and unbuilt (§7.1); Windows needs a driver this host will not ship |
+| privilege requirement | **closed**: card node plus the elevated capability |
+| pointer-hidden signal source | **closed as a question, open as work**: the session-side probe is required, not preferred, and the plane signal was measured to be a different state (§2.1) |
+| scanout format stability | **closed**: it changes several times a minute in ordinary use (§3.3) |
+| framebuffer export, classic module of the second vendor | open, not run here, off the path |
+| virtual display | open: the software virtual driver is absent from this kernel; on Windows the host's own driver is planned (W3) |
+| audio capture surface | **closed**: the session's sound server, reached over its own socket, no helper (§7) |
+| local channel authorisation | **deferred**: any local user may act, credentials are recorded, and the criterion is one comparison when it is wanted (§5.1) |
+
+Six of the ten were closed by one probe, run before Phase 0 rather than at Phase 9. A second
+run of the same probe on different hardware closed the seventh (§3.2), and the first run of the
+real backend closed two more (§2.1, §3.3) while adding one of them to the list. The rest are all
+narrower than the questions they replaced.
+
+## §12 A relay on the host's machine
+
+*Added 2026-09-23 with C10 ([03 §7.1](03-connectivity.md)).* The deployment the client's relay
+is for runs a relay server on the host's own machine, and nothing about the host changes: it is
+offered one more candidate and checks it like any other. Operating the relay is the deployment's
+rather than this project's -- nothing ships one -- but its configuration decides whether the
+arrangement works at all, and three of its settings fail silently.
+
+- **Forward the relay's listening port, and nothing else.** The router forwards that one port
+  to the machine. The relay's allocation range stays on the machine's side of the router: the
+  host reaches a relayed address by local delivery to its own address, and nothing outside needs
+  to reach the range.
+- **Forward it for TCP as well, where clients that cannot use UDP are to be reached** (C11;
+  [03 §7.4](03-connectivity.md)). A relay listens for TCP on the same port unless told not to; the
+  router must forward both protocols, and nothing else changes -- the allocation and the host's
+  leg stay datagrams. Measured on such a machine, its TCP leg carried 14.4 Mbit/s as cleanly as
+  UDP, and a ten-minute session with motion through it carried the host's full rate at UDP's
+  round trip.
+- **Configure no external address.** Without one the relay hands out the machine's own address,
+  which is what the host reaches locally. With the router's public address configured, both
+  legs hairpin through the router into a range nobody forwarded, and allocation and permission
+  both succeed while no media ever arrives.
+- **Relay only to the machine's own network, and never to loopback.** Deny every peer and
+  allow the machine's network as the one exception. A relay that reads an allowed range only as
+  an exception to a denied one does nothing with the allowed range alone, and then relays to any
+  address for whoever holds the credential. Leave loopback refused: a deployed relay destroys
+  the allocation that sends toward loopback. The client asks for neither; anyone else holding
+  the credential can.
+- **Long-term credentials, or time-limited ones**, which the client takes unchanged. The
+  credential is configured into the client application, never logged by the library, and
+  cleared from every copy it takes.
+- **The allocation range bounds concurrent clients**: one relayed port each for as long as an
+  attempt lives, released on a clean leave.
+
+## §13 macOS
+
+*Planned 2026-10-29* ([impl-plan-macos.md](impl-plan-macos.md)). **The client half only: there is
+no host on macOS and none is planned** ([00 D14](00-overview.md)), so the capture, encode,
+injection, daemon and driver crates build empty there.
+
+- **macOS 11 on arm64 and x86_64.** The client ships as one universal static library (*amended at
+  M1.5, 2026-10-31*; [06 §3b](06-api.md)), each architecture built and tested on its own and the
+  two joined; the shared library builds the same way and is not shipped. CI tests x86_64 under
+  the system's translation layer. **Every macOS build is for 11**, the workspace's cargo
+  configuration naming it: unset, the compiler takes the SDK's own version for the C and
+  assembly the crates compile (26.4, measured), and a static library built so warns an
+  application linking for 11 of each such member. An entry point newer than 11 is found at run
+  time, since a symbol linked by name and missing stops the load on an older system.
+- **Nothing is signed** (*amended at M1.5*): an archive carries no signature, and the application
+  that links it signs what it makes, and notarizes it with a developer identity; an unsigned
+  download is quarantined by the system until the user allows it. The hardened runtime, which
+  notarization requires, also refuses to load a library signed by neither the system nor the
+  application's own team (measured), so an application that loads the machine's codec pair under
+  it takes the entitlement that turns library validation off.
+- **Timed waits are coalesced**: the system lets a sleep or a timeout run late by an eighth to a
+  quarter of its length, up to 1 and 5 ms, unless it is a kernel-queue timer marked critical
+  ([02 §2](02-io-shell.md)).
+- **The system's interfaces are generated bindings** over the macOS SDK's headers, checked into
+  the driver crate, as Windows's are. *As built (M1.2)*, the video frameworks' functions are
+  generated as the types of pointers to them rather than as declarations, and the frameworks
+  are opened by path at run time, every function and constant the library uses found once at
+  the first decoder probe -- measured at 21 ms on arm64 and 119 under the translation layer,
+  nearly all of it Core Foundation's own start. Nothing is linked by name, so an application
+  that never decodes loads none of them and the static library links with nothing named.
+- **A shared library is named by the path it was built at** unless its link says otherwise, and
+  an application's link records that name, so the library's says `@rpath/liblowlat.dylib`
+  ([06 §3b](06-api.md)).
+- **The socket's platform facts are [02 §5](02-io-shell.md)'s**: every v4-level option refused on a
+  dual-stack socket, the mark and the source per datagram on IPv4, and a port held for IPv4 by
+  another socket not stopping a dual-stack bind. **A relay attempt crosses both carriers**
+  (*measured at M1.5*): through a public relay service to a host across the Internet, over UDP
+  through the dual-stack socket's IPv4 path and over TCP on a stream in the relay's own family,
+  each session leaving as asked ([10 §11](10-client.md)).
+- **A library installed on the machine is a package manager's**: the dynamic linker's own search
+  reaches `/usr/local/lib` and `/usr/lib` but not Homebrew's directory on Apple Silicon, so what
+  the library loads from the machine it finds by full path in the package managers' directories
+  ([10 §5.3](10-client.md)). A package manager's build for one architecture does not open in a
+  process of the other. Nothing is opened by a bare name there at all: the system's search for
+  one takes the working directory (measured), so a library left beside a user's files would load.
+- **A non-interactive shell does not read the login profile**, where the package manager puts
+  its paths, so scripts run over a remote shell name its tools by full path.
+- **App Nap and the threads' classes are left as they are** (*measured at M1.4, 2026-10-30*).
+  The system naps a client whose window is hidden, minimized, covered or on another space
+  while it plays no sound, and a session there kept its figures -- the round trip at 2 ms, no
+  fragment late, the decode at 2.15 ms at the median -- the library's waits being a critical
+  timer, the kernel queue and the address wait, none of which a nap holds back; it wakes on the
+  window's return with no catch-up seen. A hidden window no longer paces its presents by the
+  display, so a client that presents while hidden draws as fast as pictures come, which cost
+  the demo two to three times the processor it used shown. No thread's class is raised
+  ([10 §10](10-client.md)).
+- **Game Mode reaches an application with no bundle when its policy is forced** (*measured at M1's
+  gate*, Xcode's `gamepolicyctl game-mode set on|off`): a DualSense by Bluetooth reported 125
+  times a second on against 65 off, by USB 250 either way; the decode did not move measurably,
+  and no indicator showed in the menu bar. The system engages it on its own only for an
+  application it takes for a game, by its bundle's category.
+- **Under the translation layer an x86_64 client plays sound** through SDL's Core Audio backend
+  (measured, macOS 26): a sound path of an earlier client's crashed there.

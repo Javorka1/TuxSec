@@ -1,0 +1,1894 @@
+# 06 - Public API
+
+**Status:** locked 2026-08-15. Implemented by `lowlat-sdk`, generated as one C header.
+
+**The C ABI is the only public surface.** There is no public Rust API, no C++ wrapper, and no
+language-specific SDK. Every binding anyone will ever want consumes C: C#, Java, Swift,
+Python, and Rust itself all speak it, and it is the one calling convention that survives across
+compilers, runtimes, and toolchain versions.
+
+## §1 Shape
+
+Six rules, each of which removes a class of integration failure.
+
+1. **Opaque handles.** The application holds a pointer it cannot dereference. Internal layout
+   changes freely.
+2. **Plain data structs with a leading `size` field.** The caller sets it. We read it and
+   behave according to what the caller knows about, so a struct can grow without breaking
+   binaries compiled against an older header. It is also what makes a translation unit that
+   disagrees with the library about a structure's size fail to start rather than misread every
+   field after the first.
+3. **Stable-numbered enums, and never a parameter.** Values are assigned once and never
+   reused, never renumbered, and never reordered; new variants append. A code travels **outward**
+   as its enumeration and **inward** as a plain integer, because a value the application wrote
+   is whatever the application wrote, and reading one nothing defined is undefined behaviour.
+   Every such field is checked at the boundary rather than converted. *Amended 2026-10-31
+   (minor 36):* outward is also every structure field and out-parameter the library writes
+   with a value one of its enumerations names, each typed by it. Every enumeration is one
+   `typedef enum` for both languages, its width under `LOWLAT_ENUM_BASE`: in C++ the macro
+   declares it (`: uint32_t`, or `: int32_t` for a status), so a field reads into its
+   enumeration with no cast and holds any value a newer library writes; in C the macro is empty
+   and the enumeration the platform's, four bytes on every target this builds for. Nothing in
+   the header tests a C standard's version, which MSVC leaves undefined in its default C mode.
+   A structure the application writes keeps its integers even where the library fills it too
+   (`lowlat_host_default_config`), since the library reads it back; a family of bits names one
+   bit an enumerator, and whatever holds them OR-ed stays an integer.
+4. **A boolean field is a `bool`.** One byte on every target this builds for, asserted at
+   compile time by the header's own test, and C normalizes anything assigned to one.
+5. **Poll based, not callback based.** The application asks for events on its own thread at its
+   own cadence. No callback fires from inside our threads, so there is no reentrancy contract
+   and no lock the application can deadlock against.
+6. **Prefixed symbols.** Every exported name begins `lowlat_`. This is checked mechanically
+   against the symbol table ([impl-plan §Phase 8](impl-plan.md)).
+
+The **call shape follows the established host SDK** ([00-overview.md](00-overview.md) D6), so
+porting an existing integration is close to mechanical. **Struct layouts are ours.** Binary
+drop-in compatibility is explicitly not offered, and the symbol prefix guarantees that a
+mismatch is a link error rather than silent memory corruption at the first field.
+
+## §2 Lifecycle
+
+```c
+uint32_t      lowlat_abi_version(void);
+uint32_t      lowlat_features(void);
+const char   *lowlat_status_string(int32_t status);
+lowlat_status lowlat_set_log_callback(lowlat_log_fn fn, void *opaque);
+lowlat_status lowlat_set_log_level(uint32_t level);
+
+lowlat_status lowlat_host_create(const lowlat_host_create_info *info, lowlat_host **out);
+void          lowlat_host_destroy(lowlat_host *hl);
+```
+
+**One library, one header, two halves, and a handle type per half.** A host session is a
+`lowlat_host`, made by `lowlat_host_create` and used by every `lowlat_host_*` call; a client
+session is a `lowlat_client` in the same way ([§3b](#3b-client)). The two are distinct opaque
+types rather than one handle in two roles, so a host call on a client handle fails to compile,
+which is the same rule the symbol prefix enforces at link time (§1, rule 6). What takes no
+handle -- the version, the features, the status text, the log -- belongs to neither half and
+is in every build.
+
+**Either half can be left out of a build.** A platform that can only be a client gets a
+library with no host in it and none of the host's display stack compiled; the header hides
+the same half when the application defines `LOWLAT_NO_HOST` (or `LOWLAT_NO_CLIENT`) before
+including it, so a call into the missing half is a compile error rather than a link error.
+A plain include declares everything. `lowlat_features` reports the halves of the library
+actually loaded, as `LOWLAT_FEATURE_HOST | LOWLAT_FEATURE_CLIENT`, so a loader that resolves
+names one at a time learns once what it lacks rather than at whichever name it reached first.
+It reports one more thing decided at build time (minor 12): `LOWLAT_FEATURE_GPL_LIBAVCODEC`,
+set by a library built with the `gpl-libavcodec` feature, whose software decoder loads a GPL
+build of the machine's codec library as well as an LGPL one ([§3b](#3b-client)). The header
+is one for every build, so the bit is the only way a loader learns what this one would load.
+
+**On Windows a third half, the virtual displays** (minor 26, [§3c](#3c-virtual-displays)): a
+`lowlat_vdd` is one handle on the host's own display driver, used by every `lowlat_vdd_*`
+call. The header declares it under `_WIN32` alone, `LOWLAT_NO_VDD` hides it, and
+`lowlat_features` reports it as `LOWLAT_FEATURE_VDD`.
+
+One handle owns one host session. `lowlat_host_destroy` stops hosting, disconnects every
+guest, joins every thread, and returns only when all of it has happened.
+
+`lowlat_abi_version` lets a loader verify the library matches the header it was built against
+before calling anything else. It is the one function whose signature can never change.
+
+**`lowlat_debug_panic` is exported on purpose and is not for applications.** It panics, so that
+containment can be tested against the object that ships rather than against a copy of the same
+code linked into a test, which answers for the test's build settings instead. One symbol is a
+small price for the only check that can fail if [§9](#9-panics-and-unwinding) regresses.
+`lowlat_client_debug_panic` is its twin on a client handle (minor 18), so a library carrying
+the client half alone -- the client-only build, and a Windows build until W2.0 -- is tested the
+same way.
+
+The log callback is the single exception to rule 5. It is cold, it fires on whichever thread
+logged, and it must not call back into the API.
+
+**It is replaceable, and passing `NULL` returns the library to writing lines itself.** The sink
+underneath is process-wide and takes one installation; what an application registers sits behind
+that, so registering again changes where lines go rather than being refused.
+
+**The message is a NUL-terminated copy**, which is the one allocation on that path: a Rust
+string carries its length rather than a terminator, and handing out a pointer to one would be
+handing out something C cannot read to the end of.
+
+**`lowlat_set_log_level` decides what is formatted at all**, not only what is delivered. A line
+above the level costs a comparison; below it, the message is built. That is why the level is a
+call rather than a filter the callback applies.
+
+**With no callback registered, lines carry the elapsed time** since the first of them and go to
+standard error. Every diagnosis made from these logs has come down to an interval -- how long a
+wait actually waited, whether a periodic line stopped -- and a log with no clock answers none of
+them. It is monotonic rather than a wall clock: that is the quantity being read, and it needs no
+timezone to mean something.
+
+## §3 Host
+
+```c
+lowlat_status lowlat_host_start(lowlat_host *hl, const lowlat_host_config *cfg);
+lowlat_status lowlat_host_stop(lowlat_host *hl);
+lowlat_status lowlat_host_get_status(lowlat_host *hl, lowlat_host_status *out);
+lowlat_status lowlat_host_poll_microphone(lowlat_host *hl, uint32_t timeout_ms, int16_t *samples,
+                                          uint32_t *count, uint32_t *guest, uint32_t *dropped);
+lowlat_status lowlat_host_poll_pad_report(lowlat_host *hl, uint32_t timeout_ms, uint32_t *guest,
+                                          uint32_t *pad, uint32_t *type, uint32_t *kind,
+                                          uint8_t *report, uint32_t *len,
+                                          uint32_t *dropped);               /* minor 10 */
+lowlat_status lowlat_host_send_pad_report(lowlat_host *hl, uint32_t guest, uint32_t pad,
+                                          uint32_t kind, const uint8_t *report,
+                                          uint32_t len);                    /* minor 10 */
+
+lowlat_status lowlat_host_set_video_config(lowlat_host *hl, const lowlat_host_video_config *cfg);
+lowlat_status lowlat_host_get_video_config(lowlat_host *hl, lowlat_host_video_config *out);
+
+lowlat_status lowlat_host_set_audio_config(lowlat_host *hl, const lowlat_host_audio_config *cfg);
+lowlat_status lowlat_host_get_audio_config(lowlat_host *hl, lowlat_host_audio_config *out);
+
+/* Windows alone (minor 32) */
+lowlat_status lowlat_host_set_input_config(lowlat_host *hl, const lowlat_host_input_config *cfg);
+lowlat_status lowlat_host_get_input_config(lowlat_host *hl, lowlat_host_input_config *out);
+
+uint32_t      lowlat_host_get_guests(lowlat_host *hl, lowlat_guest *out, uint32_t *count);
+lowlat_status lowlat_host_kick_guest(lowlat_host *hl, uint32_t guest_id, int32_t reason);
+lowlat_status lowlat_host_set_permissions(lowlat_host *hl, uint32_t guest_id,
+                                          const lowlat_permissions *perms);
+
+lowlat_status lowlat_host_send_user_data(lowlat_host *hl, uint32_t guest_id, uint32_t id,
+                                         const void *data, uint32_t len);
+lowlat_status lowlat_host_send_roster(lowlat_host *hl, const void *data, uint32_t len,
+                                      uint32_t *reached);
+lowlat_status lowlat_host_get_metrics(lowlat_host *hl, uint32_t guest_id, lowlat_metrics *out);
+```
+
+**The roster is not a variant of an application message.** It travels on its own opcode, it is
+addressed to everybody rather than to a guest, and each peer finds *itself* in the list by
+number and takes that entry as what it is allowed to do. A peer has no way to ask for one, so a
+guest that is never sent one does not know what it is. Its body's shape belongs to the clients
+an application serves, exactly as a message's does.
+
+**A guest carries the attempt it was registered under**, which is the link between the seam's
+two halves: everything before a guest is seated is addressed by attempt and everything after by
+number, and without it an application holding one peer per attempt cannot tell which peer an
+event about guest three concerns.
+
+**Metrics live behind their own call rather than inside `lowlat_guest`, and that follows from
+rule 2.** A guest is delivered as an array element, an array element cannot usefully carry a
+`size` -- the caller walks it by stride -- so `lowlat_guest` is fixed for the major version.
+Metrics are the numbers most likely to grow, so they live where growing them is free.
+
+**Named channels, not an array of streams.** A number here would be a stream index, and this
+host produces one stream and switches which display feeds it, so there is nothing to index.
+What genuinely differs between these figures is the channel -- control, sound, video -- and
+each gets a `lowlat_channel_metrics` of its own: fragments sent, retransmissions by cause, the
+rate, what the payload cost to produce and what the peer says it costs to decode.
+
+**Shared figures appear once.** The smoothed round trip is the path's and there is one path
+under every channel, so it sits beside the channels rather than being repeated in each. So does
+the congestion count: video is the only channel a rate controller steers, and a count reported
+against sound or control would be a number with nothing behind it.
+
+**They report what this host can answer for, and one thing it cannot.** How many frames a peer
+has queued waiting to decode is the peer's to know and is not here. Decode time is the
+exception: a peer volunteers it, and this host stores what it was told rather than deriving
+anything, so the field is the peer's own figure and reads zero until one arrives. Everything
+else is what the congestion controller already reads -- outstanding fragments, how many are past
+due, the measured rate, encode time -- plus when each kind of input last arrived, which is the
+one question an application kicking idle guests can ask nobody else. **Zero means never, which
+is not zero milliseconds ago.**
+
+**Counters pin rather than wrap.** They are cumulative for the life of a guest and reported in
+thirty-two bits; a count that wrapped would read as a session that had just started, which is
+wrong by an unknowable amount where the ceiling is wrong by a knowable one.
+
+**There is no separate call to enable or disable a guest's input.** It was declared here and
+removed 2026-08-21 before anything was built against it: it is `lowlat_host_set_permissions`
+with every flag cleared, and two calls that write one field can disagree about what a guest is
+allowed to do. Permissions are the field; there is one way to set them.
+
+**`lowlat_host_poll_microphone` is a poll of its own, not an event.** A hundred packets a
+second sharing the event queue would evict the events it is there to deliver, so sound from a
+guest has its own queue and an application that wants both polls both. **It hands over samples
+rather than a codec**: sixteen-bit, mono, 48 kHz, whichever way the guest encoded them. The
+buffer must hold `LOWLAT_MICROPHONE_SAMPLES_MAX`, because a packet cannot be larger and there is
+therefore no partial delivery to call back for. `dropped` reports what a queue nobody drained
+had to discard -- oldest first, because late sound is worth less than the sound behind it -- and
+travels with the next delivery, which is the only place it can.
+
+**`lowlat_host_poll_pad_report` is the same shape for a pad's reports** (minor 10;
+[05 §7.2](05-host.md)), and exists for an application that owns the virtual device: with
+`pad_sink` set to the application, a DualShock 4's or a DualSense's reports come out here --
+the guest, the pad, the product, the kind, then the report in the pad's USB form -- feature
+reports ahead of the first input report, **and the pad's end after its last report**
+(`LOWLAT_PAD_REPORT_UNPLUG`, no report, on the guest's unplug and on its leaving), which is
+what the application destroys its device on; `lowlat_host_send_pad_report` carries back what
+that device was written -- *from W4.3's minor (decided 2026-10-26)* its output reports alone: a
+feature write is refused with `LOWLAT_ERR_INVALID_ARGUMENT`, as on the library's own devices it
+stays on the host ([05 §7.2](05-host.md)).
+Two hundred and fifty reports a second is the microphone's rate,
+so it is the microphone's queue: bounded, the oldest input report dropped and counted when
+the application falls behind, never a feature report or a pad's end. The wait is the same
+wake the microphone's is, so the cost over the library's own device is one cross-thread wake
+(measured, push to return, 13 us at the median and 26 us at the ninety-ninth percentile); an
+application that polls it with a zero timeout from a timed loop adds the loop's period,
+which is why the header says to park a thread on it.
+
+**It refuses rather than waits when the microphone is not accepted.**
+`LOWLAT_ERR_NOT_STARTED` comes back immediately: a host that is not taking microphones will
+never have one, and spending the caller's timeout to say so would read as sound that is merely
+late.
+
+**`lowlat_host_get_status` reports what is happening, not what was asked for**, which is why
+it carries the picture's size and the guest count and not the settings that produced them: the
+display decides its own size and the room decides its own occupancy. It answers on a handle that
+is not hosting too, with `running` clear -- an application asking what state something is in
+should not have to know the answer to ask.
+
+**The live codec, chroma and depth are there for the same reason**, and they are the half the
+settings genuinely cannot express: a seated guest may ask for a different codec or a different
+depth mid-session and the host rebuilds the encoder to match ([05 §6.1](05-host.md)), so what
+the configuration holds is what was asked for at the start and what this holds is what is
+coming out now. `codec` and `chroma` are enumerations, `ten_bit` is a flag -- **an enumeration
+where the axis can grow and a flag where it cannot**: a codec may gain another entry and chroma
+already has a third layout in wide use, while no encoder on this platform offers a depth above
+ten and one of them cannot express one. All three read none, none and clear
+(`LOWLAT_CODEC_NONE`, `LOWLAT_CHROMA_NONE`) on a handle that is not streaming, the same way the
+picture's size reads zero, because until then there is nothing truthful to report.
+
+**Sound is there for the same reason, and it is the half the settings cannot express.**
+`audio_active` is whether a device is being read right now, which is clear in an empty room
+however sound is configured, and clear when the device could not be opened or has gone away --
+the case an application could otherwise not learn at all, because the settings go on saying
+enabled. `audio_device` is what the capture landed on: an empty `device` in the configuration
+asks for the default output's monitor and the sound server may move a stream while it runs, so
+this is the only place the request and the answer can be compared. **The configuration keeps the
+request** rather than being rewritten to the resolved name, so an application that reads the
+settings, changes one field and writes them back does not pin a host that was following the
+default.
+
+**`lowlat_host_stop` takes no reason, and that is a gap rather than a design.**
+Stopping ends every guest loop and joins every thread, and the far side learns from its own
+liveness deadline rather than from a message -- so a peer pays the wait instead of being told.
+Telling it means sending the disconnect status the protocol already carries
+([01 §11.2](01-protocol.md)) on the way down, which the seam has no path for yet. A reason
+parameter appends when it does.
+
+**`lowlat_host_kick_guest`'s reason is not a `lowlat_status`.** It is what the peer is told on
+the way out, which belongs to the protocol's own numbering rather than to this API's
+([01 §11.2](01-protocol.md)); the two spaces share a width and nothing else. Zero is not a
+value to pass: a peer carries on through it.
+
+### The two halves of a configuration
+
+**A setting is either settled when hosting starts or changeable while it runs, and which one it
+is follows from what changing it costs.** They are separate structures rather than one struct
+with a comment, so an application cannot ask for something the answer to which is "not while
+this is running".
+
+`lowlat_host_video_config` is the live half, and `lowlat_host_start` takes it nested inside the
+whole:
+
+| Field | Live | Why |
+|---|---|---|
+| `fps` | yes | A **ceiling** over the display's own rate, not a target, and **clamped to it**: a rate above what the display presents is one the loop will not reach while still being the number the encoder's per-frame budget is divided by. Zero asks for the display's own rate. Changes the pacing from the next frame. (*Amended 2026-10-16*: on Windows the display's own rate is the rate its desktop is composed at, which a mode can overstate, [05 §2](05-host.md).) |
+| `bitrate_mbps` | yes | Re-bases the rate budget and reaches the encoder through the reconfigure the rate loop already performs every pass. No keyframe, no interruption ([00 §D8](00-overview.md)). (*Corrected 2026-11-01*: a stream rebuilt for another reason -- another output, a guest's codec, a display's mode -- was made at the rate and the floor the host started with and ran at them until the next change, while this read back the ones asked for. A rebuild is made at these, as at the quality.) |
+| `min_bitrate_mbps` | yes | The floor congestion control may not descend below, and it **moves down with the ceiling**: a ceiling lowered under a floor that stayed leaves every controller pinned at a rate the operator just asked not to exceed. |
+| `full_fps` | yes | Emit at `fps` even when the picture has not changed. **Clearing it is a permission, not an instruction** -- there is no damage signal here, so nothing yet skips a repeated picture, and continuing to send costs bitrate rather than being wrong. |
+| `output` | yes | The exception in cost rather than in kind: a picture from another output cannot be absorbed into a stream built for one, so it rebuilds around the new source for **one coded refresh** and every guest keeps its seat and its channel. `virtual` is the host's own display, plugged when it is asked for and kept for the host's life (Windows alone; refused elsewhere, at the call). (*Corrected 2026-10-25, at W2.8's gate*: an output asked for while the stream is being rebuilt for another reason -- a joining guest's codec, say -- is the next one built. It was left unread until something else rebuilt, and the stream stayed on the output it had been asked to leave.) |
+| `virtual_width`, `virtual_height` | yes | The host's own display's size, both or neither (minor 27). **Zero lets the host decide**: the size an owner states as it joins an empty room, else the size the display has, 1920x1080 when first plugged, either within the largest picture that guest accepts. A size is put through the system's display configuration where the monitor lists it and by plugging the monitor again with it added where it does not; the stream follows as it follows any resize. Refused outside 640x480 to 7680x4320 rather than clamped. Read back as asked, which the display's own size is not: that is the picture's, on the status. (*Amended 2026-10-21, at W3.11*: put as it is asked, and after that only over the mode the system's store holds for the display, which another monitor's arrival and a program leaving exclusive fullscreen put back; any other mode stands -- a program's own in exclusive fullscreen -- the stream following it.) |
+| `quality` | yes (minor 37) | One of [`lowlat_quality`](#quality). **Moves the running encoder**, asked of it only when it differs from what the stream runs at, so a configuration sent again as it stands moves nothing. One encode serves every seat, so a move changes what every guest is watching at once, and it is the application's to make. What it costs is the encoder's, below: most moves none, one keyframe where an encoder takes a change of effort only with a new sequence, and a rebuild, as an output change costs, where an encoder cannot move at all. (*Moved here 2026-11-01*: it was settled at start, on the configuration, whose field it was is `reserved2`.) |
+| `cg_level` | yes (minor 37) | One of `lowlat_cg_level`. **Moves every guest from the next pass**: each guest's session counts its stale fragments at it and each guest's controller judges that count by its ratio, one setting moving both halves, with nothing rebuilt and no keyframe; a guest seated after a move counts at it from its first pass. **Zero is the most aggressive, not "off"**: its thresholds are all zero, so every outstanding fragment classifies stale and congestion is declared on every pass once the send window passes its floor. The default is *sensitive*, and *adaptive* runs the same tuning while reserving a place for host-local signals (§10). (*Moved here 2026-11-01*: it was settled at start, on the configuration, whose field it was is `reserved3`. *Corrected 2026-11-01*: until then the sessions counted at the default whatever was set, so a level moved the ratio alone: *relaxed* ran the default's thresholds under its own ratio, and zero was not stale by construction.) |
+| `virtual_hz` | yes | The host's own display's refresh (minor 27). **Zero is the frame rate's ceiling**, `fps`, and 60 where that is zero too: a display composing faster than the stream takes pictures composes pictures nobody is sent. 24 to 480. (*Amended 2026-10-20, at W3.8*: where `fps` is zero too, **the display's own refresh**, which nothing puts back: the one the system restores for it as it is plugged -- the last its display settings saved -- 60 where it restores none, and whatever those settings set after, the stream pacing from it as from any display. Before, 60 was put back over a refresh a person set.) |
+
+**The fields only Windows acts on are declared on Windows alone** (*planned 2026-10-22*, W4;
+*built at minor 32*): `virtual_width`, `virtual_height` and `virtual_hz` here, `virtual_fallback`,
+`wake_display` and `hold_memory_clock` in the settled half below, and the input configuration
+whole (below), exist where the header is compiled for Windows and nowhere else
+([§11](#11-versioning)), so the configuration is laid out per platform. A value whose meaning is
+Windows' alone, the output `virtual`, stays refused at the call elsewhere.
+
+**On Windows they need the host's drivers installed** (*added 2026-10-22*): the host's own
+display -- the output `virtual`, `virtual_fallback`, `virtual_width`, `virtual_height` and
+`virtual_hz` -- exists only where its display driver is installed, and the input configuration's
+devices (W4) only where its input driver is. Nothing of the library or `lowlatd`
+installs either: the machine's administrator runs each driver's script
+([07 §10](07-platforms.md)). Without the display driver the fields are accepted and nothing is
+plugged: a stream asked for `virtual` says why once and waits as for a display that is not
+scanning out, and the host takes the driver up at its next attempt once it is installed. Without
+the input driver, switching `virtual_input` or `virtual_pads` on is refused (*amended 2026-10-26*,
+at W4.3's review: `virtual_pads` gave the Xbox pad).
+
+**The library turns no display, its own included** (*2026-10-20*, W3.10): a turn is made where a
+person makes one, in the display's own settings, or by the application -- on Windows, where the
+host runs in the session, through the system's display configuration, as `lowlatd` puts an
+owner's. The stream follows a turn as it follows any display's, and a size asked of the host's own
+display is put keeping it. A call for it, added while this was being built, was withdrawn before
+it was published.
+
+**A configuration nobody filled in is not a zeroed one.** Every enumerated field here is
+validated rather than clamped, so a structure the caller zeroed asks for the first variant of
+each -- the most aggressive congestion level among them -- and names no codec, which is
+refused; the boundary cannot tell a zero that was meant from one that was not.
+`lowlat_host_default_config` fills the caller's structure with what a host would choose for
+itself, the inner `size` fields included, and is the thing to start from and overwrite. The
+caller sets `size`, as for every other structure filled here, and one shorter than the
+configuration is refused rather than written past (*amended 2026-10-31*, minor 36: it was
+`lowlat_host_config_default`, which returned the structure by value, and a newer library wrote
+it whole into a return slot a caller built against an older header had sized; under its new
+name such a caller fails to load rather than calling it the old way). **A null configuration
+to `lowlat_host_start` means exactly those defaults**, which is the one reading of a null
+pointer there that cannot be a mistake.
+
+Everything in `lowlat_host_config` outside that structure is settled at `lowlat_host_start`:
+
+| Field | Why not live |
+|---|---|
+| `codec` | One encode serves every seat and a session has one video configuration ([00 §D11](00-overview.md)). |
+| `encoder` | A consequence of where the display is rather than a preference, and changing it rebuilds the pipeline. Absent means **follow the display**, which is the right default; choosing one is an override. (*Amended 2026-10-20, at W2.7*: on Windows the vendor encoder is **the encoder of the captured output's GPU** -- NVIDIA's on an NVIDIA GPU, AMD's on an AMD GPU -- so it follows the display there as well; an output another GPU renders is refused rather than copied across, and the open kind is refused, there being no open stack to build it on, [05 §4](05-host.md). *Amended 2026-10-25, at W2.8*: and Intel's on an Intel GPU whose driver carries Intel's current runtime; an Intel GPU only the older runtime reaches is refused, as a GPU with no encoder here is.) |
+| `base_port`, `servers` | Bound and consulted per attempt; moving them under running guests moves nothing that is already connected. |
+| `max_guests` | Advertised capacity, read when a guest asks for a seat. |
+| `exclusive_pointer`, `exclusive_hold_ms` | The pointer arbiter is built once with them. The hold is **clamped rather than refused**: it is a comfort setting, and the nearest usable value beats a host that will not start.
+| `virtual_fallback` | Whether the host plugs its own display when nothing is lit (minor 27), checked at its start and again while it runs, and keeps it for as long as it runs. Lit is an output on the desktop with a monitor behind it: the last monitor's cable pulled leaves its output on the desktop with none, and that is nothing lit. **Off by default**, since it changes the machine; `lowlatd` turns it on. Windows alone has the display, and from minor 32 the field exists there alone. |
+| `wake_display` | Whether a stream wakes the display it captures as it starts, with one pointer move of no distance (minor 28). A stream holds its display on, but a display that slept before anybody arrived stays asleep under that and gives no pictures until input wakes it. **Off by default**, in `lowlatd` too (`--wake-display` turns it on): a guest's first input wakes the display, and a connection lights nothing at the desk by itself. Windows alone acts on it, and from minor 32 it exists there alone. |
+| `hold_memory_clock` | Whether a stream on an NVIDIA GPU holds the GPU's memory clock at a floor for as long as it runs (minor 31): the lowest clock the GPU lists at or above half its top, the top its ceiling, the driver choosing between them. The driver's light-load memory states bound the encoder, 4 to 5 ms a picture at 1080p against 1 to 2 above them ([05 §4.2](05-host.md)). A hold outlives the process that took it, so a stream gives it back as it ends, and a host with this set gives back every NVIDIA GPU's as it starts. **Off by default**, since it changes the machine and needs the administrator; `lowlatd` turns it on. A host that cannot hold says why as each stream starts and streams on. Windows alone acts on it, and from minor 32 it exists there alone. |
+
+<a name="quality"></a>
+**`lowlat_quality` names where a host sits between delay and picture**, and it is the only
+encoder tuning this boundary exposes:
+
+| Value | Quantiser floor | Search effort |
+|---|---|---|
+| `LOWLAT_QUALITY_LOWEST_LATENCY` = 0 | 5 | the least a device offers |
+| `LOWLAT_QUALITY_BALANCED` = 1 | none | the least a device offers |
+| `LOWLAT_QUALITY_HIGHEST` = 2 | none | the most, and a second pass where the encoder has one |
+
+(*Corrected 2026-11-01*: the effort column had the two ends swapped. The first two settings ask
+for a device's fastest effort and the third for its most thorough, as the host has always done
+and as [05 §4.1](05-host.md) says.)
+
+**Zero is the low-latency end, and that is deliberate**: a zeroed structure has to mean the
+sensible default, and for a product whose first goal is delay the sensible default is the floor.
+
+**The floor reads backwards until you see why.** A lower floor lets the encoder spend more bits
+refining a picture; more bits is a larger frame, a larger frame is more packets, and more packets
+is longer on the wire and longer in every queue in between. Below about five those bits refine
+nothing the eye resolves, so they are spent purely on delay. Raising the floor above five trades
+visible sharpness for smaller frames; removing it does the reverse.
+
+**Search effort is not fidelity and the two are easy to confuse.** Effort says how far the
+encoder looks -- motion range, sub-pixel refinement, how many modes it tries -- not how coarsely
+it quantises. At a fixed rate more effort spends fewer bits on the same picture; it also takes
+longer, and on one device measured here the span between the extremes is 1.5 ms against 3.3 at
+1080p. That is why the highest setting carries a warning rather than being the default.
+
+**Moving it while a host runs costs what the encoder makes it cost** (*added 2026-11-01*, minor
+37). Between lowest latency and balanced only the floor moves, which every encoder here takes as
+it runs. In or out of the highest setting the effort moves too:
+
+| Encoder | In or out of highest |
+|---|---|
+| NVIDIA's | as it runs, both codecs |
+| AMD's | at one keyframe: its second pass is taken only at a re-initialisation |
+| Intel's | as it runs in H.264; at one keyframe in H.265, which takes a change of effort only with a new sequence |
+| VA-API and Vulkan Video (Linux) | by a rebuild, not yet shown to move as they run |
+
+A keyframe a move costs goes out with the next picture, whatever the desktop is doing, and is
+announced as any keyframe is; a rebuild is an output change's ([§3](#3-host)). An encoder that
+refuses a move is rebuilt at the setting asked for. **A move as it runs sends no parameter set
+again, so the sets have to stay as they were**: NVIDIA's encoder codes one reference at every
+setting so that its sequence and picture sets do not differ between them.
+
+**What a host reports back is what it asked for.** No interface here says whether a driver acted
+on a quantiser floor or an effort level, and the drivers differ: one encoder advertises thirty-two
+effort levels and its timings track none of them, another takes the floor on one codec and ignores
+it on the other, and a third has no second pass at all. So the three values are points on a trade
+honoured as far as each device allows, a host logs the request and the levers it derived once per
+stream, and an application that needs to know what a device really did has to measure coded bytes
+rather than ask.
+
+**Sound has no settled half at all**, so `lowlat_host_audio_config` is both what a host starts
+with and what `lowlat_host_set_audio_config` takes:
+
+| Field | Why it can change | |
+|---|---|---|
+| `enabled` | Switching it off gives the sound device back and restores the speakers, exactly as the last guest leaving does. Switching it on takes the device again -- **including on a host that started with it off**, which is what makes this field live rather than a settled one wearing a setter. |
+| `bitrate_kbps` | Read on the frame that uses it, so a change costs no rebuild and no discontinuity a listener would hear. **A rate of zero or one past the ceiling is refused** rather than clamped in silence, because the codec would clamp its own and the application would be told yes and given something else. |
+| `allow_uncompressed` | **A permission, not a request, and off by default.** A guest asks for the uncompressed form in its own initialization; this is whether a host will serve it. It costs an order of magnitude more of the uplink than the compressed form, and that comes out of what is left for the picture ([05 §9](05-host.md)). A guest denied it is sent the compressed form, priced as the compressed form, and told it is the compressed form. |
+| `accept_microphone` | Whether a guest's microphone is taken, **off by default**. It is two things at once and they cannot be separated: this host decodes what arrives, and it tells the peer whether it will -- **a peer with a microphone sends it until it is told no**, so this host says no while this is clear rather than being sent what it does not read (*corrected 2026-10-12*: this said a peer sends nothing until it is told). It costs a packet every ten milliseconds on the channel that carries control messages ([05 §9.6](05-host.md)), which is why it is a decision rather than something switched on by polling for it. Live, like the rest: switching it off tells every connected peer to stop. |
+| `mute_local` | Silences the speakers at the desk while a guest is connected, off by default. On a device that applies its own mute the tap is ahead of it, so a guest still hears everything. **On a device whose mute the sound server applies, nothing is silenced and the log says why** -- the mix the mute reaches is the one being captured, so obeying would silence every guest ([05 §9.4](05-host.md)); the setting is still accepted, because the device can change under a running host. **It restores rather than unmutes**: a device somebody had already muted stays muted, and one they unmuted mid-session is not muted again. |
+| `device` | Empty means the default output's monitor, **followed as the default changes**. A named one is checked against the enumeration at the call and refused with `LOWLAT_ERR_INVALID_ARGUMENT` if it is not there, because a name that does not resolve is substituted by the sound server rather than refused -- and the loop that opens it runs long after the call returned, so the call is the only place that can say no. Refused changes nothing: the host keeps the device it has. **The start does not check**, because a host whose sound server is not up yet must still be able to stream pictures. |
+
+**The sound device is held only while somebody is listening.** It is opened when the first guest
+arrives and given back when the last leaves, so a host that is advertised but empty holds no
+capture and no speakers.
+
+**Input has a live half of its own, on Windows alone** (*planned 2026-10-22*, W4; *minor 32*):
+`lowlat_host_input_config`, nested in `lowlat_host_config` as `input` and set and read back
+through its own pair of calls, as sound's is. Every field is live, and the structure, its member
+and its calls are declared where the header is compiled for Windows and nowhere else. It is not
+the video configuration's: the input devices are not the stream's, and a switch of them should
+neither carry nor re-send the stream's fields.
+
+| Field | Why it can change |
+|---|---|
+| `virtual_input` | Whether a guest's keyboard and mouse go through HID devices of the host's own input driver rather than the batch input call ([05 §7](05-host.md), [11 §2](11-drivers.md)). **Off by default**, zero included. Switching it on with no driver installed refuses the call and changes nothing; a driver lost while it is on gives the guests the batch input call again. The devices exist only while it is on, made for each seated guest on its next pass, and a switch either way first releases everything held on the old path. (*Built 2026-10-26, minor 32, the keyboard; the mouse the same day, W4.2*. A driver that cannot be used is refused with a status of its own, `LOWLAT_ERR_INPUT_DRIVER_ABSENT`, `_VERSION`, `_DENIED` or `_IO` ([§7](#7-status-codes)): an application can tell a driver to install from a process the driver does not admit, which is any but the system account and an administrator elevated. **A start asking for it is not refused for it**, as sound's is not for its server: the host says why once, keeps the batch input call, and reads back off; `lowlatd` asks for it with `--virtual-input`. A guest's keys wait the few milliseconds until the system takes its keyboard, and go through the batch input call where it never does; its pointer waits for its mouse the same way. **A position on any display but the primary goes through the batch input call even so**, the mouse's positions spanning the primary alone; its buttons, wheels and motion stay on the mouse.) |
+| `virtual_pads` | Whether a DualShock 4 or a DualSense a guest sends as its reports is presented as that product on the host's input driver ([05 §7.2](05-host.md)). **Off by default**: off, the pad is played as the Xbox pad from its whole states, since a HID pad never reaches a game that reads only the Xbox pad's interface. **A change applies to the pads plugged after it**: a pad keeps the family its first message fixed. The pad sink set to the application takes the reports whatever this says. On Linux a pad sent as its reports is always presented as its product ([00 §D12](00-overview.md)). (*Planned for W4.3's minor*, in one of the reserved bytes. *Amended 2026-10-26, at W4.3's review*: switching it on where the input driver is not installed, or does not admit the process, is refused with the input driver's statuses and changes nothing, as `virtual_input` is; a start asking for it is not refused for it, says why once and reads back off; `lowlatd` asks for it with `--virtual-pads`. A pad whose device never comes, or goes, plays on as the Xbox pad from its own reports. A library of an earlier minor ignores the byte and reads it back zero, so an application reads the minor first. *Built 2026-10-26, minor 33.*) |
+
+Starting a host that is already running is refused rather than quietly reconfiguring, because a
+second configuration that looks accepted and is not is a host running settings nobody can see.
+
+**What is being captured is read back, never remembered.** `lowlat_host_get_video_config`
+reports the output the loop is actually on, which a guest may have switched and a display may
+have moved by itself; an application that kept its own copy would mark the wrong screen.
+
+## §3b Client
+
+**Planned 2026-09-15, built from 2026-09-17 by [impl-plan-client.md](impl-plan-client.md).**
+Everything below is in the header (minor 4 the session, minor 5 the pictures, minor 6 the
+input, minor 7 the sound, minor 8 the preferences and the handle, minor 9 the cursor and the
+metrics, minor 10 the pad reports, minor 14 the relay, minor 15 the picture's range, minor 16
+its arrival time, minor 17 the range asked for, minor 18 the client's deliberate panic, minor
+19 the handle on Windows and the kind switched live, minor 22 the port and its mapping, minor
+23 the translation in front of it, minor 24 the application's own message, minor 25 the
+microphone); the header is the truth.
+
+```c
+lowlat_status lowlat_client_create(const lowlat_client_create_info *info, lowlat_client **out);
+void          lowlat_client_destroy(lowlat_client *cl);
+
+lowlat_status lowlat_client_new_attempt(lowlat_client *cl, const lowlat_client_config *cfg,
+                                        const char *attempt_id, uint32_t transport,
+                                        lowlat_credentials *ours);
+void          lowlat_client_add_candidate(lowlat_client *cl, const char *attempt_id,
+                                          const lowlat_candidate *cand);
+lowlat_status lowlat_client_begin_p2p(lowlat_client *cl, const char *attempt_id,
+                                      const lowlat_credentials *theirs);
+void          lowlat_client_end_connection(lowlat_client *cl);
+
+lowlat_status lowlat_client_send_user_data(lowlat_client *cl, uint32_t id,
+                                           const void *data, uint32_t len);
+lowlat_status lowlat_client_get_status(lowlat_client *cl, lowlat_client_status *out);
+lowlat_status lowlat_client_poll_events(lowlat_client *cl, uint32_t timeout_ms,
+                                        lowlat_event *out, void *body, uint32_t *body_len);
+
+lowlat_status lowlat_client_acquire_frame(lowlat_client *cl, uint8_t stream, uint32_t timeout_ms,
+                                          lowlat_frame *out);
+lowlat_status lowlat_client_release_frame(lowlat_client *cl, const lowlat_frame *frame,
+                                          const lowlat_fence *done);
+
+lowlat_status lowlat_client_set_viewport(lowlat_client *cl, int32_t x, int32_t y,
+                                         int32_t w, int32_t h);
+lowlat_status lowlat_client_send_key(lowlat_client *cl, uint32_t code, uint32_t mods,
+                                     bool pressed);
+lowlat_status lowlat_client_send_mouse_button(lowlat_client *cl, uint32_t button,
+                                              bool pressed, int32_t x, int32_t y);
+lowlat_status lowlat_client_send_mouse_wheel(lowlat_client *cl, int32_t x, int32_t y);
+lowlat_status lowlat_client_send_mouse_motion(lowlat_client *cl, int32_t x, int32_t y,
+                                              bool relative);
+lowlat_status lowlat_client_send_pad_button(lowlat_client *cl, uint32_t pad, uint32_t button,
+                                            bool pressed);
+lowlat_status lowlat_client_send_pad_axis(lowlat_client *cl, uint32_t pad, uint32_t axis,
+                                          int16_t value);
+lowlat_status lowlat_client_send_pad_state(lowlat_client *cl, uint32_t pad,
+                                           const lowlat_pad_state *state);
+lowlat_status lowlat_client_send_pad_unplug(lowlat_client *cl, uint32_t pad);
+lowlat_status lowlat_client_send_pad_report(lowlat_client *cl, uint32_t pad, uint32_t type,
+                                            uint32_t kind, const uint8_t *report,
+                                            uint32_t len);                  /* minor 10 */
+lowlat_status lowlat_client_send_release_all(lowlat_client *cl);
+lowlat_status lowlat_client_send_control(lowlat_client *cl, uint8_t opcode, uint32_t a0,
+                                         uint32_t a1, uint32_t a2);         /* minor 24 */
+lowlat_status lowlat_client_send_microphone(lowlat_client *cl, const int16_t *samples,
+                                            uint32_t count);                /* minor 25 */
+
+lowlat_status lowlat_client_acquire_audio(lowlat_client *cl, uint32_t timeout_ms,
+                                          int16_t *samples, uint32_t *count);
+
+lowlat_status lowlat_client_set_video_config(lowlat_client *cl, const lowlat_client_video_config *cfg);
+lowlat_status lowlat_client_set_decoder(lowlat_client *cl, uint32_t decoder,
+                                        const char *device);                /* minor 11 */
+lowlat_status lowlat_client_get_metrics(lowlat_client *cl, lowlat_client_metrics *out);
+lowlat_status lowlat_client_probe_nat(lowlat_client *cl, const lowlat_nat_probe *cfg);
+lowlat_status lowlat_client_get_nat(lowlat_client *cl, lowlat_nat_info *out);  /* minor 23 */
+```
+
+**A pad's sticks are given one way round, whichever call carries them** (*2026-10-15*):
+pushed right or away from the player is positive, in `lowlat_pad_state` and in
+`lowlat_client_send_pad_axis` alike. The per-axis message carries its vertical axes pointing
+down ([01 §11.1](01-protocol.md)), so the call turns them over at the wire, the far end of the
+range kept inside it.
+
+**Minor 11 (2026-09-21): the software decoder, and a decoder chosen mid-session.**
+`lowlat_client_set_decoder(cl, decoder, device)` takes the kind and render node of creation
+and of the listing's rows (`LOWLAT_DECODER_AUTO` walks the automatic order again). The
+decoder is probed there and then, on the caller's thread, exactly as creation probes; a
+kind that does not open answers with its stage and **nothing changes** -- the running
+decoder keeps decoding. Before an attempt the choice is replaced and that is all. During a
+session it is one act: the declaration re-masked by the new decoder's capability and
+restated to the host where it changed, the running decoder torn down, the new one opened,
+and one keyframe request with the reinitialisation argument once the new decoder exists --
+so a keyframe never arrives for a decoder that is still opening, and a runtime that fails to
+open costs the host nothing; the picture resumes at the next keyframe, a picture the
+application holds stays valid, the queue never closes. Costs the host one keyframe and an
+established host an encoder rebuild, so it is for a person changing a setting. **The frame
+kind stayed the creation's** in this minor: a session of `LOWLAT_FRAME_HANDLE` refused the
+call with `LOWLAT_ERR_DECODER_UNSUPPORTED`, its device slots bound to the device; since minor
+19 each slot carries its own backing and the call is accepted (below).
+`LOWLAT_DECODER_NONE` is refused with that status.
+Measured against this host at 2560x1440: the open stack to the vendor's, to software, and
+round again every hundred seconds, each answered by exactly one keyframe and the picture
+back within the second.
+
+`LOWLAT_DECODER_SOFTWARE` names the
+machine's own codec library -- loaded at runtime, never linked, and **only when the library
+answers that it is an LGPL build**: before any other entry point is called it is asked its
+licence, and a build that answers otherwise is closed unused and refused with
+`LOWLAT_ERR_NO_DECODER_LICENCE`, a status of its own, so the person who has a codec library
+installed and is refused is told why rather than told to install one. **A library built with
+the `gpl-libavcodec` feature loads a GPL build as well** (*added 2026-09-21*, minor 12): the
+default build never does, and a build that opts in is its maker's combination, to which the
+GPL's terms apply; it says so through `lowlat_features` (`LOWLAT_FEATURE_GPL_LIBAVCODEC`),
+and the listing names whatever was loaded with its licence. A build answering `nonfree` is
+refused by every build. The pair is looked for
+in the environment (`LOWLAT_FFMPEG_DIR` a directory, `LOWLAT_FFMPEG_VERSION` a major of 4
+through 9; a pair named there that fails is the answer, never a walk), in the directory
+`lowlat_client_create_info.device` names when it names one, beside the running executable,
+then the linker's own way; the highest major that opens wins. It hands out the same four
+formats the hardware decoders do, planes only, so an application that draws NV12 and P010
+draws this decoder's pictures unchanged; `LOWLAT_FRAME_HANDLE` on it is refused at creation.
+`LOWLAT_DECODER_AUTO` reaches it last, after the open stack's nodes and the vendor's devices,
+so a machine with any hardware decoder never does; status `backend` says which was chosen.
+`lowlat_enum_decoders` lists it last, `name` carrying the library's version and its licence
+and `device` the directory it came from (empty for the linker's own search), every
+capability true where the library opens the second codec; a row's `decoder` and `device` open
+exactly that pair. Two corrections to the automatic order under the same minor: with a
+render node named it now tries the vendor's interface on the card behind that node after the
+open stack refuses (it stopped at the open stack), and the handle kind with a node named
+resolves the vendor's device from that node rather than taking any. Nothing moves.
+
+**Minor 9 (2026-09-19, evening): the cursor, rumble, the guest list, the client's
+metrics.** Three events join §5's set. `LOWLAT_EVENT_CURSOR` carries the pointer as the
+host described it -- hidden, relative, suppressed, the position it reappears at in window
+units, the hotspot in the picture's own pixels, the picture's size and its checksum -- and,
+when a picture came or was named from the cache, **a pointer to the decoded RGBA in a buffer
+the handle owns, valid until the next `poll_events` on that handle**: the one event that
+carries a pointer, because a pointer picture at its ceiling is a megabyte and arrives a few
+times an hour, which is the wrong shape for a caller's scratch buffer and the `TOO_SMALL`
+retry ([§5](#5-events)); `image_update` says whether one is there. The picture is at its
+native size and the library scales nothing: the application resamples picture and hotspot
+by the ratio of its rectangle to the picture, as an established client does
+([10 §7](10-client.md)). A picture the reader cannot take (anything but 8-bit RGB or RGBA,
+non-interlaced, up to 512 square) is dropped and counted in status, the rest of the update
+delivered; **the picture already delivered, named or sent again, travels as its checksum
+alone**, so a host that repeats the name on every update does not have it decoded on every
+update -- the application keeps the picture it was given. `LOWLAT_EVENT_RUMBLE` names the
+pad the application reported and the two motors as eight-bit values. `LOWLAT_EVENT_GUEST_LIST` carries the recipient's own number and the
+list's body through the caller's buffer, exactly as user data does; the library reads
+nothing in it, and `lowlat_client_status.number` carries the same number for a late reader.
+`lowlat_client_get_metrics` fills `lowlat_client_metrics { size, connected_ms, rtt_ms,
+control, video, audio }`, each channel a `lowlat_client_channel_metrics { fragments, late,
+duplicates, out_of_window, nacks_sent, bytes, messages, loss_30s }` as [10 §9](10-client.md)
+defines them -- the receiver's own figures under the receiver's names; the host's figures for
+this guest reach the application through the guest list, on the host's `lowlat_metrics`,
+so a panel shows both ends of one path from the structure each end can fill. Status gains
+`number` and the pointer's three counts (pictures delivered, names not held, pictures
+refused).
+
+**Minor 10 (2026-09-20, C7 and Phase 14): the pad reports.** The client half is C7.1, the
+host half 14.2.
+`lowlat_client_send_pad_report(cl, pad, type, kind, report, len)` hands over a DualShock 4's
+or a DualSense's own report (`type` one of `lowlat_pad_type`: `LOWLAT_PAD_TYPE_DS4`,
+`LOWLAT_PAD_TYPE_DS5`; `kind` one of `lowlat_pad_report`: `LOWLAT_PAD_REPORT_INPUT` the input
+report as the device delivered it, USB or Bluetooth form, or `LOWLAT_PAD_REPORT_FEATURE` a
+feature report read from the pad -- calibration or firmware, identifier in byte 0, sent
+before the first input report; at most `LOWLAT_PAD_REPORT_MAX` bytes). The library derives
+and sends the standard state beside the report, so `send_pad_state` is never called for such
+a pad and is refused for its identifier until `send_pad_unplug`, as a report is refused for a
+pad already sent as states -- `LOWLAT_ERR_INVALID_ARGUMENT` either way, at the call
+([10 §8](10-client.md)). `LOWLAT_EVENT_PAD_REPORT` carries back what the host's device was
+written (`lowlat_pad_report_event { pad, kind, len, report }`, `kind`
+`LOWLAT_PAD_REPORT_OUTPUT` or `LOWLAT_PAD_REPORT_FEATURE`), an output report already in the
+pad's own framing and a feature write in the USB form, **a pointer valid until the next
+`poll_events`** as the cursor's picture is; the application writes it to the pad, in the order
+the events come. *Since M1.4 (2026-10-30), no change to the surface*: for a wireless DualSense
+the event also brings, once a connection, a report of the library's own resetting the pad's
+lights, which it takes no light write without, and behind it the host's light write from
+before, which the pad ignored ([10 §8](10-client.md)); `pad_reports_received` counts neither.
+`LOWLAT_EVENT_RUMBLE` is unchanged and still arrives for any pad a host rumbles that way.
+Status gains `pad_reports_sent`, `pad_reports_received` and `pad_reports_dropped` (received
+for a pad this client never sent as reports).
+
+On the host half ([§3](#3-host)): `lowlat_host_config.pad_sink` (`LOWLAT_PAD_SINK_DEVICE`,
+the default, or `LOWLAT_PAD_SINK_APP`), `lowlat_host_poll_pad_report(hl, timeout_ms, &guest,
+&pad, &type, &kind, report, &len, &dropped)` and `lowlat_host_send_pad_report(hl, guest, pad,
+kind, report, len)`, the pair an application uses when it owns the virtual device
+([05 §7.2](05-host.md)); a poll of its own, like the microphone's, parked on the same wake --
+call it from a thread that waits on it, not from a loop that polls it. `lowlat_pad_report`
+gains `LOWLAT_PAD_REPORT_UNPLUG`, the pad's end, which that poll delivers after the pad's
+last report; the pad enumerations are in the half both sides share. No status field for the
+report pads: the guest's own line names the message when it first arrives.
+
+**Minor 8 (2026-09-19): the preferences, the second backend, the handle, the decoders
+listed.** `lowlat_client_config` gains a `video` block, `lowlat_client_video_config {
+resolution_x, resolution_y, hevc, ten_bit, chroma_444 }` -- the size request moves into it
+from the top level, and the three booleans are preferences, "this if the host has it", masked
+by what the decoder opened at creation decodes before anything is declared
+([10 §7](10-client.md)); one block for the one stream. `lowlat_client_set_video_config` takes
+the same block mid-session: the new declaration goes out with a reinitialisation request and
+the decoder is torn down, so the next keyframe builds one for whatever the host now sends.
+Status gains what was asked, what was declared and what the stream is (`asked_flags`,
+`declared_flags`, `stream_format` beside the codec). Two planar formats join the two:
+`LOWLAT_FORMAT_YUV444` and `LOWLAT_FORMAT_YUV444_16`, three planes at full size, ten bits in
+the high bits of sixteen as `P010` holds them. `LOWLAT_DECODER_VENDOR` is accepted at
+creation.
+
+`lowlat_frame` gains its handle: `handle_kind` (`LOWLAT_HANDLE_OPAQUE_FD` now, a buffer
+descriptor with modifier reserved), `fd`, `handle_size`, `modifier`, an `allocation` number,
+and each `lowlat_plane` an `offset`; a frame of kind handle leaves the plane pointers null.
+The descriptor is the library's for the lease and is closed when the allocation behind it is
+freed, which happens after the last hold on it is released, so an application that keeps one
+past a release duplicates it -- and an import that takes ownership of what it is given (GL's
+does) is given a duplicate. **The application's import is keyed by `allocation`, not by the
+descriptor's number**: numbers are reused once closed, so the number alone cannot tell a new
+allocation from an old one; the ordinal can, and it also says which imports may be dropped.
+`frame_kind = LOWLAT_FRAME_HANDLE` is accepted for the vendor backend (and settles
+`LOWLAT_DECODER_AUTO` on it, since nothing else exports) and refused with
+`LOWLAT_ERR_DECODER_UNSUPPORTED` for the open stack in this minor.
+
+`lowlat_enum_decoders(index, out)` lists what this machine can open ([§6](#6-enumeration)):
+one `lowlat_decoder_info` per backend and device that decodes anything, carrying what
+creation takes to open exactly that one (`decoder`, `device`), what it decodes (the five
+capability rows), the size limits per codec, whether it hands out a handle, and the device's
+own name for a label.
+
+**Creation names the decoder** (minor 5). `lowlat_client_create_info` carries the backend by
+kind (`LOWLAT_DECODER_AUTO`, the open interface, the vendor's from minor 8, software from
+minor 11, or `LOWLAT_DECODER_NONE` for a client with nowhere to draw -- a test peer, a
+probe), the frame kind asked for, a ceiling on the picture the slots are sized for (4096
+square when zero), and a render node (the first that decodes when empty; for software, the
+directory of the library pair). The decoder is opened here, not at the attempt, so a machine
+without one is refused at creation with the stage named: `LOWLAT_ERR_NO_DECODER_RUNTIME`,
+`_DEVICE`, `_PROFILE` or `_LICENCE`.
+
+**Creation names the port, and can ask the gateway to keep it open** (minor 22,
+[03 §6](03-connectivity.md)). `lowlat_client_create_info.port` is the port every attempt binds
+first, stepping up past one that is taken -- fifty ports, then any the system picks. Zero picks
+the seed's own, 24000 plus a hash of `port_seed` modulo 2000, the seed the application's or,
+when empty, the machine's name: the same port at every attempt and every run, and two
+instances on one machine given two seeds hold two. `port_mapping` asks the gateway to keep the
+port open for the handle's life, by PCP, NAT-PMP or UPnP's gateway device, whichever answers
+first: asked at creation, so the mapping is usually in before the first answer, moved when an
+attempt's port does, and deleted at `lowlat_client_destroy` within a quarter of a second.
+**Nothing about it is ever an error, and no attempt waits for it.** **With `port_mapping` on
+the port is the handle's from creation** (*2026-10-06*): bound there, held between attempts and
+lent to each, so a second handle with the same seed walks past it before anything is mapped;
+and each attempt has the gateway looked at again as it begins. The gateway's external
+address and mapped port are offered to the host as a candidate once a reflexive server reports
+the same address, so that nothing translates beyond the gateway, and never otherwise; where
+the gateway keeps ports that candidate is the reflexive one, already offered. Status carries
+the mapping (`mapping`, one of `lowlat_mapping`; `mapped_address` and `mapped_port`) and the
+gateway's last refusal (`mapping_refusal`, in the numbering of the protocol
+`mapping_refused_by` names). The seed, with the machine's own identifier reduced by a keyed
+hash, names this client's entries in the gateway's table, so another machine's entry on the
+same port is left alone, whatever its name. **On Windows the stable port draws the system
+firewall's question** -- at creation with `port_mapping` on, at the first attempt without it:
+a port bound by number is what it asks about, where one the system picks was never asked
+(measured), and until the application is allowed, what reaches the port from a peer it never
+sent to -- the case the mapping exists for -- is dropped.
+
+**The translation in front of the port can be asked for** (minor 23, *2026-10-06*,
+[03 §6.1](03-connectivity.md)). `lowlat_client_probe_nat` asks up to four reflexive servers,
+named as the configuration names them and each at its name's first IPv4 address, where they
+see the port every attempt binds, on a thread of the library's own: each every half second
+until it answers or the timeout passes, three seconds when zero and thirty at most.
+`lowlat_client_get_nat` reads the result, polled. It carries the number game consoles give a
+translation -- `LOWLAT_NAT_TYPE_1` nothing translates, `_2` one public port for every
+destination or a confirmed mapping on the gateway, `_3` a port per destination or no answer,
+`LOWLAT_NAT_TYPE_UNKNOWN` while fewer than two server addresses have answered -- beside how
+the translation itself maps (`lowlat_nat_mapping`), where the first server saw the port and
+whether the port was kept, how many servers answered, and the gateway's view as it stands
+when read: what keeps the port mapped, and whether the gateway's own address is where the
+servers saw the port (`gateway_confirmed`), another address (`double_translation`), or in a
+carrier's shared range (`carrier_range`). An attempt's own reflexive answers fill the same
+result once two server addresses have answered (`source`). A probe is refused with
+`LOWLAT_ERR_ALREADY_STARTED` while an attempt holds the port or another probe runs;
+`lowlat_client_begin_p2p` during one stops it, and what was known before stands. A server
+whose name has no IPv4 address is refused.
+
+**The seam is the host's, mirrored.** A client makes the offer: `new_attempt` produces the
+credentials and certificate digest the application puts in it (its `port` is zero -- the
+socket does not exist until the answer), candidates come out as events for the application to
+relay, and `begin_p2p` takes what the answer carried. One attempt at a time. The
+configuration is the attempt's, given with it: the size asked of the host (zero for none,
+and it is a request to change the host's display, not a description of this one),
+uncompressed sound, reflexive servers, and `legacy_cipher`, which leaves the media key out of
+the offer so both ends key the older 128-bit cipher from the host's certificate digest; with
+it clear the session is keyed from the host's media key in the answer, and an answer without
+one takes the legacy path regardless. `ipv4_only` (minor 21, [03 §3](03-connectivity.md))
+confines the attempt to IPv4: no IPv6 candidate of the client's is raised, no IPv6 reflexive
+server is asked, the host's IPv6 candidates are declined with a log line, and a relay is taken
+only at an IPv4 address. It took the byte that was reserved, so a caller built against an
+earlier minor, which zeroed it, gets both families.
+Nothing in the library speaks to a signaling service
+(D3); the example client does, itself. `end_connection` says goodbye on the control channel
+and gives the message a moment to arrive; it raises no event, because the application caused
+it. **That moment holds nothing else up** (*2026-09-25*): the attempt is taken out first and
+the waiting is done outside the handle, so a call made on another thread meanwhile is
+answered at once, as for a handle with no attempt, and a new attempt is refused with
+`LOWLAT_ERR_ALREADY_STARTED` until the departure is over. **Attempts follow one another on one
+handle** (*2026-09-25*), and each starts from nothing the last session left: events the
+application had not taken are dropped rather than handed out under the new attempt's name,
+the status reads as connecting and every figure counts from zero, and no picture or access
+unit of the last session reaches the next.
+
+**A relay makes the attempt a relay attempt** (minor 14; [03 §7](03-connectivity.md),
+[10 §11](10-client.md)). `lowlat_client_config.relay` names it as `host:port`, resolved to its
+first IPv4 address, with `relay_username` and `relay_password` beside it; a relay without both,
+or whose name does not resolve, is refused as an invalid argument while the caller can still
+fix it. A relay attempt asks no reflexive server and raises no host candidate: its one
+candidate event is the relayed address, marked as a reflexive server's report, followed by the
+readiness event, and both come only once the relay has allocated and permitted its own
+machine. `lowlat_client_status` carries the relayed address and port once there is one, and
+`relayed`, whether the path goes through the relay. A relay that does not answer in time ends
+the attempt with `LOWLAT_OUTCOME_RELAY_UNREACHABLE`, one that refuses the credential or the
+allocation with `LOWLAT_OUTCOME_RELAY_REFUSED`, and one that lets the allocation go mid-session
+with `LOWLAT_OUTCOME_RELAY_LOST`; nothing is retried. The credential is never logged, the
+library clears every copy it takes, and a clean leave releases the allocation once the
+departure has gone through it.
+
+**The relay's carrier** (minor 29, 2026-10-17; [03 §7.4](03-connectivity.md)):
+`lowlat_client_config.relay_carrier`, one of `lowlat_relay_carrier` --
+`LOWLAT_RELAY_CARRIER_UDP` (0, the default, and what a caller whose size stops short of the field
+gets) or `LOWLAT_RELAY_CARRIER_TCP` (1) -- read only where the caller's size reaches it. Any other
+value, or TCP without a relay, is refused as an invalid argument. The allocation and the host's
+leg stay UDP either way, and nothing else changes for the application: the same candidate and
+readiness events, the same status and the same three outcomes -- a TCP connect that fails, or a
+stream that ends before the relay is ready, being the relay unreachable, and a stream that ends,
+resets or takes no write for five seconds after it the relay lost. A TCP attempt opens no datagram
+socket: the handle keeps its port, and the gateway's mapping is not asked for. Named a carrier
+because `lowlat_transport` is already the session's. The library never moves from one carrier to
+the other by itself; the last rung is the application's ([03 §8](03-connectivity.md)).
+
+**The seam's types are shared.** `lowlat_candidate`, `lowlat_credentials`,
+`lowlat_transport`, `lowlat_event` and its bodies are declared for either half, so an
+application built against a library carrying one half sees the same types as one built
+against the other. `lowlat_client_status` says where the session stands -- idle, connecting,
+established, over -- with the host's disconnect status, the round trip, how far behind the
+reader is and for how long, and what has been taken off each channel.
+
+**Pictures are acquired and released, never called back with.** `acquire_frame` is the poll:
+it waits up to its timeout for a picture newer than the last one lent, discards older ready
+ones, and lends the newest. It waits outside the handle's lock, as the event poll does, so
+status stays answerable meanwhile. At most two are held per stream -- the one being presented
+and the one just acquired, so a swap has no gap -- and a third acquire is refused with
+`LOWLAT_ERR_TOO_MANY_HELD` rather than silently dropping one. `release_frame` may carry a
+fence the application's device signals when it has finished reading, which is what lets a
+decoder write into shared memory without waiting on the application's CPU; a null fence
+means reusable now, and **it is the only fence**: a picture of the planes kind was copied --
+or on macOS lies in the hardware decoder's own buffer, which nothing writes while it is held -- and one
+of the handle kind was copied or finished on the device before the acquire returned
+(§4 of [10](10-client.md)), so `lowlat_fence` has one kind, none, and a fence of any other
+kind is refused. The rule 5 of §1 holds: no callback fires from inside the library.
+
+**`lowlat_frame` carries either planes or a handle**, and says which. Planes are pointers,
+pitches and a format (`LOWLAT_FORMAT_NV12`, `LOWLAT_FORMAT_P010`) into memory valid for the
+lease; a handle is a device-level reference -- a buffer descriptor and layout modifier, or a
+texture per plane (minor 19, below) -- the application imports into its own device. The
+application names the kind it wants in `lowlat_client_create_info` and is told the kind it
+got, frame by frame. Every picture also
+carries size, rotation, generation and a sequence number -- a gap between two consecutive
+presents is a skip -- and **`full_range`**, whether its samples span the whole of their depth
+rather than the video range, as the stream's own parameter set says (minor 15), so a
+renderer needs nothing from the stream itself. The samples are handed out as coded and never
+converted: the renderer's conversion takes the range, and one that assumes the video range
+draws a full-range picture darker, its blacks crushed and its contrast raised. **Which range
+arrives is asked for** (minor 17): `lowlat_client_video_config.full_range` says the
+application's renderer takes the full range, and the library declares it as asked, never
+masked by the decoder, which decodes either range alike; a host that acts on it codes the
+full range when every seat asked, and otherwise the video range. Zeroed, it asks for the
+video range, which a renderer that never reads `full_range` draws right (*corrected
+2026-09-24*: this said hosts send either unasked; the declaration had asked for the full
+range on every attempt). **`arrived_us`** (minor 16) is when the message
+the picture was decoded from was taken off the network, in microseconds of
+`CLOCK_MONOTONIC`, the clock an application reads by that name, or of
+`QueryPerformanceCounter` on Windows, or zero where it is not
+known: read against that clock at the acquire, it is the picture's time in the library, and
+after the present its time to the screen, which is what a latency figure needs and nothing in
+the stream can say.
+
+**Minor 19 (2026-09-28, W1.4): the handle on Windows, and the kind switched live**
+([10 §4.2](10-client.md)). `lowlat_handle_kind` gains `LOWLAT_HANDLE_D3D11_SHARED`: one texture
+per plane in the legacy shared form, which a device on the same GPU opens by its handle -- a
+luma and a two-channel chroma texture at half size for the two-plane layouts (`R8` and `R8G8`,
+or `R16` and `R16G16` with ten bits in the high bits), three single-channel ones at full
+chroma. `lowlat_frame` gains `textures`, the planes' handles, and `adapter`, the GPU they are
+on as its identity in one 64-bit value, low part first; a picture from another GPU than the
+last says the decoder has moved, and a renderer opens the textures on a device of that GPU. A
+lost device is found again by the library under the identity its GPU came back with, which the
+pictures after it name; a renderer's own device can be lost while the pictures' GPU stays as it
+was, so a renderer remakes its device by itself too, not only when `adapter` changes. Handles
+pay where the renderer is on the GPU that drives the display; a renderer moved to another GPU
+to open them pays for every frame's crossing to the display, and planes drawn on the display's
+GPU are then the faster kind (measured, [10 §4.2](10-client.md)). The open decoder on Windows
+hands them out on a system with a fence (Windows 10 1703 on); the listing's `handle` says so
+per GPU, asked of the device rather than of the system's version. Each picture is finished on
+the device before the acquire hands it out, so the release fence keeps its one kind: for a
+picture of textures, null says the application's device has finished reading it, as a renderer
+that waits on its swap chain's latency after each present has.
+`lowlat_client_set_frame_kind(cl, kind)` switches planes and handles at the next picture with
+no keyframe, before a session or during one, and is refused with
+`LOWLAT_ERR_DECODER_UNSUPPORTED` by a decoder that hands out no handle, nothing changing then.
+**The frame kind is a preference at `lowlat_client_set_decoder`**: in a session asking for
+handles a decoder that hands out none is taken all the same and its pictures come as planes,
+every frame saying its kind; the call is no longer refused for a handle session. Each slot
+carries its own backing, so a picture still held stays valid on the device it was made on.
+Linux's vendor decoder takes both calls the same way, between planes and its descriptor and
+between its devices.
+
+**On macOS since M1.2** (*2026-10-30*, minor 34; [10 §4.3, §5.3](10-client.md)): the library
+is `liblowlat.dylib`, whose install name is `@rpath/liblowlat.dylib`, so an application finds
+it through its own run path, and `liblowlat.a`, asked for by name as on Windows; each is built
+for one architecture, and the client's zip joins the static one's two (below). It carries the
+client half alone: no host is built
+there whatever the build asks for, `lowlat_features` reports none, and the header declares none
+where `__APPLE__` is defined, a `LOWLAT_HOST` the application defines declaring nothing more.
+`LOWLAT_DECODER_SYSTEM` is the system's decoder, VideoToolbox -- the hardware where the Mac has
+it and the system's software decoder where it does not -- for H.264 and HEVC, ten-bit and full
+chroma where it answers that it decodes them, planes only. `LOWLAT_DECODER_AUTO` settles on it,
+and on the codec library's pair after it; the open and vendor kinds, and the handle kind until
+M1.3, are refused with `LOWLAT_ERR_DECODER_UNSUPPORTED`. `lowlat_enum_decoders` has two slots
+there: 0 the system's decoder, labelled `VideoToolbox [Apple]`, its words what the hardware
+decodes and what only the software decoder does, and 1 the software pair, found as
+`libavcodec.N.dylib` through the variable, the application's directory, then the package
+managers' directories by full path. **Full chroma comes as two planes**, appended at this
+minor: `LOWLAT_FORMAT_NV24` (5), eight bits, a luma plane and a plane of both chroma components
+interleaved, each at the picture's size, and `LOWLAT_FORMAT_P410` (6), the same with ten bits in
+the high bits of sixteen; `planes[2]` is null for both. **A picture of the planes kind lies in
+the hardware decoder's own buffer**, each plane at its own pitch, which the decoder aligns per
+plane: the chroma's pitch is its plane's own, not derived from the luma's. **The system's
+software decoder's pictures are copied** into the library's own memory, as every other
+platform's software decoder's are: it writes into a buffer it has handed out, while it is held
+(*found 2026-10-30*, M1.3).
+
+**The handle on macOS since M1.3** (*2026-10-30*, minor 35; [10 §4.3](10-client.md)):
+`lowlat_handle_kind` gains `LOWLAT_HANDLE_IOSURFACE` (4), one IOSurface per picture, and
+`lowlat_frame` gains `surface`, the picture's `IOSurfaceRef`. The system's decoder hands both
+kinds out where the hardware decodes, the kind followed per picture with no keyframe, and a
+picture of its software decoder as planes, copied; `LOWLAT_DECODER_AUTO` with the handle kind
+settles on it, the codec library's pair refusing the kind, and its row in the table says
+`handle` where the hardware decodes anything. **A plane is imported by its index**, at the plane's own size and the layout's format --
+`R8` and `RG8`, or `R16` and `RG16` with ten bits in the high bits, the two-plane layouts above
+included -- so each plane's `pitch` is the surface's and its `offset` zero; `handle_size` is the
+surface's allocation and `adapter` zero, a surface opening on any device of the machine.
+**`allocation` is the surface's identifier** there rather than an ordinal: unique among the
+surfaces alive, and an import keeps its surface alive, so an identifier an application keys an
+import by names no other surface for as long as the import lasts. The decode is finished before
+the acquire hands a picture out, so the release fence keeps its one kind, and **the application
+releases a picture once its own device has finished reading it**: the surface goes back to the
+decoder at the release and is written by a later picture.
+
+**On Windows since W1.2** (*2026-09-27*): the library is `lowlat.dll` with its import library
+`lowlat.dll.lib`, the C runtime linked in statically, and it carries the client half alone --
+`lowlat_features` reports no host half there whatever the build asked for, and an application
+that defines `LOWLAT_NO_HOST` has a call into it fail to compile rather than to link.
+(*Amended 2026-10-14*, W2.0: it carries the halves the build asks for, as on Linux, and
+`lowlat_features` reports both by default. Until the host's own steps fill the host half
+([impl-plan-windows.md](impl-plan-windows.md) W2), `lowlat_can_host` answers
+`LOWLAT_ERR_NO_DISPLAY`, `lowlat_get_outputs` lists nothing, and hosting starts but a guest
+that joins is ended for want of an encoder, which the application sees as `fatal`. *Since
+W2.1* the encoder is there and the display is what is wanting, with the same outcome.) Its
+decoder is the software one, `LOWLAT_DECODER_AUTO`
+settling on it: the pair is found by the platform's names (`avutil-N.dll`,
+`avcodec-N.dll`) in the environment's directory, the one the application names, beside the
+application, then the system's own directory, never the current directory or the search path.
+The other kinds and the handle kind are refused with `LOWLAT_ERR_DECODER_UNSUPPORTED` until
+their steps, and `lowlat_enum_decoders` lists the software slot alone meanwhile.
+
+**The open kind on Windows since W1.3** (*2026-09-27*) is the system's video decoding
+interface, planes only: `LOWLAT_DECODER_AUTO` tries it first, on the GPU named or the first
+that decodes, then the software pair. The device string names a GPU by its identity for the
+boot, `luid:HIGH:LOW` in hex as the listing spells it; the identity changes when the GPU is
+reset or its driver replaced, so an application takes it from the listing and never keeps
+it. A name no GPU has -- a stale identity, a Linux render node -- is refused with
+`LOWLAT_ERR_NO_DECODER_DEVICE` and, from `lowlat_client_set_decoder`, the running choice is
+kept. `lowlat_enum_decoders` has nine slots there: 0 to 7 the open decoder on the GPUs the
+system lists, high-performance first, each labelled `D3D11 [NVIDIA]`, `D3D11 [AMD]` or
+`D3D11 [Intel]` with the GPU's name and driver version as its words, and 8 the software
+pair. A virtual display's adapter, which the system enumerates under its GPU's name, has no
+slot. No entry point or field is added, so the minor stays 18. The vendor kind and the
+handle kind are still refused (the handle kind until minor 19, above, and the vendor kind
+until W1.5, below).
+
+**The vendor kind on Windows since W1.5** (*2026-09-29*): `LOWLAT_DECODER_VENDOR` opens
+NVIDIA's decoder on an NVIDIA GPU, named by its identity as the open kind's is, or on the first
+of the vendor's GPUs offered, and hands out both kinds -- planes, and by handle the same shared
+textures as the open decoder, made on a device of the library's own on that GPU and signalled
+on its fence. A row says `handles` where the vendor's runtime wrote a texture of that GPU when
+the row was probed. `LOWLAT_DECODER_AUTO` tries the vendor's decoder first where the GPU named,
+or the first offered, is an NVIDIA one, having measured faster there, and the open decoder
+first elsewhere ([10 §5.2](10-client.md)). `lowlat_enum_decoders` has seventeen slots there
+now, the same count as on Linux: 0 to 7 the open decoder on the GPUs the system lists, 8 to
+15 the maker's own decoder on the same GPUs in the same order -- `NVDEC [NVIDIA]` on an NVIDIA
+GPU, and on another maker's unavailable as no such device until its step -- and 16 the
+software pair. A device lost under the vendor's decoder is not found again, since its runtime
+does not come back in the process that lost it: the session ends as
+`LOWLAT_OUTCOME_DECODER_FAILED`. No entry point or field is added, so the minor stays 19.
+
+**AMD's decoder on Windows since W1.6** (*2026-09-30*): `LOWLAT_DECODER_VENDOR` on an AMD GPU
+opens AMD's own decoder, in its low-latency mode, and hands out both kinds -- planes, and by
+handle the same shared textures as the open decoder, signalled on the library's fence.
+`LOWLAT_DECODER_AUTO` tries it first on an AMD GPU where its runtime has that mode, having
+measured faster there, and the open decoder first where it has not ([10 §5.2](10-client.md)).
+Its slot is the maker's own, 8 to 15, labelled `AMF [AMD]`, its words the GPU's name and the
+runtime's version; its size limits are the device's as the open decoder finds them. It decodes
+no full chroma, so the declaration is masked by that. Unlike NVIDIA's, a device lost under it
+is found again on the same GPU, under its new identity, and the runtime made again there; the
+session goes on. No entry point or field is added, so the minor stays 19.
+
+**Intel's decoder on Windows since W1.7** (*2026-09-30*): `LOWLAT_DECODER_VENDOR` on an Intel
+GPU opens Intel's own decoder through the runtime its display driver installs, found by the
+GPU itself. Its current runtime decodes on the library's own device and hands out both kinds --
+planes, and by handle the same shared textures as the open decoder, signalled on the library's
+fence -- full chroma at both depths where the GPU has it. A part the current runtime does not
+reach has the older one, which hands out planes alone, eight-bit and ten-bit 4:2:0. The slot is
+the maker's own, 8 to 15, labelled `VPL [Intel]` (`MFX [Intel]` for the older runtime), its
+words the GPU's name and the runtime's version; its size limits are the device's as the open
+decoder finds them. `LOWLAT_DECODER_AUTO` keeps the open decoder first on an Intel GPU and
+Intel's second, having measured it no faster there ([10 §5.2](10-client.md)). A device lost
+under it is found again on the same GPU and a session of the runtime made again there; the
+session goes on. No entry point or field is added, so the minor stays 19.
+
+**The system's decoder on Windows since W1.8** (*2026-10-01*, minor 20):
+`LOWLAT_DECODER_SYSTEM` names the platform's own decoder, in software -- H.264 on every
+edition that has the media framework, and HEVC at eight and ten bits where the system's HEVC
+extension is installed and licensed; 4:2:0 alone, planes alone, the handle kind refused at
+creation as for the codec library. Its slot is the table's last, 17 of 18, labelled `MF
+[Microsoft]`, its device empty and its words each decoder's module version or why it did not
+open; it reports no size limits. `LOWLAT_DECODER_AUTO` reaches it last, after the codec
+library, so a machine with any GPU decoder or a library pair never lands on it. On any other
+system the kind is refused with `LOWLAT_ERR_DECODER_UNSUPPORTED`, as not in the build
+([10 §5.2](10-client.md)).
+
+**A static library on Windows since W1.11** (*2026-10-09*): `cargo rustc -p lowlat-sdk
+--release --crate-type staticlib` builds `lowlat.lib` beside the shared library, the same
+entry points behind the same header, for an application that links the client into its own
+image rather than shipping the library beside it. It is asked for by name, so no other build
+spends its link on one. **It names the system libraries it calls into inside itself**, so an
+MSVC link takes `lowlat.lib` and nothing more. Its C runtime is the shared library's, the
+static release one: an application built with that links it as it is, and one built with the
+static debug runtime adds `/NODEFAULTLIB:libcmt.lib`, which sets the release runtime's name
+aside. Only the release build names its libraries: a debug build keeps every crate's objects
+apart, and the one carrying the names is never one the linker takes. The decoders' runtimes are
+found at run time exactly as before, the codec library's pair included.
+
+**The client's Windows zip** (*2026-10-27*, W1.10), from the build workflow and the script it
+runs (`scripts/package-client-windows.ps1`): `lib\lowlat.dll` with `lib\lowlat.dll.lib`, and
+`lib\lowlat.lib`, all three the client half alone; `include\lowlat.h` as committed;
+`bin\client.exe`, the demo, with the static library linked into it and nothing beside it to
+load; the licences of the project, the application toolkit and SDL; this document and
+[10](10-client.md); and `FEATURES`, the version and feature bits read from the zip's own DLL.
+The DLL's and the demo's symbols are a second zip of the same run. No codec library is in it:
+the software decoder takes an LGPL pair named by `LOWLAT_FFMPEG_DIR` or kept beside the
+application.
+
+**The client's macOS zip** (*2026-10-31*, M1.5), from the build workflow and the script it runs
+(`scripts/package-client-macos.sh`): `lib/liblowlat.a`, the client half as one static library
+holding arm64 and x86_64; `include/lowlat.h` as committed; the project's licence, this document
+and [10](10-client.md); and `FEATURES`, the version and feature bits each architecture's library
+reports. No shared library is in it and nothing is signed: an archive carries no signature, and
+the application that links it signs what it makes. **Every member is built for macOS 11 or
+earlier**, so an application linked for 11 is warned of none. **An application's link-time
+optimisation links it as it is**, on macOS as on Windows (MSVC's and clang-cl's alike): thin or
+full, from C or C++, the application's own code is optimised at its link and the library's is
+whole already; dead-stripping is what trims the library's share. Optimisation across the two
+languages is not offered, since the library's code would have to be bitcode, which Xcode's
+linker reads through an older LLVM than the compiler that wrote it. The runtime's own members
+carry bitcode of that kind beside their machine code, which `nm` stops on unless told
+`--no-llvm-bc`; a link reads the machine code. No codec library is in the zip: the software
+decoder takes the machine's own pair as [10 §5.3](10-client.md) describes.
+
+**Sound is decoded, not played** (minor 7). `acquire_audio` hands out one packet a call,
+signed sixteen-bit stereo at 48 kHz, in the order the host sent them, as many frames as the
+packet held -- 960 for a host at 20 ms, at most 8000; `count` is the room in frames going in
+and the frames written coming out, and a buffer too short is told the need with
+`LOWLAT_ERR_TOO_SMALL` and the packet kept for the next call. The decode runs on the caller's
+thread, inside the call, and the wait for a packet is outside the handle's lock, as the
+picture's is; two threads calling at once take turns. Nothing paces it: the device is the
+application's and its buffer is the playback window ([10 §6](10-client.md)). Packets the
+application has not taken wait in a pool of 32, past which the newest is dropped and counted
+in status, which is a caller that stopped calling. Status carries the packets decoded,
+dropped and refused, those waiting, the last packet's age between the wire and the call, and
+the codec the decoder was built for (`lowlat_audio_codec`, none before a build).
+
+**The microphone goes the other way** (minor 25, *2026-10-12*, [10 §6](10-client.md)):
+`lowlat_client_send_microphone(cl, samples, count)` takes sixteen-bit mono samples at 48 kHz,
+as many as the call has -- a device delivering another rate or layout is the application's to
+convert -- and the library cuts them into frames of ten milliseconds, carrying the remainder to
+the next call, because a host takes whole frames and drops the rest. Each frame goes to the
+host as its microphone: uncompressed when the attempt's `raw_audio` is set, compressed
+otherwise, as the stream's own declaration decides. The call never blocks; frames cross a fixed
+ring of two hundred milliseconds to the session thread, and a full one drops the newest and
+counts it. **The host decides whether it takes one**: every attempt starts with it taken, and a
+host that says it takes none raises `LOWLAT_EVENT_MICROPHONE` (`lowlat_microphone_event {
+enabled }`) and has the call refused with `LOWLAT_ERR_MICROPHONE_OFF` -- the partial frame
+forgotten, nothing sent -- until it says otherwise, which raises the event again; the event
+comes on a change only. The application opens its device on the one and closes it on the other.
+The host's answer arrives as an application message under a sub-identifier the protocol
+reserves, and the library reads it rather than handing it over. Status gains `microphone` (the
+answer), `microphone_sent` and `microphone_dropped`.
+
+**Input is one call per kind** (minor 6): key, mouse button, wheel, motion, pad button, pad
+axis, pad state, pad unplug and release-all, each with its arguments in the signature rather
+than in a tagged structure, so a call site is checked where it is written and a binding
+needs no union; the library transforms, guards and encodes ([10 §8](10-client.md)). **The application says where it drew
+the picture** with `set_viewport`, a rectangle in the same units as the positions it reports,
+and that is all the library knows about the window: no fit is computed, so stretching,
+shrinking, a percent scale and a rotated picture are the application's ways of producing one
+rectangle, and a display scale factor never enters; the picture's own size is the stream's.
+Keys are usage codes with the modifier mask in the wire's bits (`lowlat_keymod`), the lock
+bits included because a host keeps its own locks in step from them; mouse buttons
+(`lowlat_mouse_button`), pad buttons by index (`lowlat_pad_button`), pad axes
+(`lowlat_pad_axis`) and pad state bits (`lowlat_pad_state_button`) have their enumerations, and
+the two pad forms number the buttons differently on purpose, as the wire does. A press outside the
+rectangle is not sent and a release always is; a key of code zero is not sent; an unchanged
+pad state is not repeated. **A relative motion is sent as the device reported it**, not
+scaled by the size the picture is drawn at (*corrected 2026-09-24*: it was scaled, and a
+picture stretched to a larger window moved the host's pointer slower than the hand); motion
+an application makes up from a device that reports positions is its own to scale. **The
+call never blocks**: reports cross a fixed ring to the
+session thread, and a ring that fills -- a thread that is not running -- drops the newest and
+counts it in `lowlat_client_status.input_dropped`.
+
+**The application's own message** (minor 24, *2026-10-12*): `lowlat_client_send_control(cl,
+opcode, a0, a1, a2)` puts a header of the application's choosing on the control channel, for a
+host that understands more than the protocol does on an opcode the protocol already has. No
+body; the three arguments are written big endian as every header's are, so a host that reads
+them the other way round gets them swapped by the caller. It crosses the input's ring, keeping
+its place among the input around it, and never blocks. **The library reads none of it**: a
+message on an opcode the library also speaks changes nothing the library keeps, so one on the
+pad unplug's opcode forgets no pad -- and **a host that does not know the message reads the
+opcode's own meaning**, there an unplug of the pad the third argument names. Refused with
+`LOWLAT_ERR_INVALID_ARGUMENT`, session or not: the opcodes the library sends for the session
+itself (10, 11, 13, 21, 35), which sent behind its back leave the host and the library
+disagreeing about the session, and those whose message has a body (17, 23, 31, 32), which a
+header alone misframes ([10 §8](10-client.md)).
+
+**Status and metrics mirror the host's** (§3): the same named channels, seen from the
+receiving side, plus the decoder's state (none yet, built, failed), the backend in use, the
+codec the decoder was built for, the queue depth, the last picture's decode and read-back
+times (a picture handed out by handle, which the decode thread does not wait for, timed on its
+device from its take to its fence passing, one in eight; *2026-09-30*), the host's own encode
+time as it last reported it, the count decoded and the bytes
+taken off the video channel (a rate is a difference over time, the application's clock), so
+one panel serves both ends. A decoder that fails past recovery ends the session: the library
+leaves it itself, a departure the host reads as the client leaving, and then reports
+`LOWLAT_OUTCOME_DECODER_FAILED`, once (*made so 2026-09-29*, W1.5: until then the session
+stayed up and the host streamed on until the application disconnected).
+
+**Events** add to §5's set: cursor (the decoded picture from the handle's own buffer,
+hotspot, suppressed; minor 9), relative mode (`LOWLAT_EVENT_RELATIVE`, on the transition
+alone, with the position the pointer reappears at on the way out in the window's units, so
+the application confines and hides its pointer on entry and warps it once on exit), blocked
+and unblocked, rumble, the guest list, stream ended with a reason, host mode, and the host's
+answer on the microphone (minor 25).
+
+## §3c Virtual displays
+
+```c
+lowlat_status lowlat_vdd_open(lowlat_vdd **out);
+void          lowlat_vdd_close(lowlat_vdd *vdd);
+lowlat_status lowlat_vdd_plug(lowlat_vdd *vdd, const lowlat_vdd_plug_info *plug,
+                              lowlat_vdd_monitor *out);
+lowlat_status lowlat_vdd_unplug(lowlat_vdd *vdd, uint32_t slot);
+lowlat_status lowlat_vdd_set_mode(lowlat_vdd *vdd, uint32_t slot, uint32_t width,
+                                  uint32_t height, uint32_t refresh_hz,
+                                  lowlat_vdd_monitor *out);
+lowlat_status lowlat_vdd_list(lowlat_vdd *vdd, uint32_t *slots, uint32_t *count);
+lowlat_status lowlat_vdd_get_monitor(lowlat_vdd *vdd, uint32_t slot, lowlat_vdd_monitor *out);
+lowlat_status lowlat_vdd_get_settings(lowlat_vdd *vdd, lowlat_vdd_settings *out);
+lowlat_status lowlat_vdd_set_settings(lowlat_vdd *vdd, const lowlat_vdd_settings *settings);
+lowlat_status lowlat_vdd_debug_panic(lowlat_vdd *vdd);
+```
+
+**The third half, on Windows alone (minor 26): the monitors of the host's own display driver**
+([11](11-drivers.md) §1), for any application to plug its own. The driver must be installed,
+by its own script and never by the library ([07 §10](07-platforms.md));
+without it the open answers `LOWLAT_ERR_VDD_ABSENT`, and a driver of another version
+`LOWLAT_ERR_VDD_VERSION`, since the two ship together.
+
+**A library carrying this half alone** (*added 2026-10-17*) is the C interface for an
+application that wants virtual displays and nothing else: built with neither of the other
+halves -- `cargo build -p lowlat-sdk --release --no-default-features --features vdd` -- it holds
+the shared calls of [§2](#2-lifecycle) and these, about 330 KB against about 5 MB for the whole
+library, and `lowlat_features` answers `LOWLAT_FEATURE_VDD` alone. An application built against
+it defines `LOWLAT_NO_HOST` and `LOWLAT_NO_CLIENT` before including the header and links its
+import library. The ABI's gates build one and link a program against it the way an application
+does.
+
+- **A monitor is bound or kept** (`LOWLAT_VDD_BOUND`, `LOWLAT_VDD_KEPT`). A bound one is its
+  handle's: only that handle unplugs or re-modes it, and the handle's close -- or its process's
+  end, however it ends -- unplugs it. A kept one belongs to no handle, any handle may re-mode or
+  unplug it, and `restore` brings it back whenever the driver starts. **Nothing keeps a monitor
+  alive by traffic.**
+- **A monitor is a slot**, 0 to 15, whose identity the system remembers its place and mode by; a
+  plug may ask for one, or take the first free with `LOWLAT_VDD_SLOT_ANY`.
+- **A handle follows its driver** ([11](11-drivers.md) §1.8, *added 2026-10-16*): an open
+  handle would refuse the removal an update or a restart of the driver needs, so it is closed
+  when the driver is asked to be removed, and when a call finds the driver gone -- its process
+  ended. The monitors bound to it go with it, as they would with the driver, and every call on it
+  after answers `LOWLAT_ERR_VDD_ABSENT`; `lowlat_vdd_open` makes a new one once the driver is
+  back.
+- **These calls wait for the system**, the one exception to [§8](#8-threading-and-reentrancy):
+  a plug returns once the monitor is active at its mode, a mode once it is current, an unplug
+  once the monitor has gone -- within about three seconds, past which `LOWLAT_ERR_VDD_NOT_READY`
+  says the monitor is plugged and the system has not finished, and `lowlat_vdd_get_monitor` says
+  where it stands. Calls on one handle take turns. *Since minor 30* a plug or a mode answering
+  `LOWLAT_ERR_VDD_NOT_READY` fills `out` with the monitor as it stands, so a plug that asked for
+  no slot learns its slot; **a plug the system's display configuration refuses
+  (`LOWLAT_ERR_VDD_DISPLAY_CONFIG`) is unplugged again**, its return line with it; and an unplug
+  removes a kept monitor's return line before the monitor, so one the driver then fails to
+  unplug no longer comes back, where a removed one would have.
+- **A kept monitor's arrangement is saved in the system's own store**, as any monitor's is, so it
+  comes back after a reboot where it was -- unless only virtual displays would be active, a
+  display counting as virtual when its adapter is a virtual display's, whatever connection it
+  reports. A bound monitor's never is.
+- **A mode the monitor does not list is set by plugging it again** with the mode added first:
+  the same slot and identity, a blink rather than a new display.
+- **The list is of slots**, two-call as [§6](#6-enumeration)'s, and `lowlat_vdd_get_monitor`
+  fills one size-led `lowlat_vdd_monitor` at a time, so the record can grow.
+- **The settings every monitor shares** live in the driver's file: the GPU, by vendor and
+  device, zero for the system's high-performance one; the pointer drawn into the pictures or
+  reported beside them; up to sixteen custom modes; a dumped EDID. `lowlat_vdd_set_settings`
+  applies the GPU at once, the pointer at each monitor's next swapchain, and the modes and the
+  EDID to the monitors plugged after.
+- The statuses are `LOWLAT_ERR_VDD_*`, -600 to -612. **No pictures cross this half**
+  ([§13](#13-what-is-deliberately-absent)).
+
+## §4 Signaling seam
+
+The four calls from [04 §9](04-signaling.md). This is the entire contact surface between any
+signaling implementation and the SDK.
+
+```c
+lowlat_status lowlat_host_new_attempt(lowlat_host *hl, const lowlat_attempt_info *info);
+void          lowlat_host_add_candidate(lowlat_host *hl, const char *attempt_id,
+                                        const lowlat_candidate *cand);
+lowlat_status lowlat_host_begin_p2p(lowlat_host *hl, const char *attempt_id,
+                                    uint16_t port, lowlat_credentials *out);
+void          lowlat_host_end_connection(lowlat_host *hl, const char *attempt_id);
+```
+
+**Registering is not approving.** `lowlat_host_new_attempt` takes a seat's worth of
+bookkeeping and nothing else; no socket is opened and no thread is started until
+`lowlat_host_begin_p2p`. An application that decides to decline simply never calls that and
+says so over its own signaling.
+
+**Every refusal is its own status**, in the -100 band, because the correct response differs per
+outcome: a full host declines the offer, a race with teardown is retried or dropped, and a
+crypto failure is neither. `LOWLAT_ERR_AT_CAPACITY` in particular means **decline**, not stay
+quiet -- nothing in the protocol reports a host that never replied, so a peer given silence sits
+connecting until its own deadline expires.
+
+`lowlat_host_begin_p2p` writes host credentials into `out` for the application to send as its
+answer. It does not send anything, because the SDK has no transport.
+
+**The offer's media key selects the cipher, by presence alone.** An offer registered with an
+empty `aes256` comes from a peer generation that has no such field: the session keys from the
+answer's fingerprint under the legacy 128-bit mode, and `out->aes256` comes back empty -- the
+application relays no media key, because the peer has no field to read one from. An offer that
+carried one takes the 256-bit mode, keyed from the answer's media key as usual. The peer's own
+material is never the key either way; presence is the whole of what it says.
+
+**The port is an in and an out pair, and they are different questions.** `port` is where the
+bind *starts*; `out->port` is where it *landed*. The bind walks when a port is taken and takes
+any port once the walk is exhausted, so the two differ whenever the range is busy -- and
+advertising the one that was asked for produces a peer that answers checks and never
+establishes. Everything advertised is built from the address the socket reports, which is why
+landing somewhere unexpected costs a mapping rather than a session.
+
+**Zero asks for the configured base**, which is what an application with no port of its own to
+manage passes. An application that does have one has it for a reason -- a mapping it made on
+the gateway, a rule it opened on the firewall, a pool it allocates from -- and none of those
+survive the SDK choosing for it. `out->port` is also the only way to learn the number
+*synchronously*: candidates carry it too, in the addresses they name, but those arrive as
+events afterwards.
+
+**Credentials stay an output.** The application never supplies them: the key material is
+generated here, from the one audited source of entropy, and both directions of the session key
+from it. An application-supplied key would make an integrator's random number generator the
+session's.
+
+**Which pipe an attempt speaks is the offer's to say**, and the application copies it across in
+`lowlat_attempt_info.transport` as a `lowlat_transport` value -- `LOWLAT_TRANSPORT_BUD`, the
+native transport and the zero a cleared structure carries, or `LOWLAT_TRANSPORT_WEB`, a
+browser's data channel on the same socket ([01 §14](01-protocol.md)). On the browser pipe the
+application also copies the peer's certificate digest into `fingerprint`, with or without its
+hash name; registering without one is refused with `LOWLAT_ERR_FINGERPRINT`, because there
+would be nothing the handshake could be checked against. On the native pipe the field is not
+read. The credentials that come back differ in the same two places: a browser's answer carries
+this process's certificate digest with its hash name in `fingerprint` and an empty `aes256`,
+which is the truth about a pipe that keys itself.
+
+**Both fields were appended in minor 2 and are read only when `size` says they exist.** An
+application built against minor 1 sets the size that structure had and registers a native
+attempt with no digest, whatever lies past its allocation; the boundary reads the structure
+field by field and never through a reference to the whole of it. A `transport` value nothing
+defines is refused as an invalid argument rather than defaulted.
+
+`lowlat_host_add_candidate` and `lowlat_host_end_connection` accept unknown attempt
+identifiers silently. Those are races with teardown, not errors, and returning a status the
+caller would have to ignore is worse than returning nothing. A withdrawal that arrives before
+the offer it withdraws is **remembered**, so admitting that offer afterwards is refused with
+`LOWLAT_ERR_WITHDRAWN` rather than spending a socket and a thread on a guest already gone.
+
+**A candidate marked `sync` is a readiness marker rather than an address**, and whatever
+address rides along is ignored -- so it alone is accepted without one. A peer may withhold every
+real candidate until it has seen one.
+
+**A candidate carries the exchange's two markings, `lan` and `reflexive`, copied verbatim
+from the signaling** (2026-08-29). `reflexive` steers the path-opening probe: it goes only
+toward such a candidate, because that is the path that crosses translation. `lan` names an
+address that is directly routable -- a host address, or any IPv6 one -- and wins when both
+are set. Neither set is a real class of its own, a translated-path guess no server verified,
+so all-zero is safe and means exactly that. The outbound candidate event carries the same
+two flags, decided by the boundary -- IPv6 goes out marked `lan` whichever probe discovered
+it -- so an application relays both directions without interpreting either.
+
+**`lowlat_host_end_connection` takes no reason**, for the same reason `lowlat_host_stop` does
+not: ending stops the guest's loop, and the far side learns from its own liveness deadline
+rather than from a message. The disconnect status the protocol carries exists; nothing calls it
+on the way down yet.
+
+## §5 Events
+
+```c
+lowlat_status lowlat_host_poll_events(lowlat_host *hl, uint32_t timeout_ms, lowlat_event *out,
+                                      void *body, uint32_t *body_len);
+```
+
+Returns `LOWLAT_OK` with an event, or `LOWLAT_TIMEOUT` if none arrived. A `timeout_ms` of zero
+polls without blocking.
+
+**An event that carries a body is handed it through the caller's own buffer**, which is
+why the poll call takes one. `body_len` is the buffer's capacity going in and the bytes written
+coming out; `NULL` means the application does not want bodies, and one that arrives is dropped
+with the loss counted like any other. **The event itself never carries a pointer**, only the
+body's length, so the union stays blittable ([§12](#12-bindings)) -- with one exception on
+the client half, the cursor's decoded picture ([§3b](#3b-client), minor 9), which points
+into a buffer the handle owns and is valid until the next poll on that handle: a megabyte at
+its ceiling and rare, the wrong shape for a scratch buffer sized per poll.
+
+**A buffer too small does not lose the message.** The needed length is written to `body_len`,
+`LOWLAT_ERR_TOO_SMALL` is returned, and the event stays at the head of the queue for a second
+call with a larger buffer. That is what lets an application run a small scratch buffer instead
+of sizing it at the ceiling it will almost never reach, and it is the reason a poll is a peek
+that commits on delivery rather than an unconditional take.
+
+**No allocation crosses this boundary and there is no lookup key.** An application message is
+the only variable-length thing an application ever receives - frames, audio and cursor images
+are all excluded by [§13](#13-what-is-deliberately-absent) - so a side table of pending buffers
+would exist for one event type, and it would bring the two failure modes that come with it: a
+handle that is stale because the buffer was already taken, and a free performed by a runtime
+that did not allocate it.
+
+`lowlat_event` is a tagged union: a stable-numbered type followed by a union of plain
+sub-structs. Adding an event type is additive; an application that does not recognize a type
+ignores it, which is why the type field is first.
+
+| Event | Meaning |
+|---|---|
+| candidate | a local candidate to forward over signaling |
+| ready | tell the peer this host is ready to be checked, once |
+| established | a path was found and media is flowing |
+| ended | the attempt is over, with a typed outcome |
+| user data | an application message from a guest |
+| capture changed | a different output, or the same one at a different size |
+| input owner changed | the guest holding the pointer changed |
+| fatal | the host could not serve anyone and every guest was told |
+| blocked | the host blocked this client's input, or unblocked it (client) |
+| stream ended | the host ended one stream and not the session (client) |
+| host mode | the host said which mode it is in (client) |
+| relative | the host took the pointer or gave it back, with where it reappears (client) |
+| cursor | the host's pointer changed: its picture, hotspot or flags (client, minor 9) |
+| rumble | the host asked a pad to vibrate (client, minor 9) |
+| guest list | the room, as the host describes it, with this client's own number (client, minor 9) |
+| pad report | the host's virtual pad was written: an output report or a feature write, in the pad's own framing (client, minor 10) |
+
+**A guest's state changes are the four attempt events**, not one event with a
+state field: candidate and ready while it negotiates, established when a path is found, ended
+with a typed outcome. Splitting them is what lets an application respond to each without
+switching on a state inside a state. One outcome belongs to the browser pipe alone:
+`LOWLAT_OUTCOME_HANDSHAKE_FAILED`, a path that existed and a pipe on it that did not -- the
+security handshake never completed, the peer was not the one the offer named, or its
+association ended with an error. The native pipe has no such outcome, because its records
+either authenticate or they do not, and a peer that stops is `PEER_GONE`.
+
+**Each of the last three is raised where its change happens**, which is the only place that can
+tell a change from a repetition. The capture one comes from the loop that rebuilt, because
+nothing above it knows whether the output moved or the display resized. The input owner comes
+from inside the arbiter's own lock, because a guest thread can only report that the pointer is
+now its own -- which is also what it would report on every message while it merely keeps
+holding it.
+
+**A guest that is chronically behind is not yet an event.** The skip-and-resync cycle exists
+([05 §6](05-host.md)) and what is missing is the threshold that makes a cycle "chronic"; adding
+the event before deciding that would mean either firing on every skip or picking a number
+nothing measured.
+
+**Poll from one thread.** The queue is single-consumer. Every other call is safe from any
+thread.
+
+Events are dropped **oldest-droppable-first** if the application stops polling, and `fatal` is
+never dropped -- so a fatal event sitting at the front of a full queue is not the first thing
+thrown away, which is what a plain oldest-first rule would do to the one event whose loss no
+count can convey. Holding it does not make the queue unbounded: everything droppable still
+goes. A dropped-count field on the next delivered event makes the loss visible rather
+than silent.
+
+**The queue is bounded in bytes as well as in entries**, because one of the two is not a bound:
+a body may reach a megabyte, so a queue limited only by how many events it holds is limited to
+that many megabytes. Either ceiling evicts oldest-first and both count into the same field.
+
+## §6 Enumeration
+
+```c
+lowlat_status lowlat_get_outputs(lowlat_output *out, uint32_t *count);
+lowlat_status lowlat_can_host(void);
+```
+
+**`lowlat_can_host` exists because the two ways of failing look identical afterwards.** A host
+that cannot capture fails deep in the stream loop, where an application can tell "there is no
+display" from "this process may not read one" only by reading a log. This answers which, before
+anything starts, and it is a read: no encoder is built and no thread starts.
+
+**It reads the framebuffer's buffer handles, not merely whether a plane is lit**, and that is
+the whole difficulty. Enumerating a connector and finding its framebuffer both succeed without
+the capability; getting the handles back out does not. Measured on a real display: the same
+binary answers `LOWLAT_ERR_DISPLAY_UNREACHABLE` as an unprivileged user in the `video` group and
+`LOWLAT_OK` as root. A weaker probe reports a machine ready to host that cannot.
+
+**An identity is sized for a device path, not for a connector name.** The same bound carries a
+display's identity and a sound device's, and the longest of them is a path: a USB output's name
+from the sound server passes a hundred characters once its serial and profile are in it, and a
+display identity on one platform is an operating-system device path bounded at 260. A name that
+does not fit is truncated silently and then resolves to nothing, so the bound is set by the worst
+case rather than by what a machine happens to report today. (*Amended 2026-10-14*: Windows
+names a display `DISPLAYn` ([impl-plan-windows.md](impl-plan-windows.md) W2), so the long
+identity is a sound device's; the bound stands.) (*Amended 2026-10-16*: the host's own display
+is listed with the identity `virtual` and the system's `DISPLAYn` as its name, so a request by
+identity survives the system numbering its output again, as a replug or a driver restart does.)
+
+`lowlat_get_audio_outputs` lists what sound could be captured from. **The identity it returns is
+the monitor of an output, not the output**, because that is the device a host reads: it carries
+what the speakers are playing. The name beside it is what a person calls the speakers, which is
+what an application shows them. A machine with no sound server answers with none rather than
+failing, which is the same thing an application does with the answer. (*Amended 2026-10-15*: on
+Windows the identity is the output itself, the system's own identifier for it, because the
+system reads an output back through a loopback of that output rather than through a device of
+its own; the name is still the one a person sees, and the identifier fits the bound with room
+to spare.)
+
+`lowlat_get_encoders` arrives when there is a choice worth reporting: the encoder follows the
+display, so today the answer is a consequence rather than a menu. Adding a function is additive;
+a call that answers nothing is worse than no call.
+
+**The decoders are a menu, so they are listed** (minor 8). `lowlat_enum_decoders(index, out)`
+fills the `lowlat_decoder_info` of slot `index` and answers true, or false past the table's
+end, so a caller iterates from zero until false; the shape is the one an established client
+SDK's decoder list has. **The table is fixed and a call probes one slot** (*corrected
+2026-09-22*, minor 12): on Linux, slots 0 to 7 are the open interface on render nodes
+`renderD128` to `renderD135`, 8 to 15 the vendor's on its devices by ordinal, 16 the
+software decoder from the codec library's own search (an LGPL build; a GPL one too with
+`LOWLAT_FEATURE_GPL_LIBAVCODEC`, §3b); Windows' and macOS's tables are §3b's. The same slot
+means the same thing on every machine
+and every call, and nothing is remembered between calls: a call opens its one slot exactly
+the way creation opens it and closes it again, so a loop costs every slot once -- measured
+on the development machine, 5 ms for the open interface on a node, microseconds for a node
+or an ordinal that is not there, under a millisecond for the codec library, and 190 ms for
+a vendor device, whose five capabilities are each proved by building a real decoder; 200 ms
+for the whole table where the first shape cost 800 for three rows, because every call had
+re-probed the whole machine. A slot with nothing usable behind it still answers true, with
+`available` clear, every capability false and the reason in `driver` -- a node that is not
+there, a device past the last, a codec library the build does not load -- and a loop skips
+it. An available row is a decoder creation will open, named by the two values creation
+takes; its `name` is a label for a menu, the interface and the card's maker (`VA-API
+[Intel]`, `NVDEC [NVIDIA]`, `AMF [AMD]`, `VPL [Intel]`, `VideoToolbox [Apple]`,
+`libavcodec [LGPL]`), and `driver`
+(minor 13) the driver's own words -- its banner and version, the device's product name, the
+library's version and licence, or why the slot is unavailable. For a startup or a settings
+screen, not a per-frame call.
+
+Two-call pattern: pass `NULL` to learn the count, then a buffer. **Nothing returned by this API
+is heap allocated on the caller's behalf**, so there is no free function and no ownership
+question. The caller owns every buffer it passes.
+
+These are available before `lowlat_host_start`, so an application can present a configuration
+interface before committing.
+
+## §7 Status codes
+
+A single `lowlat_status` enum spans success, warnings, and errors. Zero is success; negative
+values are errors; positive values are non-fatal conditions such as `LOWLAT_TIMEOUT`.
+
+**An enumeration for the names, and never a parameter.** Grouping the codes under a type is
+what tells a reader that `LOWLAT_TIMEOUT` is a status and `LOWLAT_ATTEMPT_MAX` is a size, which
+a header full of bare defines cannot. Accepting one back by value would be a different
+question: reading a value nothing defined is undefined behaviour, and an application is free to
+hand back any integer it holds. So statuses travel outward as the enumeration and every call
+that takes one in declares a plain integer. `lowlat_status_string` is the case that makes it
+obvious -- describing a code this version does not define is the reason somebody calls it.
+
+Ranges are partitioned by subsystem so a numeric code identifies its origin without a lookup.
+Codes are assigned once and never reused, including for removed conditions.
+
+`lowlat_status_string` returns a static string. It never allocates and the pointer is valid
+forever.
+
+Signaling outcomes are typed rather than collapsed into a generic failure
+([04 §8](04-signaling.md)), because the application's correct response differs per outcome.
+
+## §8 Threading and reentrancy
+
+- **Every call is safe from any thread**, except that `lowlat_host_poll_events` has one
+  consumer.
+- **No call blocks on a network operation.** The longest a call can take is a lock acquisition
+  and a memory copy. `lowlat_host_poll_events` blocks only for its explicit timeout.
+- **One lock covers the seam, and approving an attempt holds it** while a socket is bound and
+  that guest's threads are started. That is milliseconds rather than the microseconds the line
+  above promises, and it is stated here rather than fixed because the fix is worse: a second
+  lock is a lock ordering, and a lock ordering is what produces the first deadlock the day
+  somebody adds a call that needs both. Admission happens once per guest and never on a path
+  that carries a frame.
+- **The event queue is not behind that lock.** A poll that waits out its timeout must not stop
+  every other call for the length of it.
+- **The third half's calls wait for the system's display configuration**
+  ([§3c](#3c-virtual-displays)), within about three seconds: the one place a call waits on
+  something other than a lock, and only on a `lowlat_vdd` handle.
+- **The SDK never calls into the application** except through the log callback. There is no
+  reentrancy contract to violate.
+- **The SDK owns all its threads.** The application never provides one, and never runs our
+  work on its own ([00-overview.md](00-overview.md) D3).
+- `lowlat_destroy` may be called from any thread but not from inside the log callback.
+
+## §9 Panics and unwinding
+
+**Every `extern "C"` entry point catches unwinding.** A panic crossing the boundary is
+undefined behavior, and this library loads into processes we do not control.
+
+- A caught panic is logged with its location and returns `LOWLAT_ERR_INTERNAL`.
+- The handle is marked poisoned. Subsequent calls return the same error rather than proceeding
+  on state whose invariants may be broken. Only `lowlat_destroy` still works.
+- **The shared library keeps unwinding enabled.** Building it to abort on panic silently
+  disables all of the above, which is why the release profile is split
+  ([AGENTS.md](../AGENTS.md) §17).
+- **A C++ application's log callback lets no exception out.** It is called from the library's
+  own frames, and an exception unwinding through them is undefined: catch inside it, or declare
+  it `noexcept`. A C++ program's exceptions elsewhere and the library's contained panics share
+  the system's one unwinder, both checked in one program on macOS.
+- A deliberately panicking call is a named test at [Phase 8](impl-plan.md): for each half
+  the object carries, `lowlat_debug_panic` on a host handle and `lowlat_client_debug_panic`
+  on a client handle (minor 18), run against the shipped object on Linux and on Windows; and
+  `lowlat_vdd_debug_panic` on a display handle (minor 26), wherever the driver is installed.
+
+## §10 Memory and strings
+
+- **The caller owns every buffer.** Nothing crosses the boundary that the application must
+  free.
+- **Input strings are NUL-terminated `const char *`**, copied immediately. The API never
+  retains a caller pointer past the call.
+- **Output strings are written into caller-provided fixed arrays** inside structs, never
+  returned as pointers. Sizes are named constants in the header.
+- **All strings are UTF-8.**
+- Binary payloads are pointer plus length, copied on the way in and copied into caller storage
+  on the way out. Inbound, that storage is the buffer handed to the poll call ([§5](#5-events)).
+- **There is no free function, and that is a property to preserve.** Every allocator that
+  crosses a library boundary eventually meets an application built against a different runtime,
+  and the failure is a corrupted heap rather than an error code.
+
+## §11 Versioning
+
+The ABI is **additive within a major version**:
+
+- New functions may be added.
+- New struct fields may be appended, guarded by the `size` field.
+- New enum variants may be appended.
+- New event types may be added.
+
+Never, without a major version change: reordering or removing a field, renumbering a value,
+changing a signature, or changing the meaning of an existing field.
+
+`lowlat_abi_version` returns major and minor packed. A loader refusing a mismatched major is
+correct; refusing a newer minor is not.
+
+**Minor 2** (2026-09-12) appended `transport` and `fingerprint` to `lowlat_attempt_info`, the
+`lowlat_transport` enumeration, the status `LOWLAT_ERR_FINGERPRINT` and the outcome
+`LOWLAT_OUTCOME_HANDSHAKE_FAILED` ([§4](#4-signaling-seam)).
+
+**Minor 3** (2026-09-15) added `lowlat_features` and its two bits, and renamed the handle:
+`lowlat` is `lowlat_host`, `lowlat_create_info` is `lowlat_host_create_info`, `lowlat_create`
+and `lowlat_destroy` are `lowlat_host_create` and `lowlat_host_destroy` ([§2](#2-lifecycle)).
+A rename before the first major version, under the rule below, taken before the first
+pre-release so that the header it ships is the one that lasts; nothing moved and nothing
+changed meaning.
+
+**Minor 4** (2026-09-17) added the client half ([§3b](#3b-client)): `lowlat_client` and its
+create, destroy, seam, status, user data and poll calls, `lowlat_client_create_info`,
+`lowlat_client_config` and `lowlat_client_status`; the event types `BLOCKED`, `STREAM_ENDED`
+and `HOST_MODE` with their bodies and the outcome `LOWLAT_OUTCOME_DISCONNECTED`. The seam's
+types moved out of the host's guard into one both halves share; nothing moved in memory and
+nothing changed meaning.
+
+**Minor 5** (2026-09-17) added the pictures ([§3b](#3b-client)): `lowlat_client_acquire_frame`
+and `lowlat_client_release_frame`, `lowlat_frame`, `lowlat_plane` and `lowlat_fence`, the
+`lowlat_decoder`, `lowlat_frame_kind` and `lowlat_fence_kind` enumerations and the picture
+formats; `lowlat_client_create_info` gained the decoder, the frame kind, the ceiling and the
+device, and `lowlat_client_status` the decoder's state and backend, the codec, the queue
+depth, the decode, read-back and reported encode times, the count decoded and the video
+bytes; the statuses `LOWLAT_ERR_TOO_MANY_HELD` and the `LOWLAT_ERR_NO_DECODER_*` range with
+`LOWLAT_ERR_DECODER_UNSUPPORTED`, and the outcome `LOWLAT_OUTCOME_DECODER_FAILED`.
+`lowlat_rotation` and `lowlat_codec` moved from the host's guard to the shared block, their
+values unchanged.
+
+**Minor 6** (2026-09-18) added the input ([§3b](#3b-client)): `lowlat_client_set_viewport`,
+the nine `lowlat_client_send_*` calls with `lowlat_pad_state`, the `LOWLAT_MOD_*`,
+`LOWLAT_MOUSE_*` and `LOWLAT_PAD_*` vocabulary, `LOWLAT_EVENT_RELATIVE` with its body, and
+`input_dropped` in `lowlat_client_status`.
+
+**Minor 7** (2026-09-18) added the sound ([§3b](#3b-client)): `lowlat_client_acquire_audio`,
+`LOWLAT_AUDIO_OPUS` and `LOWLAT_AUDIO_PCM`, and in `lowlat_client_status` the packets decoded,
+dropped, refused and queued, the last packet's age and the codec.
+
+**Minor 8** (2026-09-19) is the preferences, the second backend, the handle and the decoder
+list ([§3b](#3b-client), [§6](#6-enumeration)): `lowlat_client_video_config` as
+`lowlat_client_config.video`, taking the size request with it; `lowlat_client_set_video_config`;
+the two full-chroma formats; the handle fields of `lowlat_frame` and `lowlat_plane.offset`;
+`lowlat_handle_kind`; the vendor decoder accepted; the status fields for what was asked,
+declared and decoded; `lowlat_enum_decoders` with `lowlat_decoder_info`; the client's decode
+and sound figures as reported to the host. The size request moves, which is a layout change
+to `lowlat_client_config` under the rule below.
+
+**Minor 9** (2026-09-19) is the cursor, rumble, the guest list and the client's metrics
+([§3b](#3b-client)): the three events with their bodies, `lowlat_client_get_metrics` with
+`lowlat_client_metrics` and `lowlat_client_channel_metrics`, and the status fields for the
+client's own number and the pointer's counts.
+
+**Minor 10** (2026-09-20) is the pad reports ([§3b](#3b-client), [§3](#3-host)): the client
+half built with C7.1 -- `lowlat_pad_type`, `lowlat_pad_report`, `LOWLAT_PAD_REPORT_MAX`,
+`lowlat_client_send_pad_report`, `LOWLAT_EVENT_PAD_REPORT` with `lowlat_pad_report_event`, the
+three `pad_reports_*` status fields; the host half built with Phase 14 under the same minor --
+`pad_sink` in a reserved byte of `lowlat_host_config`, `lowlat_pad_sink`,
+`lowlat_host_poll_pad_report` and `lowlat_host_send_pad_report`, `LOWLAT_PAD_REPORT_UNPLUG`.
+Nothing moves.
+
+**Minor 11** (2026-09-21) is the software decoder and the decoder chosen mid-session
+([§3b](#3b-client), [§6](#6-enumeration)): `LOWLAT_DECODER_SOFTWARE`,
+`LOWLAT_ERR_NO_DECODER_LICENCE`, the software row last in `lowlat_enum_decoders`,
+`lowlat_client_set_decoder`, and the automatic order's two corrections. Nothing moves.
+
+**Minor 12** (2026-09-21) is one feature bit, `LOWLAT_FEATURE_GPL_LIBAVCODEC` ([§2](#2-lifecycle),
+[§3b](#3b-client)): set by a library built with the `gpl-libavcodec` feature, whose software
+decoder loads a GPL codec library as well as an LGPL one. And (2026-09-22) one bit in a
+reserved byte of `lowlat_decoder_info`, `available`, with the enumeration corrected to a
+fixed table of slots probed one at a time ([§6](#6-enumeration)): a slot with nothing behind
+it now answers true with the bit clear where the first shape listed only what opened, so a
+loop written against minor 11 that reads capabilities still works and one that counts rows
+now counts slots. Nothing moves.
+
+**Minor 13** (2026-09-22) appends `driver` to `lowlat_decoder_info` ([§6](#6-enumeration)) and
+makes `name` a label: the interface and the card's maker -- `VA-API [Intel]`, `VA-API [AMD]`,
+`NVDEC [NVIDIA]`, `libavcodec [LGPL]` -- where it had carried the driver's own words, which
+now sit in `driver` together with a slot's reason for being unavailable. The row is filled as
+far as the caller's `size` reaches, so a caller built against minor 12 gets the fields it
+knows. Nothing moves.
+
+**Minor 14** (2026-09-23) is the relay ([§3b](#3b-client)): `relay`, `relay_username` and
+`relay_password` appended to `lowlat_client_config` with `LOWLAT_RELAY_CREDENTIAL_MAX`;
+`relay_address`, `relay_port` and `relayed` appended to `lowlat_client_status`; the outcomes
+`LOWLAT_OUTCOME_RELAY_UNREACHABLE`, `_REFUSED` and `_LOST`. Nothing moves. **Both structures
+are read and filled as far as the caller's `size` reaches**, with the size they had at minor
+13 as the least accepted. Until this minor each was refused unless `size` covered the whole
+of it, which would have refused every caller built against an earlier header the first time
+either grew; the rule above had not been kept for them, and is now.
+
+**Minor 15** (2026-09-24) is the picture's range ([§3b](#3b-client)): `full_range` appended to
+`lowlat_frame`, true when the stream's parameter set says its samples span the whole of their
+depth. Nothing moves. **`lowlat_client_acquire_frame` fills the frame as far as the caller's
+`size` reaches**, with the size it had at minor 14 as the least accepted: until this minor it
+refused a frame unless `size` covered the whole of it, the fault minor 14 corrected for the
+configuration and the status, corrected for the frame the first time it grows.
+
+**Minor 16** (2026-09-24) is the picture's arrival time ([§3b](#3b-client)): `arrived_us`
+appended to `lowlat_frame`, when the message the picture came from was taken off the network,
+on `CLOCK_MONOTONIC`. Nothing moves, and a caller built against minor 14 or 15 gets the fields
+it knows.
+
+**Minor 17** (2026-09-24) is the range asked for ([§3b](#3b-client)): the reserved byte of
+`lowlat_client_video_config` becomes `full_range`, the application's word that its renderer
+takes the full range. The library had declared that on every attempt; now it declares it
+only when asked. Nothing moves, and a caller built against an earlier minor, which passed
+zero there, asks for the video range.
+
+**Minor 18** (2026-09-27) is the client's deliberate panic ([§9](#9-panics-and-unwinding)):
+`lowlat_client_debug_panic`, the client half's twin of `lowlat_debug_panic`, so a library
+carrying the client half alone -- which a Windows build was until W2.0 -- proves containment
+on the object that ships. Not for applications. Nothing moves.
+
+**Minor 19** (2026-09-28) is the handle on Windows and the kind switched live
+([§3b](#3b-client)): `LOWLAT_HANDLE_D3D11_SHARED` appended to `lowlat_handle_kind`,
+`textures` and `adapter` appended to `lowlat_frame`, and `lowlat_client_set_frame_kind`.
+`lowlat_client_set_decoder` in a session of the handle kind is accepted where it was refused,
+a decoder that hands out no handle then handing out planes. Nothing moves, and a caller built
+against an earlier minor gets the fields it knows.
+
+**Minor 22** (2026-10-05) is the port and its mapping ([§3b](#3b-client)): `port`,
+`port_mapping` and `port_seed` appended to `lowlat_client_create_info` with
+`LOWLAT_PORT_SEED_MAX`; `lowlat_mapping`; `mapping`, `mapped_address`, `mapped_port`,
+`mapping_refusal` and `mapping_refused_by` appended to `lowlat_client_status`. Nothing moves.
+**The creation info is read as far as the caller's `size` reaches**, with the size it had at
+minor 21 as the least accepted: until this minor it was refused unless `size` covered the
+whole of it, the fault minor 14 corrected for the configuration and the status, corrected for
+the creation info the first time it grows. A caller built against an earlier minor gets the
+stable port with no mapping, where it had a port the system picked per attempt.
+
+**Minor 23** (2026-10-06) is the translation in front of the port ([§3b](#3b-client)):
+`lowlat_client_probe_nat` with `lowlat_nat_probe`, `lowlat_client_get_nat` with
+`lowlat_nat_info`, `lowlat_nat_mapping`, and `LOWLAT_NAT_TYPE_*`, `LOWLAT_NAT_STATE_*` and
+`LOWLAT_NAT_SOURCE_*`. Nothing moves.
+
+**Minor 24** (2026-10-12) is the application's own message ([§3b](#3b-client)):
+`lowlat_client_send_control`. Nothing moves.
+
+**Minor 25** (2026-10-12) is the client's microphone ([§3b](#3b-client)):
+`lowlat_client_send_microphone`, `LOWLAT_EVENT_MICROPHONE` with `lowlat_microphone_event`,
+`LOWLAT_ERR_MICROPHONE_OFF`, and `microphone_sent`, `microphone_dropped` and `microphone`
+appended to `lowlat_client_status`. Nothing moves, and a caller built against an earlier minor
+gets the fields it knows. The host's microphone answer, which reached the application as an
+application message until this minor, is read by the library and raised as the event instead.
+
+**Minor 27** (2026-10-16) is the host's own display ([§3](#3-host), [§14](#14-verification-status)):
+`virtual_fallback` in `lowlat_host_config`, taking one of its reserved bytes, and
+`virtual_width`, `virtual_height` and `virtual_hz` appended to `lowlat_host_video_config`; the
+output name `virtual`. **Something moved, before the first major version**:
+`lowlat_host_video_config` sits inside `lowlat_host_config` ahead of the sound's half, so
+growing it moved that half, and a host application built against an earlier minor is refused at
+`lowlat_host_start` until it is built again -- refused, never misread, since every call checks
+the size of what it is given. Taken deliberately rather than kept by a call of its own; the host
+half carries no promise before 1.0, as the client half never has.
+
+**Minor 28** (2026-10-16) is waking the display ([§3](#3-host)): `wake_display` in
+`lowlat_host_config`, taking its last reserved byte. Nothing moves, and a caller built against
+an earlier minor leaves it zero, off. The third half's handle now follows its driver
+([§3c](#3c-virtual-displays)): a behaviour, not a symbol.
+
+**Minor 30** (2026-10-17) is the virtual displays' answers ([§3c](#3c-virtual-displays)):
+`lowlat_vdd_plug` and `lowlat_vdd_set_mode` fill `out` on `LOWLAT_ERR_VDD_NOT_READY` with the
+monitor as it stands, and a plug the system refuses is unplugged again. No layout changes; a
+caller may read `out` after `LOWLAT_ERR_VDD_NOT_READY` only from this minor on.
+
+**Minor 31** (2026-10-24) is the memory clock ([§3](#3-host)): `hold_memory_clock` in
+`lowlat_host_config`, taking the first byte of the reserved half after `base_port`, whose
+`reserved` is one byte from this minor. Nothing moves, and a caller built against an earlier
+minor leaves it zero, off.
+
+**Minor 29** (2026-10-17) is the relay's carrier ([§3b](#3b-client)): `relay_carrier`
+appended to `lowlat_client_config`, and the `lowlat_relay_carrier` enumeration. Nothing moves, and
+a caller built against an earlier minor gets UDP.
+
+**Minor 26** (2026-10-15) is the third half, the virtual displays, on Windows
+([§3c](#3c-virtual-displays)): `lowlat_vdd` and its ten calls, `lowlat_vdd_plug_info`,
+`lowlat_vdd_monitor`, `lowlat_vdd_mode`, `lowlat_vdd_settings`, the `LOWLAT_VDD_*` constants,
+the statuses `LOWLAT_ERR_VDD_*` (-600 to -612) and `LOWLAT_FEATURE_VDD`. Nothing moves.
+
+**Minor 32** (2026-10-26) is the guests' input, and the configuration laid out per platform
+([§3](#3-host)): `lowlat_host_input_config` with `virtual_input`, its member `input` appended to
+`lowlat_host_config` after the sound's, and `lowlat_host_set_input_config` and
+`lowlat_host_get_input_config`, all on Windows alone; the statuses `LOWLAT_ERR_INPUT_DRIVER_*`
+(-700 to -703). Every other field only Windows acts on -- `virtual_width`, `virtual_height` and
+`virtual_hz` in `lowlat_host_video_config`, `virtual_fallback`, `wake_display` and
+`hold_memory_clock` in `lowlat_host_config` -- is declared where the header is compiled for
+Windows alone, so elsewhere it no longer exists. **On Windows the whole only grew at its end**:
+nothing moved, and a caller built against an earlier minor is refused by its size. **Off Windows
+something moved, before the first major version**, as at minor 27: the video half is sixteen
+bytes shorter and the whole with it, and a binding lays them out per platform, as the header
+does. A caller built against minors 27 to 31 is refused at `lowlat_host_start` by its size,
+which names that layout, rather than read with its sound half sixteen bytes off; one built
+before minor 27 had the layout this minor has there, and is taken. The report pads' own minor
+gives `virtual_pads` one of the input half's reserved bytes, moving nothing.
+
+**Minor 33** (2026-10-26) is the report pads ([§3](#3-host)): `virtual_pads` in
+`lowlat_host_input_config`, taking the first of its reserved bytes, whose `reserved` is two
+bytes from this minor. Nothing moves, and a caller built against an earlier minor leaves it
+zero, off. `lowlat_host_send_pad_report` takes output reports alone: a feature write is refused
+with `LOWLAT_ERR_INVALID_ARGUMENT`.
+
+**Minor 34** (2026-10-30) is full chroma in two planes ([§3b](#3b-client)):
+`LOWLAT_FORMAT_NV24` (5) and `LOWLAT_FORMAT_P410` (6), which the system's decoder on macOS
+hands out and no decoder on Linux or Windows does. Nothing moves. The library for macOS starts
+at this minor, so no application built against an earlier one meets them. **The layouts are
+named by an enumeration from this minor**, `lowlat_format`, as the frame kinds are, with the
+values the names had, still carried in `uint32_t` fields: a test of the preprocessor for one of
+the names no longer finds it, so an application asks the minor instead.
+
+**Minor 35** (2026-10-30) is the handle on macOS ([§3b](#3b-client)): `LOWLAT_HANDLE_IOSURFACE`
+(4), and `lowlat_frame.surface` appended after `adapter` on every platform, null wherever the
+kind is not the surface's. The frame grows by the field's size; a caller built against an
+earlier minor passes the size it knows and gets the fields it knows, as before.
+
+**Minor 36** (2026-10-31) names every family of values by an enumeration and types what the
+library writes ([§1](#1-shape), rule 3). The defines left -- the feature bits, the
+translation's number, state and source, the sound codec, the client's and its decoder's state,
+the modifier bits, the mouse and pad buttons, the pad axes and state bits, a display's lifetime
+-- are `lowlat_feature`, `lowlat_nat_type`, `lowlat_nat_state`, `lowlat_nat_source`,
+`lowlat_audio_codec`, `lowlat_client_state`, `lowlat_decoder_state`, `lowlat_keymod`,
+`lowlat_mouse_button`, `lowlat_pad_button`, `lowlat_pad_axis`, `lowlat_pad_state_button` and
+`lowlat_vdd_lifetime`, with the values they had. Two families take their names' prefixes: the
+decoder's state is `LOWLAT_DECODER_STATE_NONE_YET`, `_BUILT` and `_FAILED`, which had stood
+beside `LOWLAT_DECODER_NONE`, a decoder of none; the pad buttons are `LOWLAT_PAD_BUTTON_A` to
+`LOWLAT_PAD_BUTTON_DPAD_RIGHT`. Every enumeration declares a 32-bit width in C++ through
+`LOWLAT_ENUM_BASE` and is the platform's enumeration in C, and every structure field and
+out-parameter the library writes is typed by its own: the frame's kind, format, rotation and
+handle kind; the client's status's state, decoder state, codecs, backend, format and mappings;
+the translation's state, number, mapping, source and gateway; a decoder row's decoder; the
+host's status's codec and chroma; a pad report's kind and `lowlat_host_poll_pad_report`'s type
+and kind; the log callback's level. Five zeros a status reports before a build are named:
+`LOWLAT_CODEC_NONE`, `LOWLAT_FORMAT_NONE`, `LOWLAT_AUDIO_NONE`, `LOWLAT_CHROMA_NONE` and
+`LOWLAT_NAT_SOURCE_NONE`. `lowlat_host_config_default` is `lowlat_host_default_config`, which
+takes the structure to fill and returns a status ([§3](#3-host)): a signature changed under a
+new name, so an application built against an earlier minor fails to load rather than call it
+the old way. **No byte moves.** In C a typed field is its enumeration where it
+had been a `uint32_t`, four bytes either way; in C++ it reads into its enumeration with no
+cast, and a bare integer written into one takes a cast; in both a log callback takes
+`lowlat_log_level`. A test of the preprocessor for one of the names no longer finds it, as at
+minor 34.
+
+**Minor 37** (2026-11-01) moves the quality and the congestion level into the live half
+([§3](#3-host)): `lowlat_host_video_config.quality` and `cg_level` are appended after every
+other field, on every platform, and `lowlat_host_set_video_config` moves both under a running
+stream. The configuration's own `quality` and `cg_level` are `reserved2` and `reserved3`, read
+by nothing, at the offsets they had; a start takes both from `video`. **The video configuration
+grows by eight bytes everywhere, and the second word is why**: on Windows minor 36's ended in
+four bytes of padding, which the quality alone would have filled, leaving the size as it was --
+a caller built against minor 36 would have been taken, its quality ignored where it had set it
+and its padding read as one. With the second word, such a caller is refused at
+`lowlat_host_start` and at both video calls, as a shorter structure is: an application sets the
+two where they now are and builds again.
+
+**This surface is ours and carries no inherited compatibility.** It was designed here rather
+than adopted, so before the first major version a name that turns out to be wrong is corrected
+rather than kept: `LOWLAT_CG_LEVEL_LEGACY` became `LOWLAT_CG_LEVEL_AGGRESSIVE` because the
+value never selected an older scheme and the name said it did. The value did not move and the
+behaviour did not change; only the name stopped misdescribing it.
+
+**`virtual_hz` zero beside a zero `fps` changed meaning** (*2026-10-20*, W3.8): it held the host's
+own display at 60, and is now the display's own refresh, which a person may set ([§3](#3-host)).
+No byte moved and no minor marks it: a behaviour the host half was free to correct before 1.0,
+as minor 27 records.
+
+**`lowlat_rumble_event`'s motors became `low` and `high`** (*2026-09-28*), from `large` and
+`small`: one of Windows' own headers defines `small` as a macro, so a program that included
+the platform's headers whole, as most do, could not include this one after them. No byte
+moved: `low` is the byte `large` was, the large motor, which the platform's gamepad
+interfaces call the low-frequency one, and `high` the small, high-frequency one. The names
+are frequencies, not strengths. The header is compiled after the platform's headers on
+Windows now, as C and as C++.
+
+## §12 Bindings
+
+The header generates from the Rust definitions, so it cannot drift from the implementation.
+Header generation runs in continuous integration and a stale header fails the build.
+
+**Every struct is blittable**: fixed-size fields, no pointers into managed memory, no nested
+variable-length data. In C# that means plain sequential structs with no marshalling
+directives, which is what makes source-generated interop work without a runtime marshaller.
+
+**The header compiles standalone under both C and C++ with warnings as errors**, verified at
+[Phase 8](impl-plan.md), because a header that only compiles in the author's translation unit
+is a header nobody can use -- by each platform's own compiler, Visual Studio's on Windows
+since W1.2.
+
+A C# integration is the reference case, since it exercises the signaling seam, event polling,
+and struct blittability at once. It is the Phase 8 gate.
+
+## §13 What is deliberately absent
+
+- **No signaling**, on either half. [04 §1](04-signaling.md).
+- **No callbacks on data paths.** The frames and the sound a host sends never cross this
+  boundary; the SDK captures and encodes internally, and an application that wants a host's
+  frames wants a different product. What the client half hands out -- pictures, sound,
+  events -- crosses on the application's own call, by acquire and poll
+  ([§3b](#3b-client)), never by a call from inside the library. **A guest's microphone is
+  the host's one exception and it is still not a callback**: it is polled, on a call of its
+  own, and what crosses is samples.
+- **No microphone device.** A shared library has no business creating a capture device in
+  somebody's session -- it owns neither the session nor the naming nor the lifetime -- so what a
+  host does with a guest's microphone is the application's decision. The SDK decodes and hands
+  over sixteen-bit samples.
+- **No configuration file parsing.** The application decides where configuration comes from
+  and passes structs.
+- **No threading knobs.** Thread counts scale to available parallelism and are not exposed.
+  An application that wants fewer threads wants fewer guests.
+- **No public Rust API.** Deferred indefinitely. A stable Rust surface is a second ABI to
+  maintain, and the C one already works from Rust.
+
+## §14 Verification status
+
+**Ours by design:** all of it. The API shape follows an established convention, but no part of
+this document is constrained by wire compatibility. It changes only for our reasons.
+
+**Settled 2026-08-21, and the shape it took:** no resolution and no rotation, an `output`
+identity, `fps` as a ceiling, and a split between what is settled at start and what changes
+while the host runs (§3). Codec, encoder and congestion level are named by enumerations but
+**carried as plain integers**, because the application writes those fields and reading one back
+as a variant would be reading whatever it wrote; every one is checked at the boundary rather
+than converted. Reflexive servers are a fixed array with a count rather than a pointer and a
+length, so the structure stays one blittable block with nothing in it to free.
+
+**Rotation is followed, not configured.** A display decides its own orientation exactly as it
+decides its own size, so asking for one is the same request as asking for a mode. **It is read
+from the session since 2026-09-10**, on the same connection that places the output in the
+desktop, and declared in the video header from there; a host with no session to ask declares
+the picture flat. A guest's request for a size or a turn is the application's to relay to the
+session, and it stays out of this configuration for the same reason a size does
+([impl-plan.md](impl-plan.md), *Output selection*). *Amended 2026-10-20 (W3.10):* on Windows the
+host runs in the session, so the application puts the request itself; `lowlatd` takes one from an
+owner alone, on both platforms.
+
+**Was open until Phase 8:** the concrete `lowlat_host_config` field set, which depends on the
+capture backend decision in [07-platforms.md](07-platforms.md), and the status code range
+partitioning, which wants the full error surface visible before it is fixed.
+
+**One field of that set is already decided, because it is the only one whose meaning could not
+be appended later.** There is no requested resolution. The display decides the picture's size,
+the encoder follows it, and the application is told what it got -- through the status call and
+the capture-changed event -- rather than asking for it. A host that creates its own display
+chooses that display's size when it creates it, which is a different question from setting the
+mode of a display somebody else owns, and that one is nobody's here
+([impl-plan.md](impl-plan.md), *Output selection*). A frame rate is a **cap** over whatever the
+display runs at, not a target, and **zero asks for the display's own rate**: the display is
+read when the pipeline is built, so the number the application is told is one the stream can
+actually reach.
+
+*Planned 2026-10-15 ([impl-plan-windows.md](impl-plan-windows.md) W3, [00 §D16](00-overview.md)):
+the host's own display on Windows is that case, and its size reaches it through the
+configuration.* A setting fixed at start lets a stream that finds nothing lit plug it -- off by
+default, since it changes the machine -- and the live output name `virtual` asks for it. Its
+width, height and refresh are live, and zero lets the host decide: the size an owner states as
+it joins an empty room, within the largest picture that guest accepts, else the size the
+display already has; the refresh is the frame-rate cap, 60 when that is zero, so this display's
+own rate is the stream's rather than the other way round. **`owner` then decides a second
+thing**: whose stated size the display takes. A guest's later request for a size is the
+application's to relay, as on any display, and here the application relays it into these
+settings. The virtual monitors an application plugs for itself go through the library's third
+half, the controller, each bound to the handle that plugged it or kept until removed
+([11 §1.3](11-drivers.md)); the host's display is bound to the host. *The third half was built
+at W3.1 (minor 26, [§3c](#3c-virtual-displays)).* *Reviewed 2026-10-16
+([impl-plan-windows.md](impl-plan-windows.md) W3.2):* the display is plugged when the host
+starts rather than when a stream finds nothing lit, since a stream exists only once a guest is
+seated, and again whenever nothing is lit; the size at a join is clamped to that guest's largest
+picture; the enumeration lists the display as `virtual`, the system's name for it beside that,
+and reading the configuration back says `virtual` while it is captured; off Windows the fields
+are accepted, nothing is plugged, and `virtual` is refused. *Built at W3.2 (minor 27), the
+host's display listed and asked for as `virtual`.* *Amended 2026-10-20, at W3.8:* with no cap
+either, the refresh is the display's own -- a person may set it in its display settings, and it
+comes back with the display -- and the stream's rate follows it; the size stays the host's, and
+a display turned at the desk is left turned. *Amended 2026-10-20, at W3.10:* the library turns
+no display, its own included: a turn is made where a person makes one, or by the application --
+`lowlatd` puts an owner's through the system's display configuration, put once and never held, as
+a turn at the desk is -- and a size asked of the host's display after keeps it. The call W3.9 added
+for it was withdrawn before it was published.

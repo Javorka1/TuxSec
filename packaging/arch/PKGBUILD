@@ -1,0 +1,22 @@
+# Maintainer: Parsec Linux Host Contributors
+pkgname=parsec-linux-host
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Parsec-compatible Linux Host (Wayland/X11, NVENC/VAAPI) with Qt6 Control Panel and PipeWire Discord Audio Isolation"
+arch=('x86_64')
+url="https://github.com/SEU_USUARIO/parsec-linux-host"
+license=('MIT' 'Apache-2.0')
+depends=('python' 'python-pyqt6' 'pipewire' 'libpulse' 'vulkan-icd-loader' 'libdrm' 'polkit')
+makedepends=('cargo' 'git')
+backup=('etc/lowlat/lowlatd.env')
+source=()
+
+build() {
+    cd "$startdir/../.."
+    cargo build --release --locked --bin lowlatd
+}
+
+package() {
+    cd "$startdir/../.."
+    DESTDIR="$pkgdir" sh packaging/install.sh
+}

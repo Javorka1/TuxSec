@@ -1,0 +1,184 @@
+//! Sound: capture from the desktop's own output, encode it, and decode what a
+//! peer sends -- a guest's microphone on the host, the host's stream on the
+//! client.
+//!
+//! **Separate from `lowlat-capture` and `lowlat-encode` on purpose.** Those two
+//! carry a display stack and two vendor runtimes between them, and none of it
+//! has anything to do with sound; a machine with no graphics device still has
+//! audio and the reverse is true as well. What they share is the shape of the
+//! problem rather than any code.
+//!
+//! The format is fixed and is not a configuration: 48 kHz, stereo, 20 ms a
+//! packet ([docs/05-host.md](../../../docs/05-host.md) section 9). The wire
+//! carries the sample count, so a receiver would follow a different frame; the
+//! reason to keep one is that every buffer, every packet and every measurement
+//! here is expressed in it.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+
+/// The desktop's own output, captured for a host: Linux and Windows alone,
+/// the platforms a host runs on.
+#[cfg(any(target_os = "linux", windows))]
+pub mod capture;
+pub mod decode;
+pub mod encode;
+#[cfg(target_os = "linux")]
+mod pulse;
+
+/// The system's sound interfaces, generated from the SDK's headers by
+/// `scripts/gen-wasapi-bindings.sh` and committed. They follow C naming and
+/// declare more than is called, so the usual lints do not apply; named one by
+/// one, since a group allow loses to a lint the workspace sets explicitly.
+#[cfg(windows)]
+#[allow(
+    dead_code,
+    unused_imports,
+    unnecessary_transmutes,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    missing_debug_implementations,
+    unreachable_pub,
+    clippy::all,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::useless_transmute
+)]
+mod ffi {
+    pub(crate) mod wasapi;
+    pub(crate) mod wasapi_guids;
+}
+
+// The per-packet assertions count allocations on the thread that runs them.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: lowlat_common::alloc_counter::Counting = lowlat_common::alloc_counter::Counting;
+
+#[cfg(any(target_os = "linux", windows))]
+pub use capture::{Capture, Config, Live, Output, Wanted, outputs};
+pub use decode::Decoder;
+pub use encode::Encoder;
+
+/// Samples a second, per channel. **The only rate the protocol carries**, so
+/// it comes from there rather than being declared again here.
+pub use lowlat_core::audio::SAMPLE_RATE;
+
+/// Channels captured, encoded and sent.
+///
+/// Stereo is what a desktop mixes to and what every peer expects; the wire can
+/// describe more and nothing here produces it.
+pub const CHANNELS: usize = 2;
+
+/// Samples per channel in one packet: **20 ms**.
+///
+/// A host decision rather than a wire constant. Shorter frames cost bitrate for
+/// latency the picture does not have, and longer ones save little: the sound
+/// server delivers on its own period regardless, which is not this one.
+pub const FRAME: usize = 960;
+
+/// Bytes one captured frame occupies as interleaved sixteen-bit samples, which
+/// is also exactly what an uncompressed packet carries.
+pub const FRAME_BYTES: usize = FRAME * CHANNELS * 2;
+
+/// What went wrong, as codes and small values rather than as messages.
+///
+/// **No `String` anywhere in it** (AGENTS section 9): a caller logs the variant
+/// and the number the platform gave, which is what identifies the fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The sound server's client library is not installed.
+    Unavailable,
+    /// It is installed and does not export what this needs, which means a
+    /// version older than the calls used here.
+    Incomplete,
+    /// The session's sound server refused the connection, or there is none.
+    /// Carries the server's own code.
+    Refused(i32),
+    /// A read failed. Carries the server's own code.
+    Read(i32),
+    /// The codec refused a frame, or could not be built for this format.
+    Encode,
+    /// The named device is not among those the server offers. **Checked before
+    /// opening rather than after**, because a name that does not resolve is
+    /// substituted rather than refused.
+    NoSuchDevice,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Unavailable => f.write_str("the sound server's client library is not installed"),
+            Error::Incomplete => {
+                f.write_str("the sound client library is missing calls this needs")
+            }
+            Error::Refused(code) => {
+                write!(
+                    f,
+                    "the sound server refused the connection, code={}",
+                    Code(*code)
+                )
+            }
+            Error::Read(code) => write!(f, "reading sound failed, code={}", Code(*code)),
+            Error::Encode => f.write_str("the codec refused a frame"),
+            Error::NoSuchDevice => f.write_str("no such sound device"),
+        }
+    }
+}
+
+/// A failure code as the platform writes it: a negative one is a Windows
+/// result, read in hex; any other is a sound server's own number.
+struct Code(i32);
+
+impl core::fmt::Display for Code {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 < 0 {
+            write!(f, "0x{:08x}", u32::from_ne_bytes(self.0.to_ne_bytes()))
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Windows result reads as the system writes it; a sound server's own
+    /// number as before.
+    #[test]
+    fn a_failure_code_reads_as_its_platform_writes_it() {
+        let windows = i32::from_ne_bytes(0x8889_0004_u32.to_ne_bytes());
+        assert_eq!(
+            Error::Read(windows).to_string(),
+            "reading sound failed, code=0x88890004"
+        );
+        assert_eq!(
+            Error::Refused(6).to_string(),
+            "the sound server refused the connection, code=6"
+        );
+    }
+
+    /// The packet this host sends is 20 ms, and the arithmetic that follows
+    /// from it is what every buffer here is sized by.
+    #[test]
+    fn the_frame_is_twenty_milliseconds() {
+        assert_eq!(FRAME * 1000 / SAMPLE_RATE as usize, 20);
+        assert_eq!(FRAME_BYTES, 3840);
+        // Far inside what a receiver accepts uncompressed. Both sides are
+        // constants, so this holds at compile time or not at all.
+        const { assert!(FRAME_BYTES < lowlat_core::audio::PCM_PAYLOAD_MAX) };
+    }
+
+    /// A header built for this frame describes exactly the bytes it carries.
+    #[test]
+    fn an_uncompressed_packet_matches_the_frame() {
+        let header = lowlat_core::audio::AudioHeader::stereo(
+            u32::try_from(FRAME).expect("a frame count"),
+            lowlat_core::audio::Codec::Pcm,
+        );
+        assert_eq!(header.payload_len(), Some(FRAME_BYTES));
+        assert_eq!(usize::from(header.channels), CHANNELS);
+    }
+}

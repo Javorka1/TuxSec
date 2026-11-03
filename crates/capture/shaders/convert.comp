@@ -1,0 +1,421 @@
+#version 430
+
+// Colour conversion: whatever the display scans out, into the planar 4:2:0 an
+// encoder takes, with a second entry point for the three-plane 4:4:4 layout.
+//
+// **One shader for every input depth.** A normalized format arrives here as
+// float regardless of how many bits it was stored in, so a ten-bit capture and
+// an eight-bit one differ only in the view they are read through and not in a
+// line of this. That matters because the display switches between the two
+// several times a minute; see docs/07-platforms.md section 3.3.
+//
+// **One shader for every output depth too, and one body per output layout.**
+// The targets carry no format -- a format layout qualifier is required only
+// for image loads, and a writeonly image may omit it, so the store converts
+// to whatever format the view was made with -- which is what lets one body
+// serve both depths. What a uniform cannot do is change the number of planes:
+// the subsampled entry writes two, the full-chroma entry writes three, and
+// both keep the colour rules, the ranges and the summary shared so the two
+// cannot drift apart over time. The device feature this needs is checked and
+// enabled where the device is made.
+//
+// Read through a sampler rather than as a storage image, which is what makes
+// the above true: a storage read needs the format written into the shader, and
+// packed ten-bit storage support is not universal.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// **The bindings differ between the two interfaces and nothing below them
+// does.** The colour rules, the subsampling and the summary are the part that
+// must not drift, so they are written once and the declarations either side of
+// this are what each interface needs; TARGET_VULKAN is defined when the
+// compiled form is built and absent when this text is handed to a driver.
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1) uniform writeonly image2D luma;
+layout(set = 0, binding = 2) uniform writeonly image2D chroma;
+layout(set = 0, binding = 3) uniform writeonly image2D cr;
+// **A second declaration for the same picture, integer-typed.** The packed
+// body stores a composed word, which a formatless float image cannot carry;
+// this binding names the word format and the packed view is what fills it.
+// The name avoids `packed`, which the shading language reserves.
+layout(set = 0, binding = 5) uniform writeonly uimage2D packed_plane;
+#else
+layout(binding = 0) uniform sampler2D source;
+layout(binding = 1) uniform writeonly image2D luma;
+layout(binding = 2) uniform writeonly image2D chroma;
+layout(binding = 3) uniform writeonly image2D cr;
+layout(binding = 5) uniform writeonly uimage2D packed_plane;
+#endif
+
+// **What the picture came to, in eight bytes.** The loop needs to know whether
+// this frame differs from the last one, and the only honest answer is what was
+// drawn: the buffer it was drawn into can be reused without being replaced, so
+// its identity says nothing. This pass already reads every pixel, so the
+// summary is free here and would cost a second read anywhere else.
+//
+// **Binding four, so the three plane bindings can line up.** The full-chroma
+// entry points below need a third plane, and renumbering the summary is the
+// only way to give them one without two shaders disagreeing about which
+// binding is which.
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 4) buffer Digest {
+    uint accumulated[2];
+} digest;
+#else
+layout(binding = 4) buffer Digest {
+    uint accumulated[2];
+} digest;
+#endif
+
+// The source size in pixels, and a nonzero flag to spread the quantisation
+// error. One interface carries them beside the dispatch and the other as plain
+// uniforms; the names below are what the body uses either way.
+#ifdef TARGET_VULKAN
+layout(push_constant) uniform Params {
+    ivec2 extent;
+    uint dither;
+    uint ten_bit;
+} params;
+#define EXTENT params.extent
+#define DITHER params.dither
+#define TEN_BIT (params.ten_bit != 0u)
+#else
+layout(location = 0) uniform ivec2 given_extent;
+layout(location = 1) uniform uint given_dither;
+layout(location = 2) uniform uint given_ten_bit;
+#define EXTENT given_extent
+#define DITHER given_dither
+#define TEN_BIT (given_ten_bit != 0u)
+#endif
+
+// BT.709, and not selectable. A receiver applies the inverse unconditionally
+// with nothing on the wire saying which matrix was used, so emitting anything
+// else produces a stream that decodes perfectly and renders with the wrong
+// colour, on every platform at once.
+const float KR = 0.2126;
+const float KB = 0.0722;
+const float KG = 1.0 - KR - KB;
+
+// Limited range: black sits at 16 and white at 235 of 255, or at 64 and 940 of
+// 1023. Getting this wrong is subtler than getting the matrix wrong, because it
+// reads as a washed-out picture rather than as a colour error.
+//
+// **The two sets are not one set rescaled, and that is the trap.** The offsets
+// are: 16 of 255 and 64 of 1023 agree to five decimal places. The scales do
+// not -- 235 of 255 is 0.92157 and 940 of 1023 is 0.91887 -- so carrying the
+// eight-bit numbers into a ten-bit target clips white by a fraction of a step
+// at every pixel, which no test comparing shapes would see.
+const float Y_SCALE_8 = 219.0 / 255.0;
+const float Y_OFFSET_8 = 16.0 / 255.0;
+const float C_SCALE_8 = 224.0 / 255.0;
+const float C_OFFSET_8 = 128.0 / 255.0;
+
+const float Y_SCALE_10 = 876.0 / 1023.0;
+const float Y_OFFSET_10 = 64.0 / 1023.0;
+const float C_SCALE_10 = 896.0 / 1023.0;
+const float C_OFFSET_10 = 512.0 / 1023.0;
+
+float y_scale() { return TEN_BIT ? Y_SCALE_10 : Y_SCALE_8; }
+float y_offset() { return TEN_BIT ? Y_OFFSET_10 : Y_OFFSET_8; }
+float c_scale() { return TEN_BIT ? C_SCALE_10 : C_SCALE_8; }
+float c_offset() { return TEN_BIT ? C_OFFSET_10 : C_OFFSET_8; }
+
+// The largest sample value the target holds, which is what a normalised
+// store is quantised against.
+float top() { return TEN_BIT ? 1023.0 : 255.0; }
+
+// **Where a ten-bit sample sits inside its sixteen-bit word.** The planes are
+// sixteen bits a sample because one device here offers no packed ten-bit
+// storage image at all, so placing the samples is this shader's job rather
+// than the driver's: an encoder reads ten bits in the *high* ten of the word,
+// so a sample of 1023 has to store as 65472 and not as 65535. That is one
+// multiply, and getting it wrong is the failure with no symptom -- the picture
+// decodes, and every value is a fraction of a step dark.
+const float TEN_IN_SIXTEEN = 65472.0 / 65535.0;
+float store_scale() { return TEN_BIT ? TEN_IN_SIXTEEN : 1.0; }
+
+// Ordered dither. Ten bits into eight is a two-bit reduction, so sixteen levels
+// of spread is more than the error can use. Off unless asked for: whether the
+// banding it removes is visible after the encoder has quantised again is a
+// question for a comparison, not for a guess.
+const float BAYER[16] = float[16](
+    0.0,  8.0,  2.0, 10.0,
+    12.0, 4.0, 14.0,  6.0,
+    3.0, 11.0,  1.0,  9.0,
+    15.0, 7.0, 13.0,  5.0
+);
+
+// One workgroup's contribution, combined here before it reaches memory
+// everyone shares. **Sixty-four invocations contending for one address in
+// shared memory is cheap; half a million contending for one in device memory
+// is not**, so the fold happens twice and only the second half is global.
+shared uint block_sum;
+shared uint block_xor;
+
+// The finaliser from a well-known 32-bit hash. Any change to any input bit
+// changes about half the output bits, which is what makes a sum and an
+// exclusive-or over the results sensitive to a single pixel.
+uint mix32(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
+// **Quantised, not the float.** The encoder reads the eight-bit value that
+// lands in the image, so two pictures that round to the same bytes are the
+// same picture and comparing the floats would call them different.
+uint quantise(float v) {
+    float max_value = top();
+    return uint(clamp(v * max_value + 0.5, 0.0, max_value));
+}
+
+float spread(ivec2 at) {
+    if (DITHER == 0u) {
+        return 0.0;
+    }
+    // Centred on zero and scaled to one step of the target, so it perturbs
+    // the rounding and nothing else. **At ten bits there is nothing to hide**:
+    // the reduction this exists for is gone, so the caller leaves it off and
+    // this stays here only because the step size has to follow the depth if it
+    // is ever asked for anyway.
+    return (BAYER[(at.y & 3) * 4 + (at.x & 3)] / 16.0 - 0.5) / top();
+}
+
+vec3 fetch(ivec2 at) {
+    // Clamped rather than wrapped. An odd width or height leaves one column or
+    // row whose partner is off the edge, and repeating the last pixel is the
+    // only choice that does not invent colour at the border.
+    return texelFetch(source, min(at, EXTENT - 1), 0).rgb;
+}
+
+float luma_of(vec3 colour) {
+    return KR * colour.r + KG * colour.g + KB * colour.b;
+}
+
+void store_luma(ivec2 at, vec3 colour) {
+    float y = luma_of(colour) * y_scale() + y_offset() + spread(at);
+    imageStore(luma, at, vec4(y * store_scale(), 0.0, 0.0, 0.0));
+}
+
+// The subsampled conversion: one invocation owns a 2x2 block, four luma
+// samples and the single chroma sample they share.
+void body_420() {
+    // **Zeroed by the group before anything adds to it**, and the barrier is
+    // what makes that ordering real rather than likely.
+    if (gl_LocalInvocationIndex == 0u) {
+        block_sum = 0u;
+        block_xor = 0u;
+    }
+    barrier();
+    // One invocation owns a 2x2 block: four luma samples and the single chroma
+    // sample they share.
+    ivec2 block = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 base = block * 2;
+    // **The early exit still has to reach the barriers below.** A workgroup on
+    // the edge has invocations outside the picture, and a barrier that only
+    // some of them arrive at is undefined; so this contributes nothing rather
+    // than returning.
+    bool inside = base.x < EXTENT.x && base.y < EXTENT.y;
+    if (inside) {
+
+    vec3 c00 = fetch(base + ivec2(0, 0));
+    vec3 c10 = fetch(base + ivec2(1, 0));
+    vec3 c01 = fetch(base + ivec2(0, 1));
+    vec3 c11 = fetch(base + ivec2(1, 1));
+
+    store_luma(base + ivec2(0, 0), c00);
+    store_luma(base + ivec2(1, 0), c10);
+    store_luma(base + ivec2(0, 1), c01);
+    store_luma(base + ivec2(1, 1), c11);
+
+    // **Average the four colours, then convert once.** The transform is linear
+    // in the source, so this is exactly equal to converting four times and
+    // averaging the results, at a quarter of the work. Writing subsampled
+    // chroma has no shortcut in the other direction: a decoder gets its
+    // upsample from the sampler for free, and this average is ours to compute.
+    vec3 mean = (c00 + c10 + c01 + c11) * 0.25;
+    float y = luma_of(mean);
+    float u = (mean.b - y) / (2.0 - 2.0 * KB);
+    float v = (mean.r - y) / (2.0 - 2.0 * KR);
+
+    // Blue difference first, which is the order the two-plane format names.
+    float cb = u * c_scale() + c_offset() + spread(block);
+    float cr = v * c_scale() + c_offset() + spread(block + ivec2(2, 0));
+    imageStore(chroma, block, vec4(cb * store_scale(), cr * store_scale(), 0.0, 0.0));
+
+    // **Position goes into the summary, so moving a pixel is a change.**
+    // Without it a picture and the same picture with two blocks exchanged
+    // reduce to the same value under a sum and an exclusive-or, both of
+    // which ignore order.
+    uint q00 = quantise(luma_of(c00) * y_scale() + y_offset());
+    uint q10 = quantise(luma_of(c10) * y_scale() + y_offset());
+    uint q01 = quantise(luma_of(c01) * y_scale() + y_offset());
+    uint q11 = quantise(luma_of(c11) * y_scale() + y_offset());
+
+    // **Four samples do not pack into a word at ten bits.** Forty bits do not
+    // fit in thirty-two, and shifting them by eight anyway makes neighbours
+    // overlap: the summary still moves when the picture moves, but changes
+    // begin cancelling each other and this is a change detector, so a
+    // collision is a frame that never gets sent. Two samples to a word and
+    // two words folded together holds ten bits exactly, and the eight-bit
+    // packing is left as it was so no shipped stream's suppression changes.
+    uint luma_bits;
+    uint colour;
+    if (TEN_BIT) {
+        luma_bits = mix32(q00 | (q10 << 16)) ^ mix32(q01 | (q11 << 16));
+        colour = quantise(cb) | (quantise(cr) << 16);
+    } else {
+        luma_bits = q00 | (q10 << 8) | (q01 << 16) | (q11 << 24);
+        colour = quantise(cb) | (quantise(cr) << 8);
+    }
+    uint position = mix32(uint(block.y) * 65536u + uint(block.x));
+    atomicAdd(block_sum, mix32(luma_bits ^ position));
+    atomicXor(block_xor, mix32(colour + position));
+    }
+
+    // Every invocation reaches this, inside the picture or not.
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        atomicAdd(digest.accumulated[0], block_sum);
+        atomicXor(digest.accumulated[1], block_xor);
+    }
+}
+
+// One colour plane at full resolution, written by the full-chroma entry
+// below.
+void store_cb(ivec2 at, float cb_sample) {
+    imageStore(chroma, at, vec4(cb_sample * store_scale(), 0.0, 0.0, 0.0));
+}
+
+void store_cr(ivec2 at, float cr_sample) {
+    imageStore(cr, at, vec4(cr_sample * store_scale(), 0.0, 0.0, 0.0));
+}
+
+// The same colour rules packed into one word per pixel, which is what the
+// open stack's 4:4:4 surfaces are: AYUV at eight bits, Y410 at ten. The
+// word is composed here rather than by a driver format, because the packed
+// ten-bit layouts cannot be written as storage images at all on the parts
+// seen here, and the byte orders differ between the two depths.
+//
+// **The orders are the ones the importer documents, not a choice.** AYUV is
+// alpha, luma, blue difference, red difference most significant byte first;
+// the ten-bit word the importer takes is X, red difference, luma, blue
+// difference at 2:10:10:10, least significant field first. Getting either
+// backwards still imports cleanly and decodes to a plausible wrong picture,
+// so the only honest check is the decoder comparison the gate runs.
+uint pack_ayuv(uint y, uint u, uint v) {
+    return (255u << 24) | (y << 16) | (u << 8) | v;
+}
+
+uint pack_y410(uint y, uint u, uint v) {
+    return (3u << 30) | (v << 20) | (y << 10) | u;
+}
+
+// Full-resolution chroma, packed: one word per pixel in the luma binding.
+//
+// **A body beside the other two, sharing their rules and summary.** What
+// differs from the planar full-chroma body is only the store: one packed
+// word instead of three planes, so the same corrections land in the same
+// place.
+void body_444_packed() {
+    if (gl_LocalInvocationIndex == 0u) {
+        block_sum = 0u;
+        block_xor = 0u;
+    }
+    barrier();
+
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = at.x < EXTENT.x && at.y < EXTENT.y;
+    if (inside) {
+        vec3 colour = fetch(at);
+        float luma = luma_of(colour);
+        float u = (colour.b - luma) / (2.0 - 2.0 * KB);
+        float v = (colour.r - luma) / (2.0 - 2.0 * KR);
+        float y = luma * y_scale() + y_offset();
+        float cb = u * c_scale() + c_offset() + spread(at);
+        float cr_value = v * c_scale() + c_offset() + spread(at + ivec2(2, 0));
+
+        uint qy = quantise(y);
+        uint qu = quantise(cb);
+        uint qv = quantise(cr_value);
+        // **A branch rather than a select**: one GL front end here refuses
+        // the ternary with calls in it, and a uniform branch costs nothing.
+        uint word;
+        if (TEN_BIT) {
+            word = pack_y410(qy, qu, qv);
+        } else {
+            word = pack_ayuv(qy, qu, qv);
+        }
+        imageStore(packed_plane, at, uvec4(word, 0u, 0u, 0u));
+
+        uint colour_bits = qu | (qv << 16);
+        uint position = mix32(uint(at.y) * 65536u + uint(at.x));
+        atomicAdd(block_sum, mix32(qy ^ position));
+        atomicXor(block_xor, mix32(colour_bits + position));
+    }
+
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        atomicAdd(digest.accumulated[0], block_sum);
+        atomicXor(digest.accumulated[1], block_xor);
+    }
+}
+
+// Full-resolution chroma: three planes, one sample each per pixel.
+//
+// **A body beside the subsampled one, not a copy of it.** The colour rules,
+// the ranges and the summary are shared with `body_420`, so a correction
+// lands in one place; what differs is the dispatch shape -- one invocation
+// per pixel rather than per 2x2 block -- and that nothing is averaged.
+void body_444() {
+    // **Zeroed by the group before anything adds to it**, exactly as the
+    // subsampled body does.
+    if (gl_LocalInvocationIndex == 0u) {
+        block_sum = 0u;
+        block_xor = 0u;
+    }
+    barrier();
+
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = at.x < EXTENT.x && at.y < EXTENT.y;
+    if (inside) {
+        vec3 colour = fetch(at);
+        store_luma(at, colour);
+
+        float y = luma_of(colour);
+        float u = (colour.b - y) / (2.0 - 2.0 * KB);
+        float v = (colour.r - y) / (2.0 - 2.0 * KR);
+        float cb = u * c_scale() + c_offset() + spread(at);
+        float cr_value = v * c_scale() + c_offset() + spread(at + ivec2(2, 0));
+        store_cb(at, cb);
+        store_cr(at, cr_value);
+
+        uint q = quantise(y * y_scale() + y_offset());
+        uint colour_bits = quantise(cb) | (quantise(cr_value) << 16);
+        uint position = mix32(uint(at.y) * 65536u + uint(at.x));
+        atomicAdd(block_sum, mix32(q ^ position));
+        atomicXor(block_xor, mix32(colour_bits + position));
+    }
+
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        atomicAdd(digest.accumulated[0], block_sum);
+        atomicXor(digest.accumulated[1], block_xor);
+    }
+}
+
+// **The interface names every stage's entry point main**, so one source file
+// carries every body and a compile-time define picks which one the wrapper
+// runs. The other bodies are then dead and a compiler strips them, which is
+// how several pipelines are built from one file without a copy of anything.
+#ifdef PACKED_444
+void main() { body_444_packed(); }
+#elif defined(MAIN_444)
+void main() { body_444(); }
+#else
+void main() { body_420(); }
+#endif

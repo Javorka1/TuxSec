@@ -1,0 +1,50 @@
+[package]
+name = "lowlat-portmap"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# A gateway on loopback that speaks all three protocols, for tests of the
+# crates above that keep a mapping. Test-only, never in a shipping build.
+fake = []
+
+[dependencies]
+# The mapper's sleep and its wake, and the log.
+lowlat-common.workspace = true
+# The one entropy source: a PCP mapping's nonce and the renewal's jitter.
+lowlat-crypto.workspace = true
+# The one HTTP exchange's response framing: the status line, the header block
+# and the size line of each chunk. A parser and nothing more -- no client, no
+# connection, no allocation of its own -- and already in the workspace's graph.
+httparse = "1.10"
+# The gateway's description and its control answers. Safe code only, document
+# type declarations refused and the node count bounded, so a description
+# cannot grow into more than its bytes.
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }
+
+# The interface a search leaves by, and the machine's name; on macOS the
+# routing table's answer for the gateway and the machine's identifier too.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc.workspace = true
+
+# The adapter walk that names the default gateway, the interface a search
+# leaves by, a connection a stop can cut short, and the machine's name and
+# identifier: the system's own declarations, as the IO shell uses them.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Registry",
+    "Win32_System_WindowsProgramming",
+] }
+
+[lints]
+workspace = true

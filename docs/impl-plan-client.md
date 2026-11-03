@@ -1,0 +1,1564 @@
+# Implementation plan: the client
+
+**Status:** locked 2026-09-15, interview of the same day; C5 re-planned in two halves
+2026-09-19 and its decode half built and gated the same day; C7, C8 and C9 added and closed
+2026-09-20 to 2026-09-22, each ahead of C6, which they changed the surface of; C10, the
+relay, planned, built and closed 2026-09-23; C5 closed 2026-09-24 at the desk against an
+established host, its last row and the drag remainder the same night. Phases C0 to C10 with verification gates; the design is [10-client.md](10-client.md) and the surface is [06 §3b](06-api.md).
+
+Conventions as [impl-plan.md](impl-plan.md): a gate is a command that passes or a peer that
+streams, one phase per commit, changelog entry before the checkbox. Phase numbers are `C`
+so references into the host plan keep resolving.
+
+## The gate that matters
+
+**Gate C: the demo, on the application toolkit it will ship with, streams from an
+established host it does not control.** Picture first; then input; then sound; then the rest.
+It is Gate A's mirror. Everything before it is unverified in the only way that counts, and it
+is passed **at every phase from C2 on** rather than once at the end: each phase adds a feature
+and re-runs the same ten minutes against the same host, so what ships after each phase is a
+client that connects to a real host with the features it has so far.
+
+Two peers serve it. **This host**, on the development machine, is the first: it is the
+strongest reference this project has for what a host does, it runs beside the client, and
+under the simulator it makes the whole session hermetic -- the test peer the host plan has
+listed as a prerequisite since Phase 0. **An established host** on the second machine is the
+one that counts.
+
+## Decisions taken at the interview
+
+Recorded once, here; the reasoning is in [10-client.md](10-client.md) and [00 D14](00-overview.md).
+
+- One library and one header, the client half beside the host half as a feature, with its own
+  handle type (`lowlat_client`) so a host call on a client handle does not compile. **Done
+  in C0.**
+- Pictures leave the library by **acquire and release**, at most two held, with an optional
+  fence on release; acquire is the poll. Planes or a device handle, the library saying which.
+- **Decoders: VA-API first, then NVDEC**, both loaded at runtime. No Vulkan Video decode.
+  **Software decode is deferred**, with its licence question attached; not in v1. *Decided
+  2026-09-21 as C8: the machine's own libavcodec, loaded only when it is an LGPL build.*
+- The library decodes sound to PCM and hands it out packet by packet; **the application owns
+  the audio device**, whose buffer is the playback window (*C4 moved the window there from
+  the library*). Input is encoded by the library from the application's events.
+- **Signaling stays out of the library** (D3). The demo speaks the signaling service itself
+  over the toolkit's WebSocket and JSON, in one file.
+- **One stream on channel 1, the native transport only.** No second stream, no browser pipe.
+
+## Phase C0 - The boundary in two halves (closed 2026-09-15)
+
+- [x] `lowlat-sdk` builds the shared object and the header; `lowlat-host` is the host beneath
+  it. Features `host` and `client`; the header's guards generated from them, opt-out;
+  `lowlat_features()`; the handle renamed `lowlat_host`. Minor 3.
+
+**Gate:** the ABI gate passes with both halves; `--no-default-features --features client`
+builds a library of the shared entry points alone; the gate's harness names a half-built
+object. *Passed 2026-09-15.*
+
+## Phase C1 - The client core, and a hermetic session (closed 2026-09-17)
+
+The connecting side of everything below the media, written against the core that already
+plays both roles.
+
+- [x] `lowlat-client`: the client session -- the offering side of connectivity (one socket,
+  the offer's credentials and certificate digest produced for the application, candidates
+  out as events, the answer's credentials in, the session keyed from the answer under either
+  cipher with a setting that asks for the legacy one), the session's receive half with the
+  video ring at 4000 fragments and an access-unit buffer sized from it (the ring bounds a
+  message at its depth times a fragment's body, about 4.8 MB; nothing larger can ever
+  complete, so the 16 MiB an established client allocates is room nothing fills), the
+  initialization of [01 §11.5](01-protocol.md) with fourteen keys, the diagnostics message,
+  opcode 13 for the two secondary streams (stream 0 declares through the initialization),
+  and the control vocabulary of [10 §7](10-client.md) as events.
+- [x] The **catch-up over arrived messages** ([10 §3](10-client.md)), on the receive thread,
+  which owns the ring: keyframe metadata found ahead is skipped to; nothing is ever skipped
+  over a gap; and nothing is skipped when no keyframe is ahead, so a slow reader against a
+  host without periodic keyframes decodes in order. Named regression tests for the last two.
+  The reader's lag -- messages behind, and how long there has been anything unconsumed -- is
+  a metric from here, because the deferred decisions are decided on it. The hermetic census
+  counts a picture the catch-up discarded as skipped, not lost.
+- [x] The **keyframe policy** ([10 §5](10-client.md)) as a state machine over a decoder
+  interface, with only a test fake behind it until C2: two triggers, no timer, no start-up
+  kick, one request per fault paired with the teardown. Named regression tests that a decoder
+  starved of a keyframe never fires a request, that a fault fires one immediately, and that a
+  burst of bad units after it fires no second one until a decoder exists again; also the
+  announced bit, the stale generation, the rebuild bit and the format-change re-feed.
+- [x] The C ABI: `lowlat_client_create/destroy`, the four-call seam mirrored, events, status,
+  user data out. The seam's types leave the host's guard for one both halves share; the
+  client half of the header behind `LOWLAT_CLIENT`. Minor 4. Pictures, sound, input, the
+  video configuration and the metrics panel arrive with their phases.
+- [x] **A hermetic full session under the simulator**: this host's own framing and
+  negotiation against this client's driver, fake clock, scripted loss, reorder and
+  duplication, sound and a synthetic picture from the host, the client reporting what it
+  received. The picture is not decoded here -- there is no decoder yet -- so the check is on
+  access units: every one the host sent arrives whole, in order, keyframes where the host
+  said. And the real threads against this host's own admission over loopback, under both
+  ciphers.
+
+**Gate:**
+
+1. The workspace tests, the lints, the dependency policy and the ABI gate pass; the zero
+   allocation checks on the native transport still read zero, from the client's side too.
+   *Passed 2026-09-17.*
+2. The hermetic session runs clean at zero loss, one percent loss, and five milliseconds of
+   reorder, and the client's control census matches the host's message for message. *Passed
+   2026-09-17, thirty simulated seconds each; the lossy two also at three hundred.*
+3. `lowlat_features()` reports both halves; the header compiles alone with `LOWLAT_NO_HOST`
+   and with `LOWLAT_NO_CLIENT`. *Passed 2026-09-17.*
+
+## Phase C2 - A picture from a real host (closed 2026-09-17)
+
+- [x] `lowlat-decode`: the decoder trait and the **VA-API backend**, and beneath it **the
+  library's own reading of both bitstreams** -- the device interfaces here decode a picture
+  from its parameters and its slices, so the parameter sets, the slice headers, the picture
+  order, the reference lists and the picture buffer that holds them are the library's job,
+  in full syntax for H.264 (fields and MBAFF, B slices, reference-list modification,
+  weighted prediction, the marking process with long-term references, gaps in the frame
+  count) and HEVC (short- and long-term reference sets, dependent slices, tiles and
+  wavefront entry points, the leading pictures dropped after a stream-starting random
+  access point); eight and ten bit; planes by read-back. The driver's interface is loaded at
+  runtime through `lowlat-drivers`, one crate for every interface reached that way, shared
+  with the encoders. Every committed clip -- three from this host's synthetic source and
+  fifteen from two other encoders at 128 and 256 square, B pyramids, MBAFF, CAVLC, slices,
+  scaling lists, ten bit -- decodes bit-exact against an independent decoder's per-picture
+  checksums; both readers are fuzzed, with two crash inputs kept as regression tests.
+- [x] The **frame queue** of [10 §4](10-client.md): four slots, latest wins, the producer
+  steals the oldest ready slot and never a held one, `acquire_frame` / `release_frame` with
+  the two-held rule and the fence (planes only in this minor, so the fence is null-only).
+  The slots are sized at the configuration's ceiling and backed on the decode thread at the
+  first picture, demand-zero; each picture is laid out at its own pitch. The ring is model
+  checked; named regression tests: the producer never blocks without a consumer; a held
+  slot is never overwritten; a third acquire is refused; a held slot keeps its layout.
+- [x] The decoder built from the stream ([10 §5](10-client.md)) on **the decode thread**,
+  which takes access units from the receive thread's pool, runs the policy of C1 over the
+  real backend, publishes pictures into the queue, and carries the one keyframe request to
+  the session thread. The decoder is opened at creation, so a machine without one is refused
+  there with the stage named; a client with nowhere to draw may ask for none.
+- [x] **`examples/client`**: the C demo on the toolkit, one file for signaling, one for the
+  session; window, present, nothing else, and a line of figures a second. It logs in with
+  the same tool the host uses. (*2026-10-13*: C++20 now, a file per part, each holding its
+  own state.)
+
+**Gate:**
+
+1. **The demo shows this host's desktop**, on this machine, through VA-API on the second card,
+   at the display's rate for ten minutes; decode time and queue depth on the log, and the
+   presentation cadence recorded as numbers rather than judged: repeats and skips per second
+   between consecutive presents with the stream at the display's rate, above it and below
+   it, and the lag the picture reaches with the decoder slowed to half the stream's rate
+   under the simulator ([10 §4.1](10-client.md)). The deferred decisions below wait on them.
+   *Passed 2026-09-17, on the open-stack decoder of the second card, 1080p H.264 at 120
+   pictures a second, the desktop moving independently of the demo's own window: ten
+   minutes at the display's rate with 120.6 pictures decoded a second, decode 2.0 ms at the
+   median and 2.3 at the ninety-fifth percentile, read-back 2.0 and 2.2, the queue at one,
+   the reader at most one message behind (8 ms at the ninety-fifth percentile, 25 at most),
+   6.2 Mbit/s, 208 MB resident, one decoder build and no keyframe request. Cadence, per
+   second between consecutive presents: at the display's rate 118 new pictures, 3 repeats
+   and 3 skips at the median (11 and 11 at the ninety-fifth percentile) -- the beat of two
+   unsynchronised clocks; with the stream below the display's rate (60 against 120) 60
+   pictures, 60 repeats, no skips; with the stream above the presentation rate (120 against
+   a 60-a-second poll) 60 pictures, 60 skips, no repeats. The half-rate lag under the
+   simulator: 159 messages at the deepest, 611 pictures discarded by the catch-up over 1317
+   frames at a keyframe every 300.*
+2. **The demo shows an established host's desktop** on the second machine for ten minutes from
+   a cold connect, with the initialization and the per-stream declaration accepted as the
+   established client's are, and a clean departure read as such on both sides.
+   *Passed 2026-09-17: ten minutes from a cold connect to an established host on the second
+   machine, over the wide area under the current cipher, the initialization accepted with
+   the video protocol honoured (the host's own log reads the guest as connected with
+   `vp_supported = 1` and the encoder built for it), one decoder build over the ten minutes,
+   the host's encode time read at 3.7 ms, 30 pictures a second from a mostly still desktop,
+   and the departure read as a clean disconnect on both logs. The process map during the
+   run held 89 libraries and no copyleft codec. The first offer was refused outright: an
+   established host requires the offer's `mode` ([04 §4](04-signaling.md)).*
+3. A keyframe with unchanged parameter sets from a host that marks it does not rebuild the
+   decoder; from a host that does not, it does, and the picture continues. *Passed
+   2026-09-17: one build over the ten minutes of item 1, this host marking every keyframe;
+   the other half hermetically, this host's own framing with the marking off against the
+   real decoder -- a rebuild per keyframe, 477 pictures across four of them, every one the
+   reference decoder's.*
+4. The hermetic session of C1 now decodes: the picture out matches the synthetic picture in,
+   frame for frame, at zero loss. *Passed 2026-09-17: 477 pictures, three loops of the clip
+   with two announced keyframes, every picture the reference decoder's, one decoder build.*
+
+## Phase C3 - Input (closed 2026-09-18)
+
+**Planned 2026-09-18, interview of the same day.** The decisions are recorded once, here;
+the rules are [10 §8](10-client.md).
+
+- [x] `lowlat_client_set_viewport(x, y, w, h)`: the rectangle the application drew the
+  picture into, in the same units as the positions it reports. The library never computes a
+  fit: stretch, shrink, a percent scale and rotation are all the application's ways of
+  producing one rectangle, and DPI does not enter because the rectangle and the positions
+  share a space by construction. A zero rectangle means no picture area, and absolute motion
+  is not sent until one is set; the picture's size comes from the stream's own header, so
+  the two ends of the ratio come from different owners and the application cannot describe
+  the picture wrongly.
+- [x] The `lowlat_client_send_*` calls, one per kind (*a tagged structure until C3.5, split so a call site is checked where it is written*), and the rules of [10 §8](10-client.md): the transform into
+  the picture's pixels with the edge bump and the clamp, the rotation swapped back, relative
+  deltas scaled by the picture-to-drawn ratio (*corrected 2026-09-24, C5: deltas go as the
+  device reported them*), the press-outside guard evaluated at the
+  press's own position, the keyboard code guard, pad state deduplicated per identifier,
+  release-all on the application's word. Keyboard codes are usage codes and the modifier
+  mask is the event's own, in the wire's bit numbering (`LOWLAT_MOD_*`); the application
+  supplies both, because only its toolkit knows the lock state. The path from the handle to
+  the session thread is a fixed ring of 1024 entries; a full ring drops the newest message
+  and counts it in status, and never blocks the application's thread. Every push wakes the
+  loop: a wake only when the ring was empty loses the one that lands between the consumer's
+  last pop and its sleep. Minor 6.
+- [x] The relative-mode event on the cursor message's transition (either the relative or
+  the hidden bit), carrying the position to warp to on the way out, in window coordinates
+  through the inverse of the same viewport mapping. The cursor body is read for that alone
+  here; the image, the hotspot and the suppressed flag are C5's.
+- [x] The demo takes keyboard, mouse and pad from the toolkit and sends them: the key table
+  generated from the toolkit's own map crossed with the kernel's usage table (two
+  directions, so a disagreement shows); a bare GUI key is dropped, as a chord modifier it
+  is sent; repeats are forwarded as presses; both attached pads as the standard state,
+  unplug on removal. Ctrl+Alt chords are the demo's own (*Ctrl+Shift since 2026-09-21, with a
+  keyboard grab and a fullscreen toggle beside them*): stretch or shrink (the rectangle
+  re-sent), letting go of the pointer, and cycling the streamed output through the
+  application protocol -- ids 10 and 9 asked, the answers 12 and 11 read from the user-data
+  events, 11 sent back with the next `output` in the host's own configuration, whole, as a
+  host reads it. **Presenting is on a thread of its own, paced by the display; the
+  toolkit's event loop runs at its own cadence** (*added at the gate*): the toolkit reads
+  one pad event per pass of its loop, so a loop bound to the display's rate drained a
+  moving stick slower than it moved and the kernel's queue played on for seconds after the
+  hand stopped. The shape every established client has, and the shape sound will take.
+- [x] Relative mode in the demo: confine and hide on the event, warp on the way out if
+  focused.
+
+**Gate:**
+
+1. Against an established host with two monitors, one of them streamed: typing lands, the
+   pointer lands where it is aimed on whichever output is streamed, switched from the demo
+   both ways; a drag that leaves the window releases on the host; each of the two attached
+   pads drives a game; mouselook works through relative mode. *Passed 2026-09-18, the
+   Windows host on the second machine over the wide area (8 ms round trip): typing, aiming
+   on both outputs through the chord (`803140-2315383105` and `803140-4239277026`, each way
+   twice), aiming stretched and at the picture's own size, the drag out of the window, both
+   pads in a game, and mouselook entered and left seven times in the first run -- the host
+   captures the pointer for a window drag too, which the toolkit reports as relative motion.
+   The first pad run found the event-loop cadence above: the sticks lagged and drained for
+   seconds; with presenting on its own thread the toolkit delivered up to 610 pad reports
+   a second and none were late. The stick's vertical sign is the wire's up-is-positive, read
+   live: a stick pushed down arrived from the toolkit as +32767 and left as -32767.*
+   *Corrected 2026-09-19, at C5's second half: that trace was read backwards. The toolkit
+   already hands every stick over up-positive, so the demo's negation put down-positive on
+   the wire and a game on the established host looked the wrong way up; the values pass
+   through now, as every established client passes them.*
+2. Against this host: the host's own input log agrees with the demo's, message for message,
+   for one minute of mixed input; the census shows every opcode the established client sends
+   and nothing it does not. *Passed 2026-09-18, sixty seconds of scripted keys, clicks, wheel,
+   motion and a drag out of the window: keys 321 = 321, buttons 150 = 150, wheel 30 = 30,
+   pad states 56 handed over and 55 received (one unchanged state not repeated), and motion
+   340 handed over against 150 received, the 190 being the second before the first picture,
+   when the rule drops absolute motion -- from the first picture on the two lines agree
+   second by second. The host's census: init, diagnostics, the encoder configuration, then
+   keyboard, mouse button, wheel, motion, gamepad state and release, and nothing else.*
+
+**Not in C3, recorded here so it is not re-decided:** the DualSense pair -- touchpad
+contacts, motion, lightbar, adaptive triggers and haptics -- is its own phase after C5 on
+both plans, host `uhid` backend first, and the touchpad already has a wire the client will
+have to learn there; a Unicode key message for an input method needs a host half that is
+not a key injection, and is owed with it; pen and touch stay deferred. *Planned 2026-09-20
+as C7 below with the host's Phase 14; the wire turned out to be whole, and the client half
+goes first.*
+
+## Phase C4 - Sound (closed 2026-09-18)
+
+**Planned 2026-09-18, interview of the same day.** The decisions are recorded once, here;
+the rules are [10 §6](10-client.md).
+
+- [x] **The library orders and decodes; the device paces.** No playback window in the
+  library (*an earlier draft had one, with a 40 ms cap and a flush at either edge*): every
+  reference keeps the window in the application's device, where the clock is, and a second
+  window over it would only flush against it. The receive loop stamps each packet and parks
+  it in a pool of 32; a full pool drops the newest and counts it. **Decode on acquire, no
+  sound thread**: `lowlat_client_acquire_audio` takes the next packet in order and decodes it
+  on the caller's thread into the caller's buffer -- one packet a call, stereo at 48 kHz, up
+  to 8000 frames (the uncompressed ceiling; the 40 ms figure was one client build's slot),
+  the need reported and the packet kept when the buffer is short, the packet's age at
+  hand-over in status. The decoder is the one the host reads a microphone through,
+  generalised over channels and capacity, contained and rebuilt after a caught panic, fuzzed
+  with a stereo decoder beside the mono one (the target's own panic hook had aborted before
+  unwinding, so it had never run); a stream that is not stereo at the protocol's rate is
+  refused per packet; a change of mask, codec or channel count rebuilds. Minor 7.
+- [x] The demo plays it through the toolkit's device at the desktop client's window, 75 ms
+  to 150, from a listening thread beside the presenter; a resync is read from the device's
+  own queue and logged the moment it is seen; the second's line carries the packets, the
+  device's queue, the packet age, the pool's drops and the decoder's refusals; a knob traces
+  every packet, another asks for uncompressed. Against a host on the same machine the demo
+  plays into a sink the host does not capture, or it echoes.
+- [x] The microphone the other way is **deferred**: the enable and the uplink are known, the
+  capture device is the application's, and nothing in v1 needs it. *Built 2026-10-12 as C5.25,
+  minor 25 ([10 §6](10-client.md)): mono samples in, ten-millisecond frames cut by the library,
+  uncompressed or compressed as the declaration says, the host's answer read as an event.*
+
+**Gate:**
+
+1. Thirty minutes of sound from an established host with no audible gap and at most one
+   resync, then the same from this host. *The resync figure is read from the run, not
+   picked: the demo logs the device's queue every second and its slope is the drift; the
+   desktop window drifts 75 ms to an edge, which is 25 minutes at 50 ppm and 12.5 at 100,
+   so if the crystals give two the gate's number follows the crystals.* *Passed 2026-09-18
+   against the Windows host on the second machine: eighty-five minutes with sound playing
+   there, 254,178 packets at 50 a second, none dropped by the pool and none refused by the
+   decoder, one decoder build, the packet's age between the wire and the call 0 ms at the
+   median and 1 at most, the round trip 7 to 9 ms. The device's queue climbed at 39.3, 39.6
+   and 40.3 ppm in the three stretches between flushes -- the two clocks' difference, read
+   from the run -- and crossed the ceiling twice, at 1823 s and 3930 s: one resync per 35
+   minutes, at most one in any thirty, both of them the speaker's clock running behind the
+   host's. The first eleven seconds carried a seven-second hole in the host's own sound at
+   the session's start, which ran the device dry once; that is the host starting, not
+   drift. The run also found the demo counting one flush three times (the device's queue
+   reads zero once more after playback restarts), fixed after it. From this host, thirty
+   minutes the same day: 89,941 packets, none dropped or refused, the age 0 to 1 ms, one
+   build, and one resync at 1710 s -- the device running dry. But that figure is the rig's,
+   not the clocks': the demo on the same machine as the host has to play into a sink the
+   host does not capture, so its device was a null sink on a software timer while the host
+   read the sound card, and the queue wandered by fifteen milliseconds either way before it
+   emptied. The run passes the gate's letter and measures nothing about drift; the
+   established host's run is the one that does.*
+2. The hermetic session carries sound both codecs and the samples out match the samples in
+   (*"both ways" was the wording; the uplink is deferred in the same phase*). *Passed
+   2026-09-18: the harness host encodes a real stereo tone at 20 ms and sends it
+   uncompressed in a second configuration; every packet acquired, none dropped or refused,
+   at zero loss, one percent loss and five milliseconds of reorder over thirty simulated
+   seconds; uncompressed sound equal sample for sample across the run (three hundred seconds
+   too), compressed sound at each channel's level over the last second. A smoke run against
+   this host: 50 packets a second, the age between the wire and the call 0 to 1 ms, the
+   device's queue 56 to 76 ms, no drop, refusal or resync in twenty-five seconds.*
+
+## Phase C5 - The rest of the client, and NVDEC (closed 2026-09-24)
+
+**Planned 2026-09-19, interview of the same day, in two halves.** The decode half is planned
+here and **built and gated the same day**, with two rows left open on the host's side; the
+second half was planned the same evening, at its own interview, once the first had closed.
+The decisions are recorded once, here; the rules are [10 §4](10-client.md), §5.1, §7 and §9.
+
+### C5, first half: the decode time reported, the second backend, ten-bit and 4:4:4
+
+- [x] **Opcode 21 out**, both kinds, on one two-second tick of the session thread from the
+  moment the session is established: the video kind with the decode thread's smoothed figure
+  for decode and hand-over per picture, the sound kind with the figure `acquire_audio`
+  smooths on the application's thread, both zero until something has been timed and sent
+  anyway, as this host sends its own. A time cadence rather than a count of pictures, so a
+  still desktop still reports; the same message is what keeps the round-trip estimate
+  alive, because a sample is taken only when the host acknowledges something this client
+  sent.
+- [x] **The declaration is a preference masked by capability.** The application names what it
+  would like -- the second codec, ten-bit colour, full chroma -- in the video block of the
+  attempt's configuration, one block for the one stream; the library ANDs that with what the
+  decoder it opened at creation decodes and declares the result, with the wire's own
+  implication (depth and chroma imply the second codec, and neither is declared without it).
+  Defaults off, so a client of ours at its defaults asks a host for exactly what every
+  established client asks at its defaults. `lowlat_client_set_video_config` changes it
+  mid-session: the new flags go out as the encoder configuration with the reinitialisation
+  argument and the decoder is torn down with it -- the first of the two request cases of
+  [10 §5](10-client.md), which the state machine has had since C1. Status carries what was
+  asked, what was declared and what the stream turned out to be. **One decoder is chosen at
+  creation and there is no fallback to another**: a stream the built decoder cannot take,
+  which can only be one the client did not declare, ends the session with the decoder's
+  status and the stage named, never a quiet switch to a slower path. Minor 8.
+- [x] **Full chroma in the readers and three planes out.** The HEVC reader admits the
+  range-extensions profile at 4:2:0 and 4:4:4, eight and ten bits, and reads both extension
+  syntaxes, which the devices' picture parameters carry; H.264 stays at eight-bit 4:2:0,
+  which is all any device decodes. Two planar layouts join the two that exist, with the
+  third plane already in the picture's shape; the slots' ceiling layout becomes the deepest
+  of the four. On the open-stack backend the profile is asked for and refused where the
+  device lacks it -- every device here -- so no read-back is written for a surface layout
+  nothing here can verify. The clips: two from this host's synthetic source through its
+  vendor encoder at 4:4:4, eight and ten bits, and three from an independent encoder at 128
+  square with the extension syntax exercised, each checked against the independent decoder's
+  per-picture sums as every clip is.
+- [x] **NVDEC, driven from the library's own readers.** The second backend fills the vendor
+  interface's picture and slice parameters from the same jobs the open-stack backend stages
+  and submits a picture at a time; nothing in the interface's own parser is used, so there
+  is one reader, one picture buffer and one reordering rule for both backends. Read-back is
+  a device-to-host copy of the mapped picture. **The creation-time probe builds and destroys
+  a real decoder per combination of codec, chroma and depth** rather than trusting the
+  interface's capability query, which has reported a combination the device then failed to
+  create; a device that fails does so at creation with the stage named, not mid-stream in
+  the application's process. The device is named as a render node for both backends; for
+  the vendor's it is resolved to the card behind it. Automatic selection takes the first
+  node the open stack decodes on and the vendor interface only where there is none, so the
+  vendor backend is chosen by index where both exist.
+- [x] **The handle path, on NVDEC first.** A decoded picture on that interface is not
+  exportable -- its pool is internal and a mapped picture is a transient pointer -- so the
+  four slots become exportable device allocations, one file descriptor each, and the backend
+  does one device-side copy into the slot in place of the host read-back; the ring, the
+  latest-wins rule and the two-held rule are unchanged. The frame carries the descriptor and
+  its kind (an opaque descriptor now; a buffer descriptor with its layout modifier is the
+  open stack's kind and is later), with an offset and pitch per plane; acquire returns after
+  the copy has completed, so a null fence stays correct and a real fence is a refinement.
+  **Device slots are sized at the stream's size at the decoder's build, never at the
+  ceiling**: device memory is real, and full chroma at sixteen bits is 200 MB a slot at the
+  ceiling; a build at a new size or layout allocates a fresh set with fresh descriptors, the
+  descriptor keys the application's import, and the old set is freed after its last hold is
+  released. A spike precedes the wiring: a descriptor exported from the device runtime and
+  imported by the application toolkit's GL context on this machine; if the import is
+  refused, the handle kind is not viable on that renderer and the phase falls back to planes
+  with the finding recorded.
+- [x] **The application toolkit becomes a vendored tree** rather than a submodule, so its GL
+  renderer's existing hardware-frame hook can be implemented for the descriptor: imported
+  once per slot, one texture per plane, sampled through the shaders it already has for the
+  planar layouts. The demo asks for the handle kind with a knob, draws through the hook,
+  releases after present, and reports the hand-over time per picture beside the decode time.
+- [x] The demo takes the three preferences at start and cycles them live through a chord,
+  shows asked / declared / decoded in its title bar and its second's line, and draws the
+  warning of [10 §4.1](10-client.md) when the reader has been thirty or more messages behind
+  for sixty consecutive seconds.
+
+**Decided here, and not built (recorded 2026-09-16 as deferred, decided 2026-09-19):** the
+decode-lag keyframe request, the presentation-rate hint with its sustainability event, and
+the application pacer are **none of them in v1**. Every established client's whole remedy for
+a decoder slower than the stream is a warning to the person, gated on the reader being thirty
+or more messages behind for sixty consecutive samples and cleared the moment it drops under;
+status already carries the figure, so the warning is the application's and the library adds
+no mechanism. The gate below records the decode and hand-over time per backend and format at
+the display's rate and the reader's lag, which is the record if this is ever reopened.
+
+**Built 2026-09-19, deviations from the text above:** no 4:4:4 clip could be made from this
+host's synthetic source (it is two-plane and the vendor encoder refuses to upload it to a
+full-chroma session), so four full-chroma clips from two independent encoders stand in, and
+the independent encoder's clips are 144 square rather than 128 because that is the vendor
+decoder's floor. Device slots are allocated per slot as a picture of a new layout is about to
+be decoded into it rather than as a set at the build, which frees each old allocation after
+its last hold by the ring's own rule; and the frame carries the allocation's ordinal beside
+the descriptor, because descriptor numbers are reused once closed and the ordinal is what
+keys the application's import. The decoders this machine can open are also listed
+(`lowlat_enum_decoders`, [06 §6](06-api.md)), asked for during the build. **Figures so far**
+(this host, 2560x1440, 120 pictures a second): vendor backend decode 0.6 ms, read-back
+0.5-0.9 ms, device copy 0.09 ms; open stack 2.1 and 2.0 ms; the renderer's fill from the
+imported descriptor 0.05 ms for two planes; the read-back's jitter showed as five repeats
+and five skips in some seconds on the vendor backend's planes path and none on the handle
+path.
+
+**Gate, first half:**
+
+1. [x] Every committed clip decodes bit-exact on both backends, the new 4:4:4 clips included;
+   the workspace's checks and the ABI gate pass; the hermetic session's census counts the
+   client's latency reports, both kinds, at the cadence. (*2026-09-19*: twenty-one clips on
+   each backend, the vendor's by both routes.)
+2. [x] Against this host, ten minutes each with the desktop moving independently of the demo:
+   H.264 on the vendor backend, planes then handle; ten-bit HEVC on both backends; full
+   chroma at eight and ten bits on the vendor backend, planes then handle; and full chroma
+   asked of this host on the head that cannot code it, where the stream degrades and the
+   client follows without a decoder fault. Recorded per run: decode and hand-over per
+   picture, pictures, repeats and skips a second, the reader's lag, the resident set and the
+   device memory, and the reported decode time as this host's roster shows it.
+   (*2026-09-19*, `local/logs/2026-09-19-c5-gate2-*`, three ten-minute runs with the
+   preferences walked every hundred seconds, 2560x1440: vendor handle 120 pictures a
+   second, decode 0.61-0.75 ms, device copy 0.09-0.14 ms, resident 400-507 MB; vendor
+   planes read-back 0.53-1.05 ms; open stack decode 2.0/3.4 ms, read-back 1.8-2.4 ms; the
+   reader at most one message behind everywhere; sound 50 packets a second, nothing
+   dropped. Full chroma asked degraded to eight-bit HEVC and the client followed -- on the
+   vendor's head by this host's census rather than on the other head, the same client path.
+   **Real full chroma was not streamed**: it needs this host started by hand with the census
+   opened. Twice this host's service answered a ten-bit reconfigure with -15000 and stayed
+   down until restarted; diagnosed and fixed the same day on the host's side -- the runtime
+   libraries were unloaded per build and the C library's static thread-local area ran out
+   ([07 §8](07-platforms.md)) -- and the walk then ran forty switches without it. The gate
+   also found the toolkit's renderer freezing the picture after a switch to ten bits, fixed
+   in the vendored tree. The full-chroma row stays open on the host. *2026-09-24*: an
+   established host that sends full chroma when asked streamed it at both depths to the
+   vendor backend by handle, briefly, at the desk (the range item of the second half), and
+   by planes for a hundred seconds at each depth in the second half's ten-minute walk.
+   *Later the same day*, with that host playing a looping video and its sound, the handle
+   route at full chroma for ten minutes at each depth, which closes the row
+   (`local/logs/2026-09-24-c5-handle444-may085-*`): at eight bits 14,425 pictures, the
+   video's 24 a second, decode 0.88 ms at the median and 1.7 at most, the device copy 0.10 ms
+   and 0.23 at most; at ten bits 14,324 pictures, decode 0.91 ms and 1.5 at most, the device
+   copy 0.15 ms and 0.31 at most. Each the full-chroma format throughout from one decoder
+   build, the full range, the reader at most one message behind, no skip, a clean leave;
+   nothing late at eight bits, and at ten one burst of 13 late arrivals in one second that
+   cost no picture.)
+3. [x] Against an established host: at the defaults as C2's gate ran, then with the second codec
+   and ten-bit asked, following what its encoder gives; the round trip moves off its seed
+   within seconds of connecting; its own log shows this client's decode latency.
+   (*2026-09-19*, `local/logs/2026-09-19-c5-gate3-*`, over the internet at 8-11 ms: at the
+   defaults 31 pictures a second (that host's own cadence on a still desktop), the open
+   stack at 2.3/1.9 ms, the reader at most one message behind, the round trip live from the
+   first second; with the second codec and ten-bit asked that host gives the codec and not
+   the depth, and the client follows at eight bits with no fault, by planes and by handle;
+   a walk of five switches against it, each followed by its encoder rebuilding. One run
+   ended after 160 s as undeliverable when that host's path went quiet and its port
+   changed; the rerun completed. What its log shows is read at that machine.)
+4. [x] A preference changed mid-session costs one configuration message, one teardown and one
+   build, and the picture continues. (Hermetically: one restatement, one request, one
+   teardown, one build. *Live 2026-09-19*: twenty timed switches across four runs, every one
+   answered, the picture back within the second -- about forty repeats, the keyframe asked
+   for -- and the stream's format following the declaration each time.)
+
+### C5, second half: the cursor, rumble, the guest list, the client's metrics
+
+**Planned 2026-09-19, evening, interview of the same day.** The decisions are recorded once,
+here; the rules are [10 §7](10-client.md) and §9, the surface [06 §3b](06-api.md).
+
+- [x] **The cursor, decoded.** The pointer message's picture is inflated and unfiltered in
+  the library and handed to the application as RGBA at its native size, with the hotspot
+  in the picture's own pixels, the suppressed flag, and the position the pointer reappears
+  at on the way out of relative mode, in window units. **The picture is delivered from a
+  buffer the handle owns, valid until the next poll** -- not through the caller's body
+  buffer, which would make every application size its scratch at the picture ceiling or
+  drop the cursor when it does not, as the demo did on a body too large. The library keeps
+  the cache its initialization declares: pictures by checksum, a hundred of them, forgotten
+  when the host says so; a name the cache does not hold delivers the position and the flags
+  without a picture, and counts; a name that carries no size takes the picture's size and
+  hotspot from what was stored with it. The reader takes 8-bit RGB and RGBA,
+  non-interlaced, up to 512 square -- 1 MiB decoded, the same ceiling an established
+  client's buffer has -- and refuses anything else with the picture dropped and the rest of
+  the update delivered; it is fuzzed, and the committed pictures decode byte for byte
+  against an independent decoder's output. **Scaling the pointer is the application's.** An
+  established client scales it by the viewport it drew into, or by its display's scale, so
+  a pointer from a host at twice the scale shows at the size it has in the picture and
+  shrinks with a letterboxed window; the library does not own the toolkit's cursor, and a
+  display server draws a cursor at its native size, so the library hands over the picture
+  and the application resamples picture and hotspot together (*an earlier draft had the
+  hotspot "scaled into the window" by the library, which scales nothing*).
+- [x] **Rumble** as an event: the pad the application named and the two motors as eight-bit
+  values; the application scales them to its toolkit's range.
+- [x] **The guest list is handed over, not parsed.** The library needs nothing from its
+  body: its own number arrives beside it and goes into status, permissions gate nothing on
+  this side because the host drops what it does not permit, and the figures in it are the
+  application's panel. So it is an event carrying the recipient's number, with the body
+  through the caller's buffer as an application message goes; the application finds itself
+  by that number and drops a body it cannot read (*an earlier draft had the library parse it
+  for the client's own permissions*).
+- [x] **The client's own metrics**, in a shape of their own: per channel the fragments that
+  arrived, those that arrived late -- behind a later one, which on this transport is a
+  retransmission or a reorder -- duplicates, out-of-window drops, the negative
+  acknowledgements sent, bytes and messages, and **a recent-loss figure**, late arrivals
+  over arrivals per one-second sample averaged with a thirtieth's weight so it reads over
+  about thirty seconds; per session the round trip and the connected time. The host's own
+  figures for this guest reach the application through the guest list, so one panel's two
+  sides are the host's `lowlat_metrics` and the client's `lowlat_client_metrics`, each
+  measured where it can be (*an earlier draft put the client's figures on the host's
+  structure, half of whose fields a receiver cannot measure*). Minor 9.
+- [x] User data both ways, host mode, stream ended and blocked were built with the session
+  (minor 4) and stay as they are.
+- [x] The demo sets the toolkit's cursor from the picture, resampled with its hotspot by the
+  drawn ratio; hides its pointer while the host's is suppressed; rumbles the pad the host
+  named; parses the guest list with its toolkit, shows owner and permissions in the title
+  and draws the host's figures for this guest on its line beside its own.
+- [x] **The picture's range, from the stream** (*found at the desk 2026-09-24*, minor 15). An
+  established host sent the full range -- declared in its parameter set, luma 0 to 255 in its
+  samples -- and every picture was handed out as if in the video range, so the demo drew it
+  darker, its blacks crushed and its contrast raised. The readers keep the parameter set's
+  range flag, the software backend asks the codec library (the full-range twin of a layout,
+  or the decoder's range, resolved by name), and `lowlat_frame.full_range` carries it; the
+  frame is filled as far as the caller's size reaches, so a caller built against minor 14
+  still acquires. The demo hands it to the toolkit's conversion and shows `full` in its
+  title. Three full-range clips (eight-bit H.264 and HEVC, ten-bit HEVC) join the fixtures;
+  the readers' test and every backend's fixture run check each picture's range, and each
+  check was shown failing with its mechanism taken out.
+- [x] **A relative delta goes as the device reported it** (*found at the desk 2026-09-24*).
+  A window dragged on the established host, which captures the pointer for the drag, moved
+  slower than the hand: the library scaled every delta by the picture's size against the
+  drawn rectangle, 0.75 for that host's 1920x1080 stretched into a 2560x1440 window. An
+  established client scales only motion its toolkit made up from a device that reports
+  positions; a mouse's counts go as they are. The mapper passes deltas through, its test
+  checks a picture drawn at half and at twice its size and before any mapping, and fails
+  with the scaling put back. The person at the desk: as fast as the established client.
+- [x] **The demo draws a picture the moment it arrives** (*found at the desk 2026-09-24*).
+  Beside an established client on one host, a dragged window trailed by 15 to 30 pixels in
+  screen captures: the present loop showed the picture on screen again every refresh and
+  looked for a new one only after that present returned, so a picture arriving mid-refresh
+  reached the screen a refresh late. The loop now waits in acquire (up to 20 ms) and presents
+  a picture as soon as it has one, the one on screen again only when the wait brought
+  nothing; `LOWLAT_VSYNC=0` presents without waiting for the refresh, as that client does;
+  `LOWLAT_GFX=vk` draws planes through Vulkan, which paced no better than GL here; the
+  second's line carries the wait from a picture in hand to its present and how many
+  refreshes each picture stayed up. After: level with that client, but for a few pixels in
+  about one capture in twenty, during mouse-driven drags only.
+- [x] **Every picture says when it arrived** (*2026-09-24*, minor 16), to measure that
+  remainder rather than argue about it. The session thread stamps each message with the pass
+  that completed it, the stamp rides the unit and the picture, and `lowlat_frame.arrived_us`
+  hands it out on the monotonic clock an application reads; the demo prints, a second at a
+  time, a new picture's time from arrival to its acquire and to its present returning, and
+  with `LOWLAT_LATENCY_TRACE` a line per picture with the motion it had sent so far. The
+  hermetic session checks that a unit taken on the pass that completed it has no age and one
+  held back has the time it waited, and the stamp's wrap has its own test; each was shown
+  failing with its mechanism taken out. Beside the established client, the person at the desk
+  dragging windows through both, presents not waiting for the refresh
+  (`local/logs/2026-09-24-lag-may085-*`): from arrival to the present returning, 1.32 ms at
+  the median and 2.31 at the 99th percentile by planes over 21,705 pictures, 0.67 and 1.37 by
+  handle over 11,077; the library's share outside the decode and the copy about 40 us;
+  pictures with this client's own motion in flight the same as the rest. The remainder is
+  the planes route's read-back and upload, about the half millisecond a one-frame lag in a
+  twentieth of captures needs; by handle the person at the desk saw this client ahead about
+  as often as behind. Closed. One stall is unexplained: three pictures held 58, 49 and 25 ms
+  in the library once in five minutes by planes, with nothing lost and no input; it is
+  looked at if it comes back.
+- [x] **The full range is the application's to ask for** (*2026-09-24*, minor 17). Bit 3 of
+  the declaration, which this client had set on every attempt as a base flag, is full range:
+  an established host on the vendor's encoder coded the full range with it and the video
+  range without it, the same picture minutes apart, 8 percent of luma below 16 against 0.2.
+  So the library declared, for every application, that its renderer reads each picture's
+  range. `lowlat_client_video_config.full_range` (the reserved byte) says so instead, declared
+  as asked and never masked by the decoder; zeroed, the video range, which a renderer that
+  never reads `full_range` draws right. The demo asks for it, since its renderer takes it,
+  and `LOWLAT_FULL_RANGE=0` asks for the video range. The host half is the host plan's
+  (Phase 11).
+- [x] **A departure holds nothing else up** (*2026-09-25*). Found reviewing the client's
+  threads for two-core machines: `lowlat_client_end_connection` held the handle's lock
+  through the departure's grace and both joins, half a second on an established session, and
+  every other call takes that lock, so input, status and acquire made on another thread
+  meanwhile waited the whole of it. The attempt is taken out under the lock and left outside
+  it, and a new attempt is refused as already started until the leaving threads are joined,
+  because they share the unit pool, the picture queue and the sound pool with the next
+  session. `a_call_made_while_the_session_leaves_is_answered_at_once` runs a session through
+  the boundary against this host's admission on loopback and reads the status 50 ms into
+  the departure: 451 ms to answer before, 7 us after; it was shown failing both ways, with
+  the lock held and with the refusal taken out. Live against the established host the demo
+  leaves as before.
+- [x] **A second session waits for its pictures** (*2026-09-25*). A departure closes the
+  picture queue so no waiter is stranded, and nothing opened it again: after a reconnect on
+  the same handle every acquire came back at once, and a renderer paced by the wait would
+  spin. The next attempt reopens it from its offer on and lets go of a picture the last
+  session left untaken. `a_second_session_on_the_handle_waits_for_its_pictures` runs two
+  sessions on one handle through the boundary against this host's admission: the first
+  session's acquire waits its 100 ms, and after the reconnect the same call came back in 4 us
+  before and waits its 100 ms after, from the next offer on. The ring's reopen has a test of
+  its own and a model check of the reopen racing the consumer for a slot the close left
+  ready, each shown failing with its part taken out.
+- [x] **A departure ends when the session's loop does** (*2026-09-25*). The leave waited
+  while the loop looked alive, and alive meant only that no stop had been asked for, so every
+  departure ran to the cap on its grace: 501 ms, where the loop returns after 263. The seam's
+  loopback test times the departure, under both ciphers, and failed at 501 ms before.
+- [x] **A new attempt starts from nothing the last session left** (*2026-09-25*). The next
+  attempt on a handle read as over until its session came up, was handed the last session's
+  untaken events under its own name, and carried that session's figures and up to four of
+  its access units. It starts on fresh figures now, with the event queue and the unit pool
+  emptied. `a_new_attempt_starts_from_nothing_the_last_session_left` leaves a message of the
+  host's untaken, ends the session and offers again: before, the message came out and the
+  status read over; after, nothing comes out, the status reads connecting and the control
+  channel's count is zero. The event queue's clear and the unit pool's have tests of their
+  own; every check was shown failing with its part taken out. **Live**, the demo now visits
+  several peers in turn on one handle (`LOWLAT_PEER` a list, each for `LOWLAT_SECONDS`):
+  the established host, the same host again, then the second one, thirty seconds each
+  (`local/logs/2026-09-25-reconnect-*`). The first session decoded 385 pictures; the second
+  attempt's answer arrived unparseable -- the demo's toolkit reported a JSON parse error at
+  byte 259, where an answer is 742 bytes -- so it never began and was left after its thirty
+  seconds, a loss seen once before on a single attempt; the third, the second host over IPv6,
+  came up with its sound and decoded 575. Between sessions the status read connecting, no
+  codec, every count zero; the process went from 16 threads to 10 and back to 16, no thread
+  outliving its session, and its resident set from 383 MB to 222 and up to 428 at the second
+  host's size. Thirteen more attempts with the signaling frames logged, twelve to the first
+  host and one to the second between them, all came up, every message one whole frame. The
+  toolkit's reader takes the first frame of a fragmented message for the whole of it and
+  drops the rest, which would explain the lost answer; it was not caught doing so. **The
+  reader gathers fragments since** (*2026-09-25*, the vendored toolkit's record has the
+  change): `ws-check`, a loopback server sending an answer's length in three fragments with
+  control frames between them, handed out the first 259 bytes before and the whole message
+  after, and runs in CI; the demo now prints the length of a message that does not parse,
+  which tells a cut from a malformed one. Live after it, 27 attempts across both hosts, all
+  up.
+- [x] **A stream silent about its reordering stays in time past its frame number's wrap**
+  (*2026-09-25*). Found measuring the vendor backend's waits on clips from the vendor
+  encoder at its defaults: from picture 257 on, the device's map took 5 us, because the
+  picture being mapped had been decoded sixteen units earlier. Under order counts that
+  follow the frame number, the offset that carries the count across the wrap was derived
+  after the frame number it is compared against had been replaced, so it never advanced;
+  every later count restarted low, and a stream that declares nothing about its reordering
+  took each picture for a late one, stopping for sixteen pictures and running sixteen
+  behind. A stream that declares its depth never showed it, which covers this host's three
+  encoders and the established hosts tried here (both ran past 256 pictures with the map
+  still waiting on each decode). `h264-nvenc-wrap`, 300 pictures of the vendor encoder's
+  defaults, joins the fixtures with
+  `a_stream_silent_about_reordering_leaves_as_it_arrives_past_a_frame_number_wrap`, which
+  checks the clip is the case (order count type 2, no depth stated, past the wrap) and that
+  every picture leaves as it is decoded with its count rising: unit 257 was held back
+  before. It decodes to the reference through both device interfaces (the open stack on
+  two cards) and the software backend.
+- [x] **The handle path's copy is waited on asleep** (*2026-09-25*). Found reviewing the
+  client's threads for two-core machines: the vendor context's waits spin by default, and the
+  copy into a device slot was waited for on its stream. Measured through the backend itself,
+  paced at 120 pictures a second on clips of the vendor encoder, the interface's own wait
+  for a decode sleeps; our two copy waits spin. Telling the whole context to sleep was
+  measured and refused: it halves the planes route's CPU but slows that read-back by
+  0.1-0.4 ms a picture, and the application shares the context. So the handle path records
+  an event made to block behind its copies and waits on that. Back to back at 2160p: 110 us
+  of CPU a picture down to 32, 20-30 us more wait with the cores free; with the decode thread
+  and two busy threads on two cores, the 99th percentile was 5.3-6.2 ms in three runs of four
+  before, the spinning wait preempted after the copy had ended, and 1.6-1.8 ms in every run
+  after. The device route's test still reads every clip back to the reference. The planes
+  route keeps its spin; the way out of it is below, under later work.
+
+**Built 2026-09-19, evening, deviations from the text above:** the picture already delivered,
+named or sent again, travels as its checksum alone -- the first live run against this host
+showed it naming the same picture a dozen times a second, each a decode for nothing -- so
+the application keeps the picture it was given and `image_update` says when there is a new
+one. The pictures the reader is checked against are six an established host sent in a
+recorded session (compressed, where this host's encoder writes stored blocks), against an
+independent decoder's pixels; the fuzz target ran five minutes clean on them. The receive
+ring's late-arrival count is what the loss figure reads; the recorded session's downlink,
+replayed, shows none at all, which is what a clean path reads.
+
+**Gate, second half:**
+
+1. [x] Hermetic: the harness host sends a fresh picture, the same by name, a name after a
+   forget, a hidden pointer, rumble, blocked and unblocked, host mode and a guest list; the
+   events come out in order with the right bytes, the miss delivers the position alone, and
+   under the simulator's one percent loss the recent-loss figure reads about a hundredth on
+   the video channel after sixty simulated seconds and zero at zero loss. (*2026-09-19*:
+   every event in order; the miss delivers the position alone; the recent loss on the video
+   channel reads 0.3 to 2 times the link's one percent after thirty simulated seconds, zero
+   and no negative on a clean link, late arrivals without negatives under reorder alone.)
+2. [x] Gate C in full: ten minutes against an established host with picture, sound, input, the
+   cursor and relative mode, from a cold connect, on both backends; then the same against
+   this host with its ten-bit and 4:4:4 streams. (*2026-09-19, the unattended half*,
+   `local/logs/2026-09-19-c5-gateC-*`: against the established host over the internet at
+   8-12 ms, from a cold connect, the vendor backend by handles for 599 s and the open stack
+   for 502 s -- the second ended from outside, not by a fault -- a mostly still desktop at
+   14-16 pictures a second and bursts to 113; decode 0.63 ms by the vendor's route and 2.1 ms
+   plus 2.0 of read-back by the open stack's; the reader at most one message behind; the
+   guest list every two seconds with this client its owner; 152 and 63 pointer pictures
+   decoded, none refused, no name missed; a rumble message from that host's game reached the
+   event. Against this host at ten-bit HEVC, vendor handles, 599 s with the desktop moving:
+   112 pictures a second at the median, decode 0.74 ms, device copy 0.13 ms, 323 pointer
+   pictures, 293 guest lists, no late arrival. **The interactive items are owed at the
+   desk**: typing, mouselook in and out, a drag out, the pointer changing shape under the
+   pointer, rumble from a game on both backends, the output cycle; this host's rumble probe
+   and its 4:4:4 stream on the by-hand host. The first desk session found two things the
+   unattended runs could not: the demo's sticks were upside down (its negation of the
+   toolkit's already-inverted vertical axes, since C3, corrected), and a pointer resampled
+   at a two percent shrink lost a row to nearest neighbour and went soft under a box filter,
+   where an established client stays sharp. Its rule is the demo's now: the target is the
+   picture's size times the drawn-to-stream ratio per axis, a target within two pixels of
+   the native size or of exactly half of it snaps there, and anything else is halved by box
+   averaging while at least twice the target and then resampled bilinearly. The toolkit's
+   own cursor-size call is empty on this platform and on Windows, so the scaling is the
+   application's everywhere. *2026-09-24, at the desk against another established host*: its
+   pictures arrived in the full range and were drawn as the video range; the range now
+   travels with every picture (the item above), and the same desk session, 130 seconds on the
+   vendor's decoder by handle with the preferences walked through H.264, HEVC, HEVC 4:4:4,
+   ten-bit HEVC and ten-bit HEVC 4:4:4 -- every one of which that host sends when asked --
+   kept the full range throughout. *Passed 2026-09-24*, against that host: **the desk items
+   confirmed by the person at the desk**, input, the pointer and relative mode among them,
+   with the two faults they found fixed first (the two items above); and the unattended
+   half from cold connects, ten minutes on each backend with the preferences walked every
+   hundred seconds (`local/logs/2026-09-24-c5-gateC-may085-*`): the open stack 599 s
+   through H.264, HEVC and ten-bit HEVC (the second card decodes no full chroma, so the
+   declaration masked it), decode 2.0 to 3.4 ms and read-back 1.7 to 2.6; the vendor's by
+   planes 599 s through H.264, HEVC, ten-bit HEVC and **full chroma at both depths**, decode
+   0.4 to 0.9 ms and read-back 0.3 to 1.0 -- six decoder builds each, one per move, no
+   fault, the reader at most one message behind, nothing lost or late, the full range
+   throughout, pointer pictures and guest lists arriving, a clean leave. That host's desktop
+   was mostly still (8 to 11 pictures a second at the median) and **silent**, so these runs
+   carried no sound; sound against an established host is C4's gate and the unattended half
+   above. *Later the same day* it played a looping video with its sound, and the first
+   half's two ten-minute handle runs carried it: fifty packets a second decoded, 29,867 and
+   29,864, none dropped or refused and no resync, the playback queue between 36 and 104 ms,
+   through the output device moved in each run. The ten-bit and full-chroma streams the
+   item asks of this host came from the established one, which sends both when asked; this
+   host's own were run on 2026-09-19 (ten-bit) and at C9 (full chroma).)
+3. [x] The demo's panel and this host's roster agree on the figures they share: the round
+   trip, the rate, the decode time the host re-publishes; the negatives this client sent
+   against the fragments the host resent on them. (*2026-09-19*: on the same line, this
+   host's re-published decode figure 0.86-0.87 ms against the client's reported 0.86; its
+   encode 3.98 ms against `encode_us` 3.9-4.2; its round trip 0.0-0.1 ms against ours 0;
+   the established host's 10.5 ms against ours 9, its 0.75 ms decode against our 0.76
+   reported, its 3.72 encode against `encode_us` 3.7. **The resends pair loosely by
+   construction**: over the internet the established host resent 262 fragments on our
+   negatives while this side counted 124 negatives sent, 123 late arrivals and 233
+   duplicates -- a lost fragment costs one late arrival and several duplicates, because the
+   host resends from the cumulative acknowledgement up to the named fragment, and one
+   negative can name several. The recent-loss figure peaked at 1.3 percent in a burst and
+   read zero for most of the run.)
+
+## Phase C6 - Packaging and the second half of the header (closed 2026-09-22)
+
+**Planned 2026-09-15 for a header at minor 4; re-planned 2026-09-22 at minor 13**, interview
+of the same day, after C7 to C9 had each changed the header and the demo this phase packages.
+Nothing pending changes either again before Phase 11, which is the host's half. What the
+phase produces is the first client that leaves the development machine as an artifact, so
+its gate ends the way every phase's does: the artifact streams from the established host.
+
+- [x] **The client-only build checked on every push**, in the CI workflow rather than the
+  hand-started build: one lint step with the client feature alone and one with the host
+  feature alone, because every other step builds all features or the defaults, under which
+  a client-only breakage compiles; and the demo built there against the client-only
+  library, since it is the one thing that links the client symbols the way an application
+  does -- an unresolved name fails the link where a feature bit only says it was set. The
+  toolkit's shader compiler on the runner; the demo told where the library is rather than
+  building one of its own. *C6.0, 2026-09-22; each check broken once before it was
+  trusted. The client's first run on a machine with no decoder found a unit test creating
+  a client with the defaults, the hermetic session's deliberate leak counted by the leak
+  checker, and three headers the toolkit compiles against; C6.2.*
+- [x] **Two libraries from the build workflow**, the full one and the client-only one, in
+  one job and in order, each copied out of the target directory before the next build lands
+  on the same file, so that no check reads the wrong object. Each in a tarball named for
+  what it carries -- the full one keeps its name, the client one says `client` -- with the
+  one header (an application defines `LOWLAT_NO_HOST` against the client build), 06 and
+  10, the licence, and a `FEATURES` line written by a small program that opens the
+  tarball's own copy and prints the ABI version and `lowlat_features()`, refusing a value
+  other than the one expected. The ABI gate's harness is not that program: it names an
+  object without the host half and stops, by design. The GPL bit is clear on both. *C6.1.*
+- [x] **The demo inside the client tarball**, as `bin/client` and nothing beside it: linked
+  against that tarball's library with a run path relative to itself, stripped as the
+  library is, the toolkit's licence notice as a second licence file because the binary
+  carries the toolkit. The demo prints the library's version and features as its first
+  line, before it asks for a peer, so every run's log names the object it ran against.
+  *C6.1.*
+- [x] **Documentation closure**: the header's client half read once, top to bottom, against
+  [06 §3b](06-api.md), for a comment a later minor made false; [10](10-client.md) against
+  the code, its status line included; [06 §13](06-api.md), the README's status and platform
+  rows and its build section, and the document maps in [00](00-overview.md) and at the
+  head of this plan, all of which still describe a host with a client planned.
+  [09 §7a](09-compatibility.md) has carried what decodes on which part since C5 and is
+  verified rather than added to. *2026-09-22. The read found five comments a later minor
+  had made false -- an unavailable slot's reason named in `name` where minor 13 moved it
+  to `driver`, twice; the backend "as resolved at creation" where minor 11 lets a session
+  change it; the fence and the release described over copied planes alone where minor 8
+  added the handle kind -- and the same two facts in 06.*
+
+**Gate:**
+
+1. [x] The build workflow produces the full library, the client-only library and the demo; the
+   `FEATURES` lines read the two halves on the first and the client half alone on the
+   second, the demo's first line reads the client half, and the demo linked against the
+   client-only object with no name unresolved. Recorded with the run's number. *Build run
+   35710471842 on `62a0f90`, 2026-09-22: `abi 0.13 features 0x3` with 60 exported names,
+   `0x2` with 32 and no host name among them, the tarball's own `bin/client` printing
+   `features=0x2` and leaving for want of a peer; the four artifacts uploaded. The CI run
+   on the same commit green in all four jobs, the sanitizers included.*
+2. [x] The client tarball's own `bin/client`, downloaded from that run rather than built here,
+   streams from the established host for the usual ten minutes: the one check that can
+   catch a packaging fault -- a run path that does not resolve, a stripped object, a library
+   the runner's build resolved differently. *2026-09-22, the artifact of that run against an
+   established host on macOS over the LAN, ten minutes: 16,140 pictures at the host's own
+   cadence (15 to 61 a second with what moved), decode 3.4 ms at the median (3.7 at the
+   95th percentile, 9.5 at most) and read-back 3.1 ms on the AMD part, never more than one
+   message behind, 25 skips in all, no loss, no late arrival, no retransmission asked,
+   sound at 50 packets a second while the host had any, the pointer's 44 pictures all
+   taken, 307 MB resident. A first attempt with the decoder left to the automatic order
+   ran on the discrete Intel part that now holds the first render node, whose one-lane
+   link read a picture of this size back in 15.5 ms and fell up to 37 messages behind the
+   host's 30 a second; stopped at 47 s and rerun with the node named. Not a packaging fault,
+   and recorded because the automatic order on a machine with such a part is the slowest
+   choice, which the listing's rows let an application avoid.*
+
+## Phase C7 - The pad reports: DualShock 4 and DualSense (planned 2026-09-20, closed 2026-09-21)
+
+**Planned 2026-09-20 with the host's Phase 14** ([impl-plan.md](impl-plan.md)), interview of
+the same day. Executed **before C6** and after C5's owed desk items: packaging the demo and
+the header before this phase changes both would be done twice. The decisions are recorded
+once, here and under Phase 14; the rules are [10 §8](10-client.md), the wire
+[01 §11](01-protocol.md), the surface [06 §3b](06-api.md).
+
+- [x] **One call, one event** (minor 10): `lowlat_client_send_pad_report(cl, pad, type, kind,
+  report, len)` with the product named and the report as the device delivered it, USB or
+  Bluetooth form; `LOWLAT_EVENT_PAD_REPORT` with what the host's device was written, lent
+  until the next poll, in the pad's own framing. `send_pad_state`, `button` and `axis` stay
+  the sixteen-button pad's, and a pad identifier is one family until it is unplugged.
+  *C7.1, 2026-09-20. The family is recorded with the attempt on the application's thread, so
+  the other family is refused at the call rather than dropped on the session thread; the
+  enumerations are `LOWLAT_PAD_TYPE_*` and `LOWLAT_PAD_REPORT_*`, the shorter names the plan
+  used having collided with the button indices' `LOWLAT_PAD_*`.*
+- [x] **The library derives the standard state from the report and sends it beside it**, the
+  report first, deduplicated, so a host that does not read reports still has a pad and one
+  that does has its slot; a DualShock 4 also travels as the ten-byte touch block an
+  established host's DualShock mode reads, and its whole report goes without its identifier
+  byte so no established host in any mode can mistake it for a DualSense's
+  ([01 §11.1](01-protocol.md)). *C7.1.*
+- [x] **Feature reports first, bounded**: calibration and firmware for each product, any
+  subset, before the first input report; anything else refused. The pairing report is the
+  host's. *C7.1; the normalisation runs on the application's thread, where the refusal is
+  answered.*
+- [x] **Bluetooth normalised in the library**: the wireless framing stripped on the way in, the
+  transport remembered per pad, the identifier and checksum put back on the way out; the
+  calibration report's wireless identifier rewritten. *C7.0/C7.1, confirmed on both pads
+  paired to the desk: a DualShock 4 also groups its wireless calibration's gyro ranges where
+  the USB answer interleaves them, and the rewrite reorders. A late feature report does not
+  unsay the transport the input reports gave; a wireless DualSense's output reports carry a
+  sequence the library advances.*
+- [x] **The rumble event stays** for any pad a host rumbles that way; the application decides
+  what to write (a motor-only report keeping the lightbar it last wrote). *C7.1: unchanged.*
+- [x] **The demo reads the raw nodes itself**, nothing patched in the toolkit, which has no HID
+  path on Linux: the Sony nodes found by identity, opened under the seat's access, polled in
+  the millisecond loop, the feature reports read at open, the toolkit's controller events for
+  those pads dropped, unplug when a node dies. A knob decides whether a host gets reports or
+  states, defaulting to reports for this library's hosts only, known from the host list:
+  **a DualSense against an established host is neither promised nor gated.** *C7.2,
+  2026-09-20, with one deviation: the host list cannot tell this library's host from an
+  established one, because the daemon advertises the established build string, so the knob
+  is explicit (`LOWLAT_PAD_RAW`) rather than defaulted from the peer; the policy is still
+  the application's. And one addition the same-machine rig needed: `only`, which also drops
+  the toolkit's controllers, since the pads the host makes from these reports are
+  controllers to a toolkit on the host's own machine.* *(2026-10-13: the demo reads its pads
+  through SDL now, on every platform -- [impl-plan-windows.md](impl-plan-windows.md) W1.9.)*
+- [x] Fixtures from the pads on the desk (addresses zeroed); hermetic tests: the report stream
+  in and the messages out, in order and deduplicated; the output report in and the event
+  out, both framings; a host that reads no reports still receiving states. *The core half
+  is in (C7.0, 2026-09-20): the framing, the reads and the fixtures, with the pads' own
+  offsets confirmed against the reports they produced; the DualShock 4 answers its pairing
+  report empty over the raw node, which is one more reason that report is the host's. The
+  hermetic session (C7.1) sends both pads' reports through the driver to a host that reads
+  none of them and counts the report, the block and the states it makes its pads from, then
+  writes the pads and reads the events back framed for USB and for Bluetooth, with a write
+  for an unknown pad dropped and counted.*
+- [x] Documentation closure with Phase 14's. *2026-09-20, with 14.3.*
+
+**Gate:**
+
+1. **The DualShock 4 against the established host in its DualShock mode** (before the host
+   half exists): the pad appears there as a DualShock 4, sticks and buttons the right way
+   up, the touchpad works there, rumble comes back as the rumble message and the demo writes
+   it. *Passed 2026-09-20 at the desk (`local/logs/2026-09-21-c7--ds4-run-2.log`), on the
+   second run: the first found the pad identifiers too wide for that host
+   ([01 §11.1](01-protocol.md)). With them below 256: the pad a DualShock 4 there, touch and
+   its click working, seven rumble messages answered by the demo's motor-only writes, 900
+   to 960 reports a second sent with none dropped, the two feature reports taken from each
+   of the pads on the desk (a DualSense beside it over Bluetooth). **The motion sensors do
+   not reach that host, and cannot**: its DualShock mode builds the pad's report from the
+   sixteen-button state and the ten-byte touch block and writes nothing else into it -- the
+   wire it defines for a DualShock 4 carries no motion, and its own client sends none.
+   Motion is what the whole report on opcode 31 carries, which this library's host reads
+   (Phase 14).* **The DualSense against the established host in its DualSense mode, not
+   promised (D8) and tried anyway, 2026-09-21 at the desk: everything.** *The pad appears
+   there as a DualSense; the sixteen buttons, the motion sensors, the touchpad and its click
+   all read there; rumble, the mute button's light, the lightbar and the player lights all
+   reach the physical pad here. That host's DualSense mode passes the whole report both
+   ways through its own virtual bus, which is exactly what this library sends and takes
+   back, so nothing is lost in either direction -- the DualShock 4's motion is lost there
+   only because that host's DualShock mode never reads it.*
+2. **Both pads against this host** and **the established client holding the DualSense against
+   this host** are Phase 14's gate, run with it.
+3. The hermetic tests above; the ABI gate at minor 10; the census on the host names the two
+   opcodes and nothing unexpected.
+
+## Phase C8 - Software decode over the machine's own libavcodec, and a decoder chosen mid-session (planned 2026-09-21, closed 2026-09-21)
+
+**Planned 2026-09-21, interview of the same day.** Runs before C6, as C7 did: it changes the
+header (minor 11, then 12) and the demo, which C6 packages. The decisions are recorded once, here;
+the rules are [10 §5.1](10-client.md), the surface [06 §3b](06-api.md).
+
+The deferred decision of "Later" is taken. **The library decodes in software through a
+libavcodec the machine already carries, and only one under the LGPL**: nothing is shipped,
+built or bundled, and the copyleft rule of [impl-plan.md](impl-plan.md) gate 4 gains its one
+exception as a mechanism rather than a sentence.
+
+- [x] **The loader** (`lowlat-drivers`): the pair `libavutil` + `libavcodec` opened by name at
+  runtime, never linked, majors 4 through 9 (`libavcodec.so.58` to `.so.63` with the
+  `libavutil` each pairs with), **the highest that opens wins**. Where it is looked for, in
+  order: the environment (`LOWLAT_FFMPEG_DIR` names a directory, `LOWLAT_FFMPEG_VERSION` a
+  major; a pair named there that fails is a failure with the stage named, never a walk);
+  the directory of the running executable, where an application ships a pair beside
+  itself; the dynamic linker's own search. Always two files from one place, `libavutil`
+  first; the majors the pair reports of itself must equal the names it was opened by.
+  **Before any other entry point is called, the pair is asked its licence**
+  (`avcodec_license`, `avutil_license`): both must begin `LGPL`, or the pair is closed at
+  once, logged with its answer, and reported as `LOWLAT_ERR_NO_DECODER_LICENCE` (a new
+  status: "a decoder library was found and is not one this library may load"). Closing is
+  safe for exactly this library: no build of it carries a thread-local segment, which is
+  what makes unloading a device runtime unsafe ([07 §8](07-platforms.md)). The distribution
+  this is developed on ships a GPL build, which is refused; the LGPL pairs another
+  application installed on the same machine (FFmpeg 4.3 and 8.x) are accepted.
+  **No header is pinned and no binding is generated**: the surface relied on is the sixteen
+  entry points and the leading fields of two structures that are the same on every major
+  accepted, written down by hand, and **checked at load against the library that loaded** --
+  a freshly allocated frame must point its extended data at its own first field and report
+  no format, a freshly sized packet must report the size it was given -- before a unit is
+  ever fed. Every number that has moved between majors or could (codec identifiers, pixel
+  formats) is resolved by name. The library's own log stays as it is: its level and its
+  callback are process-global and the application may own them; it is silent on a healthy
+  stream. *C8.0, 2026-09-21. Built as planned, with one rule added at C8.1: a codec counts
+  as decoded only if its decoder opens, not if its name is known -- the two pairs another
+  application had installed carry an H.264 decoder that refuses to open without a device.*
+- [x] **The backend** (`lowlat-decode`): the codec found by name from the header, opened with
+  slice threading capped at four and by the machine's parallelism and the low-delay flag;
+  each unit copied once into a padded, reference-counted packet the library sizes (the
+  padding it requires comes with it); a packet the decoder will not take until a picture is
+  drained is drained and offered again, never dropped; every picture ready is taken in
+  order, so a flush leaves none late; a decode error is the fault the keyframe policy
+  answers with one request. **The same four formats out as the hardware backends**: the
+  decoder's three-plane pictures are converted during the copy that hands them out --
+  chroma interleaved for NV12 and P010, ten-bit samples shifted to the high bits -- so an
+  application sees one format set whatever decodes, and no flag exists to get wrong. A
+  format change is never reported: the decoder reconfigures itself on a new parameter set.
+  *C8.1, 2026-09-21. The low-delay flag is not set: measured on every committed clip, it
+  changed nothing. One behaviour recorded rather than fixed, because it is the library's: a
+  stream that reorders more than it declares loses a picture at each depth the library
+  discovers, where the library's own readers hold it; no host compared here sends such a
+  stream, and the one committed clip that does is the test's documented exception.*
+- [x] **Chosen, listed, last in the automatic order** (`lowlat-client`, `lowlat-sdk`, minor 11):
+  `LOWLAT_DECODER_SOFTWARE`, refused at creation with the stage when no LGPL pair loads;
+  `lowlat_enum_decoders` gains its row last, named by the library's version and licence and
+  the directory it came from, every capability true (each is proved by the fixtures);
+  `LOWLAT_DECODER_AUTO` reaches it after the open stack's nodes and the vendor's devices,
+  so a machine with any hardware decoder never does, and status `backend` says which was
+  chosen. `create_info.device` for the software kind may name the directory the row was
+  found in, so the row round-trips through creation. Two corrections to `AUTO` folded in
+  because the same function is rewritten: with a render node named it now tries the open
+  stack on that node, then the vendor's interface on the card behind it, then software,
+  where it stopped after the open stack; and the handle kind with a node named resolves the
+  vendor's device from that node rather than taking any. The header's "by index, as the
+  host's encoder is" becomes "by kind and render node, as the listing reports them".
+  *C8.2, 2026-09-21. One addition: the stream's format in status is read off every picture
+  rather than at the build alone, since a backend that reads no parameter set knows it no
+  earlier.*
+- [x] **A decoder chosen mid-session**: `lowlat_client_set_decoder(cl, decoder, device)`. The
+  probe runs on the caller's thread exactly as creation's does; a backend that does not
+  open answers with its stage and nothing changes. Before an attempt the choice is replaced
+  and nothing else happens. During a session it is one act: the declaration re-masked by
+  the new decoder's capability and restated where it changed, the running decoder torn
+  down, the new runtime opened on the decode thread, and exactly one keyframe request with
+  the reinitialisation argument -- the request that also applies the new declaration -- so
+  the picture resumes at the next keyframe; the queue is never closed, a picture the
+  application holds stays valid, and the units that arrive meanwhile are caught up over.
+  **The frame kind stays the creation's**: it is the queue's shape, and a session of the
+  handle kind refuses the call (`LOWLAT_ERR_DECODER_UNSUPPORTED`) because its device slots
+  are bound to the device; changing that is a recreate. **No automatic fallback of any
+  kind is added**: a decoder that cannot serve the frame kind is refused where it is asked
+  for, at creation or at this call, never answered with a frame of another kind.
+  *C8.4, 2026-09-21, with one refinement: the request is made by the replacement once it
+  exists rather than at the teardown, so a keyframe never arrives for a decoder still
+  opening and a runtime that fails to open costs the host nothing. The word to the decode
+  thread travels through the session thread behind the restated declaration, so a move that
+  also changes the declaration cannot cost two requests. `LOWLAT_DECODER_AUTO` is accepted
+  by the call and walks the automatic order again; `LOWLAT_DECODER_NONE` is refused.*
+- [x] The demo takes `LOWLAT_DECODER=software`, prints the row with its licence and origin,
+  and cycles the rows mid-session through a chord. *The knob and the row, C8.2; the chord
+  (`Ctrl+Shift+X`) and a timed walk (`LOWLAT_DECODER_EVERY`), C8.4.*
+- [x] Documentation closure: 10 §5.1, 06 §3b/§6/§7/§11, 09 §7a, 00 D14, gate 4 amended, the
+  README's licence sentence. *2026-09-21.*
+- [x] **A GPL codec library by opt-in** (*added after the review, 2026-09-21*, C8.5, minor 12):
+  the `gpl-libavcodec` build feature, off by default and in no release build, has the loader
+  take a GPL pair as well as an LGPL one; `nonfree` stays refused by every build. The library
+  reports it as `LOWLAT_FEATURE_GPL_LIBAVCODEC`, since the header is one for every build and
+  the bit is the only way a loader learns what this one would load; the listing names
+  whatever was loaded with its licence. CI tests the rule as shipped in a step of its own,
+  because `--all-features` turns the feature on. With it, every committed clip decodes
+  bit-exact through the distribution's GPL 7.1 pair, the one documented exception unchanged.
+  The review found two things in the loader, fixed with it: the licence is asked before the
+  versions, as every sentence about it says; and an empty `LOWLAT_FFMPEG_VERSION` is unset,
+  as an empty `LOWLAT_FFMPEG_DIR` is.
+
+**Gate:**
+
+1. [x] Every committed clip decodes bit-exact on the software backend through both LGPL pairs
+   on this machine (FFmpeg 4.3 and 8.x, named by `LOWLAT_FFMPEG_DIR`); the distribution's
+   GPL pair is refused with the new status and absent from the listing; a major named by
+   `LOWLAT_FFMPEG_VERSION` that is not present refuses rather than walks. The feed-to-take
+   delay in pictures per fixture family equals the library's own readers' figure. The four
+   conversions' cost at 2560x1440 recorded. Zero allocations per unit on this side.
+   (*2026-09-21*: the two pairs another application installed open the second codec alone
+   -- their H.264 decoder refuses to open -- so an LGPL 7.1 pair was built from source for
+   the test, decoders only, not shipped: through it all twenty-one clips are bit-exact, the
+   one undeclared-reorder clip losing the picture the library drops at the depth's
+   discovery; through the 8.x pair every second-codec clip, full chroma and ten bits
+   included; the 4.3 pair loads through the loader with its formats numbered as measured
+   and its own dependency found by the linker. The distribution's GPL pair answers "GPL
+   version 2 or later" and is refused with `LOWLAT_ERR_NO_DECODER_LICENCE`, absent from the
+   listing; an absent major refuses. The delay is none for every clip without bidirectional
+   pictures and the declared depth for the rest. Conversions at 2560x1440: 74, 168, 147 and
+   554 us for the four formats. Zero allocations over two hundred units after warm-up.)
+2. [x] Ten minutes each on H.264 and ten-bit HEVC at 2560x1440 from this host through the
+   software backend, and the defaults from the established host: decode and conversion per
+   picture, pictures and skips a second, the reader's lag, the CPU. Numbers recorded, not
+   judged: a software decoder is the floor, not the target. (*2026-09-21, smoke*: twenty-five
+   seconds from this host at 2560x1440 H.264, 120 pictures a second, decode 1.2 to 1.8 ms,
+   conversion 0.15 to 0.26 ms, the reader at most one message behind, 285 MB resident; the
+   ten-bit run could not be had because another guest was seated with the first codec, so
+   the room's consensus held the stream there. *Later the same evening, the H.264 leg*: ten
+   minutes from this host at 2560x1440 with a moving scene at 4.1 Mbit/s, 119.9 pictures a
+   second on average, decode 1.78 ms at the median, 2.24 at the 95th percentile and 2.70 at
+   most, the conversion 0.16 / 0.19 / 0.23 ms, the reader never more than one message behind
+   and 17 ms at most, nothing late and no loss, 22 skips over 11 seconds all at the host's
+   own bitrate dips, the whole client process at 31 percent of one core with 13 threads, 286
+   to 290 MB resident (`local/logs/2026-09-21-c8-gate-h264-10min.log`). **Still owed**: the
+   ten-bit leg -- the other seat again held the consensus at H.264 (the client declared
+   `0x19`, the host answered "the stream carries what every seat can take"), so the run was
+   stopped at 69 s. *The ten-bit leg, once the other seat had left (22:44)*: ten minutes of
+   HEVC ten-bit at 2560x1440 with a moving scene at 4.9 Mbit/s, the host reinitialising by
+   declaration once at the start and never asked for a keyframe after; 120.1 pictures a
+   second decoded throughout, decode 2.98 ms at the median, 3.46 at the 95th percentile and
+   3.90 at most, the P010 conversion 0.42 / 0.71 / 1.03 ms, the reader never more than one
+   message behind and 25 ms at most, nothing late, no loss, 55 percent of one core, 354 to
+   360 MB resident. The pictures shown fell from 120 a second in the first half to 108 in
+   the second with the rest arriving in pairs against the 120 Hz present -- a cadence
+   effect, not a loss: the host's own frame interval at the 99th percentile crept from 9.1
+   to 10.1 ms over the run and this decoder's median from 2.96 to 3.15 ms, the host, the
+   client, the moving scene and the compositor sharing one machine
+   (`local/logs/2026-09-21-c8-gate-hevc10-10min.log`). *The established host's defaults on
+   software, the same evening*: ten minutes over the internet
+   (round trip 8 ms at the median, 282 at most), H.264 at 2560x1440 at that host's own
+   cadence -- 16 pictures a second at the median on its still desktop, 104 at most -- decode
+   2.8 ms at the median and 7.9 at the 95th percentile, because that host spends its bitrate
+   on few, large pictures (up to 60 KB each against 4 KB from this host, 7 Mbit/s on average
+   and 50 in bursts) and the software decoder's time follows the bits; the conversion 0.14
+   ms; behind at most 5 messages and 80 ms at the worst of the path, 240 late, 1 percent
+   loss at most; 17 percent of one core, 290 MB resident; its log shows one encoder build at
+   the connect and nothing else for the ten minutes
+   (`local/logs/2026-09-21-c8-gate-myhome1-software-defaults.log`, the host's own log in
+   `...-myhome1-stock-host-log.txt`). Passed.)
+3. [x] The switch: hermetically, with test doubles, one request per switch, the queue never
+   closed, a held picture valid across it; live against this host the open stack, the
+   vendor's and software each way every hundred seconds, each answered by one keyframe and
+   the picture back within the second; once against the established host, whose log shows
+   one encoder rebuild per switch. (*2026-09-21*: with test doubles, the loop that is
+   replaced returns the choice without asking, the replacement asks exactly once as its
+   first act, the queue stays open, an empty word moves nothing and an idle thread takes a
+   choice too. Live against this host at 2560x1440, every ten seconds for forty-eight:
+   open stack 2.0/1.9 ms -> vendor 0.6/0.5 -> software 1.3/0.16 -> open stack -> vendor,
+   each move one reinitialisation request on the host's log and the picture back within
+   the second, the move to the vendor's costing about three hundred milliseconds of
+   pictures for its runtime's opening, the others under a hundred
+   (`local/logs/2026-09-21-c8-switch-walk.log`). *Later the same evening, the hundred-second
+   walk against this host*: 519 seconds with a moving scene, five moves -- open stack ->
+   vendor -> software -> open stack -> vendor -> software -- the host's log showing exactly
+   five `peer asked to reinitialize`, one per move and a hundred seconds apart, nothing
+   else; the picture back within the second every time: the move to the vendor's cost 35
+   and 37 pictures (its runtime's opening), to software 9 and 9, to the open stack 2; per
+   backend decode / hand-out at the median 2.0 / 1.9 ms on the open stack, 0.6 / 0.5 on the
+   vendor's, 1.9 / 0.16 on software, 120 pictures a second and never more than one message
+   behind on all three; the skips in the first half (44, 75, 111 a segment) fell at the
+   host's own stalls, the same three backends showing none in the second half
+   (`local/logs/2026-09-21-c8-gate-walk-100s.log`). *And against the established host, the
+   same evening*: 519 seconds over the internet, the same five moves, each answered by one
+   keyframe at the next encoder generation (the client's log counts generations 1 through
+   6), **and that host's own log shows exactly six encoder builds: one at the connect and
+   one per move, a hundred seconds apart, nothing else**; the picture back within the second
+   every time; decode at the median 2.2 ms on the open stack, 0.7 on the vendor's, 2.8 on
+   software at that host's 10 to 36 Mbit/s, never more than one message behind
+   (`...-c8-gate-myhome1-walk-100s.log`, `...-myhome1-stock-host-log.txt`). Passed.)
+4. [x] The process map after a run shows the LGPL pair and nothing copyleft, which is gate 4 as
+   written; the ABI gate at minor 11; the workspace's checks. (*2026-09-21*: the ABI gate
+   and the workspace's checks green; the pair in the map is the LGPL one named, the
+   distribution's GPL pair opened only to be asked and closed. *Later the same day*: the ABI
+   gate at minor 12 with the opt-in's feature bit; the workspace's checks green with the
+   feature off and on.)
+
+## Phase C9 - Full chroma on the open stack, and the listing's labels (closed 2026-09-22)
+
+**Planned and built the same day**, on a discrete Intel part plugged into the development
+machine. The open-stack backend had refused every range-extended stream because no device
+it was built on could verify the surface it would read back ([10 §5.1](10-client.md)); the
+part's driver decodes HEVC Main 4:4:4 at both depths into packed layouts, and the ffmpeg
+command-line tool's own hardware path brought the four committed full-chroma clips back bit
+for bit through it, which made the question a bounded one.
+
+- [x] **Full chroma where the driver's layout is one the backend reads** (`lowlat-decode`,
+  `lowlat-drivers`): the range-extension picture and slice structures staged for a
+  full-chroma stream (the base ones lead them, so one storage serves both), the profile and
+  render-target format from the stream's own parameter set rather than the declaration's
+  guess, surfaces asked for in the first layout the backend reads among those the driver
+  offers for the profile (planar, then the packed eight-bit and ten-bit ones), and the
+  read-back copy unpacking them into the two full-chroma formats the other backends hand
+  out. The capability is reported only where such a layout is offered; a driver listing the
+  profile with another layout is not asked for it, and a stream the range extensions allow
+  but no profile here takes is refused as before. *C9.0, 2026-09-22.*
+- [x] **The workers never outnumber the machine**, and no thread is raised: the software
+  decoder's slice-worker count is a named rule with a test, after a client generation
+  compared here hung a two-core machine with four workers above the window's own thread.
+  *C9.0.*
+- [x] **Every row a label and the driver's words** (`lowlat-client`, `lowlat-sdk`, minor 13):
+  `name` is the interface and the card's maker -- `VA-API [Intel]`, `VA-API [AMD]`, `NVDEC
+  [NVIDIA]`, `libavcodec [LGPL]` -- and `driver`, appended and filled as far as the caller's
+  size reaches, carries what `name` used to: the banner, the product, the version and
+  licence, or the reason a slot is unavailable. *C9.1.*
+- [x] Documentation: 10 §5.1, 06 §6/§11, 09 §7a, the changelog. *2026-09-22.*
+
+**Gate:**
+
+1. [x] The four committed full-chroma clips bit-exact through the open stack on the Intel
+   part, the rest of the clips unchanged there and on the AMD part, which reports no full
+   chroma and refuses the clips as before; the packed layouts' unpacking against a plain
+   reference. (*2026-09-22*: 24 of 24 on each of the four, 0 wrong, on the Intel part; the
+   AMD part reports neither depth and refuses; the unit tests pass.)
+2. [x] A live full-chroma stream through the open stack on the Intel part, from a host that
+   sends one. *Passed 2026-09-22*, from this host in its full-chroma mode -- neither host at
+   hand sends it at its defaults, so the stream is the one this project's own host builds
+   when the census gate is opened by hand. Ten minutes of HEVC 4:4:4 eight bits at 2560x1440
+   with motion: 11,966 pictures at the twenty a second asked for, the format the full-chroma
+   one throughout, decode 1.83 ms at the median (1.87 at the 95th percentile), never more
+   than one message behind, no skip, no loss, no late arrival, what was asked for and what
+   was declared the same. Then five minutes of the ten-bit full-chroma layout at fifteen a
+   second: 4,476 pictures, the same figures, one message behind at most.
+   **The rate is asked for rather than taken**, because the part sits on a link one lane
+   wide and the read-back is 22 ms a picture at full chroma and 23 at ten bits: asked for
+   thirty the reader fell 88 messages behind in half a minute, which is the design's stated
+   limit for a decoder slower than its stream ([10 §4.1](10-client.md)) and not a fault of
+   this phase. The log of that attempt is kept beside the two runs.
+
+## Phase C10 - The relay (closed 2026-09-23)
+
+**Planned 2026-09-23, interview of the same day, and next**: ahead of C5's desk items, the
+host's Phase 12 seated runs, C9's gate on a second host and the host's Phase 11. The host's
+relay phase (2b) is dropped in its favour ([impl-plan.md](impl-plan.md),
+[00 D15](00-overview.md)): the relay is the client's and the host takes no part. The decisions
+are recorded once, here; the rules are [03 §7](03-connectivity.md), the client's side
+[10 §11](10-client.md).
+
+**The deployment was measured before the phase was written.** A relay on an established
+host's machine, behind one forwarded port and advertising the machine's own address, carried
+a session from an earlier client implementation to that host at 0.8 ms more round trip than a
+direct session on the same pair. The same session showed the two faults this phase is written
+against: the relayed address reached the host before any permission for the host's address
+existed, and the host's checks that did pass were answered outside the relay, so the host
+finished its punch late and read the first media as malformed connectivity messages. Probed
+directly, the same relay relays to its own machine's address with full-size datagrams intact,
+carries channel data both ways, keeps its allocation range off the router, grants a permission
+for any address, and destroys an allocation that sends toward loopback.
+
+- [x] **The relay's codec** (`lowlat-core`): the allocation, refresh, permission,
+  channel-binding and send messages built; answers, errors, challenges, addresses, lifetimes,
+  data indications and channel data read; the long-term key and integrity; the class read
+  with both of its bits. One new dependency, `md-5`, for the key alone. Fuzzed. *C10.1.*
+  Built: the standard's long-term sample reproduced byte for byte; both framings done in
+  place, nothing copied; `zeroize`, already in the graph, clears the key. Driven against the
+  deployed relay before anything else was built on it.
+- [x] **The relay in the endpoint** (`lowlat-core`): recognised by its source before any
+  datagram is classified, unwrapped there and wrapped on the way out for everything bound to
+  a relayed peer, its timers among the endpoint's. The attempt's order -- allocate, permit the
+  relay's own address, only then advertise; permissions per address; a channel once the path
+  exists; renewals at 240 s and at half the lifetime; the stale nonce; the path following the
+  host; nothing toward loopback; a clean leave that releases; typed failures. Zero allocations
+  per relayed datagram. *C10.2.* Built: setup's deadline, five seconds, covers the allocation
+  and the relay's own machine; a refusal of that machine still ends setup, since a relay
+  elsewhere may refuse its own address; a success counts only under the key; the one mapping
+  probe is not sent through the relay.
+- [x] **A relay in the simulator** (`lowlat-sim`), written from the specification and not from
+  our codec, because a client and a server written from one misreading agree with each other
+  perfectly; with a deployed relay's behaviours -- permissions that lapse at 300 s, a nonce
+  that rotates, an allocation destroyed by a send toward loopback. The host-machine topology
+  behind one forwarded port, and a symmetric client. *C10.3.* Built with a router's forwarded
+  port and delivery between hosts behind one translator added to the network.
+- [x] **The relay attempt through the boundary** (`lowlat-client`, `lowlat-sdk`, minor 14): a
+  relay in `lowlat_client_config` -- the server as `host:port`, resolved like the reflexive
+  servers, and the credential, never logged and cleared when dropped -- and a relay configured
+  makes the attempt a relay attempt. Status gains the relayed address and whether the path is
+  relayed; three outcomes, unreachable, refused and lost. *C10.4.* Built: both structures are
+  now read and filled as far as the caller's size reaches, which they had not been
+  ([06 §11](06-api.md)); a hermetic session of this host's framing runs clean through the
+  simulated relay.
+- [x] **The demo takes a relay from the environment** and never prints the credential.
+  *C10.5.* A minute against an established host through the deployed relay: 27 ms, nothing
+  lost or late, a clean leave.
+- [x] **A real relay in the namespace fixtures**: a relay server and a host endpoint behind one
+  forwarded port, the client behind symmetric translation. *C10.6.* Beside the same topology
+  without the relay, which times out.
+- [x] Documentation: 06 §3b, 07 (the deployment), 10 §11 as built, the changelog.
+- [x] **A path is both directions** (`lowlat-core`), found by gate 3: our check answered and
+  the host's check answered by us, and nothing on the wire ahead of that answer, pacing or
+  not ([03 §5](03-connectivity.md)). *C10.7.* Every connect of this client had left a burst
+  of malformed connectivity messages on the established host's log, direct or relayed; the
+  relay had not caused them, and the ordering the relay attempt was written with could not
+  remove them. Each rule shown failing with its mechanism taken out; the namespace fixture
+  that forces the answer's source is judged on its check being answered, since it withholds
+  the candidate that would let the other side check back.
+
+**Gate:**
+
+1. [x] The workspace tests, the lints, the dependency policy and the ABI gate pass; zero
+   allocations on the relayed per-datagram path, both ways. *1083 tests; both framings, with
+   what crossed counted.*
+2. [x] Under the simulator: a symmetric client reaches the host through the relay and times
+   out without it; full-size datagrams both ways, as indications and as channel data; three
+   permission lifetimes and a nonce rotation crossed with the path kept; a loopback candidate
+   never relayed; each outcome from its cause. Each check shown failing with its mechanism
+   taken out before it is trusted. *Nine runs, and a real relay in namespaces besides. Two
+   runs could not fail until they changed: a late permission renewal is hidden while a
+   channel is bound, and loopback is stopped twice on the way out.*
+3. [x] **Against an established host with the relay on its machine**: the demo through the
+   relay, relay only, twelve minutes with motion on the host -- two permission lifetimes and
+   the relay's nonce rotation crossed -- the host's log naming the relayed path and **no
+   malformed connectivity message at connect**; round trip and overhead against a direct
+   session on the same pair, where 0.8 ms more is the figure to meet. *Met 2026-09-23 in two
+   runs. Twelve minutes with motion (9.0 Mbit/s at the mean, 26 at the peak): 26 ms at the
+   median against 27 for a direct session on the same pair, 688,343 fragments with nothing
+   lost or late and no resend asked for, three permission renewals and two refreshes crossed
+   -- and malformed connectivity messages on the host's log at connect, which failed it and
+   which C10.7 answers. With C10.7, three minutes relayed to the same host, restarted with its
+   log cleared: none at connect. The host's path is the relayed address by construction, the
+   only candidate offered; the deployed relay's own log was not read, so its nonce rotation
+   is gate 4's to show.*
+4. [x] Optional: the same against this host, with a relay beside it. *Met 2026-09-23, the
+   desktop idle (0.2 Mbit/s at the mean, 3.2 at the peak; the motion was gate 3's), against
+   the installed host, which predates C10.7. A credentialed relay on the machine's own
+   address rotating its nonce every 600 s, the demo on an offscreen display on the same
+   machine, since a window on the captured desktop feeds its own input back to the host:
+   twelve and a half minutes, the host's log naming the relayed path, 80,936 fragments with
+   nothing lost, late or duplicated and no resend asked for. The relay's log shows three
+   permission renewals with the channel's, two refreshes, the rotated nonce refused twice
+   and both requests granted when sent again, and the allocation released at the leave.
+   Round trip under the millisecond relayed and direct, below what the status resolves.*
+
+## Phase C11 - The relay over TCP (planned and built 2026-10-17)
+
+**Planned and built 2026-10-17**, the interview and the build the same day; the namespace
+fixture waits for a Linux machine. A client on a network that blocks
+UDP reaches nothing through C10's relay, which it speaks to over UDP alone. This phase lets it
+reach the same relay over TCP; the allocation and the host's leg stay datagrams, so the host
+still takes no part ([00 D15](00-overview.md), amended). **TLS is not offered** -- it would
+protect nothing the session needs, measured no better than TCP on the same leg, and is the TLS
+stack inside the boundary that D3 keeps out. The rules are [03 §7.4](03-connectivity.md), the
+shell's part [02 §5-§6](02-io-shell.md), the client's side [10 §11](10-client.md).
+
+**The relays were measured before the phase was written**, with an earlier implementation of
+the stream carrier against an established host. A relay on the host's own machine served TCP on
+its forwarded port, and its TCP leg carried a steady 14.4 Mbit/s as cleanly as UDP. A public
+relay service's TCP leg lost 0.65 to 1.87 percent of the same load, with stalls up to half a
+second, while retransmitting nothing: it throttled itself to four segments a round trip for
+about 300 ms at a time and paused outright, dropping what it could not hold. Each stall set off
+the session's own recovery against the stalled stream: duplicates, late arrivals and loss bursts
+near 1 percent, none over UDP. So the stream is the last rung, and its cost is stated per relay.
+
+- [x] **The stream's framing and a reliable carrier** (`lowlat-core`): each message found in
+  place from its length, channel data padded to four bytes on a stream, a reserved channel
+  skipped by its length, a header that is neither ending the stream; nothing re-sent over TCP
+  and no timer armed by an answer awaited; an error-class answer that verifies under the key and
+  names no code read as a refusal. Fuzzed. *C11.1.*
+- [x] **The stream on the loop's wait** (`lowlat-net`): the stream a socket of the platform
+  module beside the datagram one -- one more descriptor in the Linux poll, the stream's own key on
+  the Windows port with the connect, a zero-length receive kept posted and sends from staging
+  completing there -- the wake unchanged. Set once at open: non-blocking, `TCP_NODELAY`, no
+  buffer sizes, `MSG_NOSIGNAL` on Linux. One fixed receive buffer parsed in place, everything
+  ahead of the stream's end handed out before it; a pass's frames written a staging at a time;
+  teardown takes every posted operation back. Zero allocations per message both ways.
+  No new dependency. *C11.2.*
+- [x] **A stream leg in the simulator** (`lowlat-sim`): ordered, lossless, with scripted stalls
+  and the relay's bounded queue that drops while the stream is stopped; the relay's stream
+  listener written from the specification. *C11.3.*
+- [x] **The TCP relay attempt through the boundary** (`lowlat-client`, `lowlat-sdk`, minor 29):
+  `relay_carrier` in `lowlat_client_config`; a TCP attempt opens no datagram socket and asks for
+  no gateway mapping; one five-second setup deadline with the connect in it; the connect, the
+  stream's end and a stalled write mapped onto the three outcomes. *C11.4.*
+- [x] **The demo takes the carrier from the environment** (`LOWLAT_RELAY_CARRIER`). *C11.5.*
+- [ ] **The relay over TCP in the namespace fixtures**, the client's datagrams dropped at its own
+  firewall. *C11.6.*
+- [x] Documentation as built: 02, 03 §7.4 and §11, 06 §3b, 07 §12, 08, 10 §11, the changelog.
+
+**Gate:**
+
+1. [x] Both platforms' workspace tests and lints, the dependency policy and the ABI gate; zero
+   allocations per message on the stream, both ways, with what crossed counted.
+2. [x] Under the simulator: full-size datagrams both ways over the stream, as indications and as
+   padded channel data; a half-second stall with a dropped run survived; two permission
+   lifetimes and a nonce rotation crossed over the stream (the datagram run crosses three); each
+   outcome from its cause -- the connect refused, the credential refused, a relay that forgot the
+   allocation -- and, through the client's real loop against the same relay on loopback, the
+   stream ended before the allocation and after it. The stream reset and the stalled write are
+   shown on the stream itself and end the attempt by the same path as its end. Each check shown
+   failing with its mechanism taken out before it is trusted.
+3. [ ] In namespaces: a real relay over TCP, the client's datagrams dropped.
+4. [x] **Live**, ten minutes each with motion on the host, each beside the same relay over UDP on
+   the same pair: a public relay service over TCP on both of its ports, and a relay on the host's
+   machine over TCP; late, duplicated, asked again, resent by the host, the loss over thirty
+   seconds and the round trip, for both carriers.
+
+**The live gate, run 2026-10-17** (ten minutes each, the host streaming motion; requests for
+missing fragments, the host's resends, duplicates, the loss over thirty seconds at its peak):
+
+| relay, carrier | round trip p50 / p95 | Mbit/s | requests | resends | duplicates | loss30 |
+|---|---|---|---|---|---|---|
+| on the host's machine, UDP | 23 / 24 ms | 9.35 | 52 | 80 | 42 | 0.11 % |
+| on the host's machine, TCP | 24 / 24 ms | 9.30 | 538 | 833 | 472 | 0.28 % |
+| public service, UDP | 85 / 86 ms | 8.56 | 177 | 275 | 178 | 0.58 % |
+| public service, TCP 3478 | 89 / 140 ms | 3.38 | 342 | 2,456 | 1,064 | 0.83 % |
+| public service, TCP 80 | 97 / 151 ms | 2.86 | 411 | 2,685 | 1,113 | 1.69 % |
+
+Every session held its ten minutes at 24 pictures a second. The stream to the relay on the
+host's machine carries UDP's rate at its round trip, at about ten times the recovery traffic;
+the public service's costs its rate, its round trip's tail and two thousand timeout resends.
+Every segment the client sent to the relay carried the audio-video marking on the wire.
+
+## Later, and not in v1
+
+- **A Windows client**: the completion-port receive path in the shell ([02 §6](02-io-shell.md)),
+  Media Foundation or NVDEC, shared textures with fences as the handle kind, the toolkit's
+  D3D11 renderer. Its own phase when Linux is done; the design already names its handle.
+  *Planned 2026-09-26 as W1 ([impl-plan-windows.md](impl-plan-windows.md)): D3D11 video
+  decoding first, then NVDEC, the pair, and the system's decoder in software only; the handle
+  is one shared texture per plane, finished on the device before it can be acquired, so it
+  needs no fence.*
+- **A macOS client** (*planned 2026-10-29 as M0 and M1, [impl-plan-macos.md](impl-plan-macos.md)*):
+  the kernel-queue receive path with the batched receive, VideoToolbox then the LGPL pair from the
+  package managers' directories, one IOSurface per picture as the handle kind, the toolkit's
+  Metal renderer; the client half alone, never a host.
+- **A second stream, the browser pipe, pen and touch, the microphone uplink.** Each is known
+  and none is needed for a client that streams. *The microphone uplink built 2026-10-12
+  (C5.25).*
+- **A session that changes its frame kind**: `lowlat_frame.kind` is already per frame, so a
+  mixed-kind session is expressible without a change to the surface; what it needs is a
+  queue that holds both kinds of slot at once. Not needed by anything that streams today.
+  *Planned in W1*: each slot carries its own backing, and `lowlat_client_set_frame_kind`
+  switches at the next picture.
+- **The vendor backend's planes read back into page-locked memory** (*measured
+  2026-09-25*): the read-back into ordinary memory is staged by the driver through its own
+  buffer, the thread copying out of it and waiting on each chunk -- spinning, since a
+  sleeping chunk wait slows it by 0.1-0.4 ms. Into page-locked memory it is one transfer and
+  one wait: at 2160p 26 us of CPU a picture against 1023, at the same 1.0 ms, and a 99th
+  percentile of 2.5 ms on two busy cores against 5.9. It needs the queue's host slots
+  registered with the device while that backend runs, against slots that are backed only
+  when first used and a decoder that can change mid-session.
+
+### Deferred decisions, recorded 2026-09-16, decided 2026-09-19
+
+Each is written up in [10-client.md](10-client.md) and was decided on the numbers the C2 gate
+records. **Decided at C5's planning: none of the three is in v1** (the reasoning is in C5
+above and in 10 §4.1). They stay written down here so the shape is not re-derived if a
+slower decoder ever reopens them.
+
+- **A decode-lag keyframe request** ([10 §5](10-client.md)): a third trigger for the request,
+  when the reader is behind by more than a threshold with no announced keyframe ahead, rate
+  limited; the catch-up then lands on it. A divergence from the established client, correct
+  on a reliable channel, an encoder rebuild every two seconds on the established host while
+  the lag lasts. Thresholds measured, not picked.
+- **A presentation-rate hint and a sustainability event** ([10 §9](10-client.md)): the
+  application's display rate in `lowlat_client_set_config`, the sustainable rate in status,
+  an event when the decoder cannot keep up with the rate the library recommends; the
+  application relays it as `encoderFPS` in its own protocol, which is the one lever every
+  host honours. The library never sends that message.
+- **A presentation pacer in the application** ([10 §4.1](10-client.md)): a deeper hold count
+  on acquire for an application that wants evenness over currency, as Moonlight offers
+  pacing as an option beside a client-set frame rate. The library stays latest-wins.
+- **Temporal layering on the host** is the only per-guest frame-rate lever, and belongs to a
+  host phase; noted here because every client-side answer above ends at it.
+
+## Change log
+
+Newest first.
+
+- 2026-10-17: C11 built: the stream to the relay in the core, the shell, the simulator, the
+  client and the SDK (minor 29) and the demo, and its live gate run through two relays; the
+  namespace fixture waits for a Linux machine.
+- 2026-10-17: C11 planned: the relay over TCP where UDP is blocked, TLS not offered; the
+  stream a socket on the loop's own wait, not a second loop; the relays measured first, a relay
+  on the host's machine clean over TCP and a public relay service costly.
+
+- 2026-10-12: the codec library is replaced, in both directions and on both sides: the new
+  decoder reads every stream tried to within one step of a sample of the reference decoder,
+  hybrid packets included, has not been seen to panic, and neither half allocates per frame.
+- 2026-10-12: the client sends the application's microphone (minor 25), in frames of ten
+  milliseconds, compressed in the codec's transform mode alone unless uncompressed sound was
+  declared, gated by the host's answer; the codec library is to be replaced next, its decoder
+  having been measured reading a peer's hybrid packets short.
+- 2026-10-12: the application may send a header of its own on the control channel (minor
+  24), as given and in order with the input; the library's own opcodes and those with a body
+  are refused.
+- 2026-10-09: the decoder is built for the codec its parameter set names, not the header's
+  byte, which a host of the earlier generation writes as the first codec over HEVC too.
+- 2026-10-05: an attempt may be confined to IPv4 (minor 21), to exercise the IPv4 path's
+  translation where IPv6 would connect directly.
+- 2026-09-25: the demo's toolkit gathers a signaling message sent in fragments, the likely
+  cause of the answer lost twice; checked on loopback, in CI.
+- 2026-09-25: the handle path's copy is waited on asleep; the whole context left as it is,
+  and the planes route's page-locked read-back measured and written down as later work.
+- 2026-09-25: a stream silent about its reordering stays in time past its frame number's
+  wrap; it had stopped for sixteen pictures there and run sixteen behind.
+- 2026-09-25: a new attempt starts from nothing the last session left; live, the demo moved
+  between two established hosts on one handle, one answer lost to the signaling socket.
+- 2026-09-25: a second session on one handle waits for its pictures, and a departure ends
+  when the session's loop does, 263 ms where it took 501.
+- 2026-09-25: a departure holds nothing else up; ending a connection had held the handle
+  through its half-second grace.
+- 2026-09-24, night: the full range becomes the application's to ask for (minor 17), once
+  the declaration bit taken for a base flag turned out to be full range.
+- 2026-09-24, night: the drag remainder measured and closed. Minor 16 stamps every picture
+  with its arrival; beside the established client, arrival to present is 1.3 ms by planes and
+  0.7 by handle, and this client's own input does not hold the video back.
+- 2026-09-24, evening: the one part of C5's decode-half gate not run -- ten minutes of the
+  handle route at full chroma -- run at each depth against an established host playing a
+  looping video, whose sound the same runs carried; clean at both.
+- 2026-09-24, later: C5 closed. Gate C in full passed against an established host: the desk
+  items confirmed by the person at the desk once two faults they found were fixed -- relative
+  deltas scaled by the drawn size, which made drags slower than the hand, and a demo loop
+  that looked for a new picture only after presenting the old one again, a refresh late --
+  and ten unattended minutes on each backend with every format that host sends walked.
+- 2026-09-24: C5 gains the picture's range (minor 15), found at the desk: an established
+  host sent full-range pictures that every backend handed out as the video range. The range
+  is the stream's, read from its parameter set, carried per picture and never converted;
+  the frame is filled as far as the caller's size reaches, which its first growth needed.
+- 2026-09-23, night: C10 closed. Gate 3 met in two runs, the second with C10.7 and no
+  malformed message at connect; gate 4 against this host with a relay beside it, where the
+  relay's own log showed its rotated nonce answered and the allocation released.
+- 2026-09-23, evening: gate 3's first run failed on its one host-side criterion. The host's
+  log showed malformed connectivity messages at connect, and so did every stored log of this
+  client's connects, direct ones included: a path was taken on our answer alone, while the
+  host was still reading checks. C10.7 makes a path both directions; the gate is run again.
+- 2026-09-23, later: C10 built through C10.6, gates 1 and 2 met; gate 3, twelve minutes against
+  an established host through the deployed relay, is open. The client structures of the
+  boundary had been refused below their full size and are now read and filled as far as the
+  caller's size reaches, which minor 14 was the first to need.
+- 2026-09-23: C10 planned, and the host's relay phase dropped for it. The relay is the
+  client's: it serves every established host because it asks nothing of any host, and the
+  deployment it is for, a relay on the host's own machine behind one forwarded port, works
+  from the connecting side only. A relay attempt is relay-only, and it permits the host's
+  machine before it advertises, the ordering an earlier implementation got wrong; the relay's
+  own quirks were probed on a deployed one before any code, and one of them -- an allocation
+  destroyed by a send toward loopback -- became a rule. Next, ahead of the owed desk items.
+- 2026-09-22: C6 re-planned at minor 13, after C7 to C9 had each changed what it packages.
+  The client-only build and the demo's link against it are checked on every push rather
+  than in the hand-started build; two tarballs from one job, each copied out before the
+  next build lands on the same file, each saying what it carries through a line a program
+  prints from the tarball's own copy; the demo inside the client tarball as a bare binary
+  with a run path relative to itself; the closure widened to the README and the document
+  maps, which still describe a host with a client planned; and a second gate item, the
+  tarball's own demo streaming from the established host, because nothing else in the gate
+  proves the shipped client streams.
+- 2026-09-21: C8 planned. The deferred software-decode decision is taken: the machine's own
+  libavcodec, loaded at runtime and only when it answers that it is an LGPL build, nothing
+  shipped; the pair searched for in the environment, beside the executable, then the
+  linker's own way, the highest major winning; no header pinned, the leading fields
+  checked against the library that loaded, every number that could move resolved by name;
+  the same four formats out, converted in the copy; last in the automatic order; and a
+  decoder chosen mid-session as one act with one keyframe request, the frame kind fixed at
+  creation. No automatic fallback of any kind. C8 runs before C6.
+- 2026-09-20: C7 planned with Phase 14. The pair recorded at C3 as later has its wire
+  already (opcode 31 in, 33 out, raw reports); the library derives the standard state
+  beside the report so every host has a pad; feature reports go first and are bounded;
+  Bluetooth is normalised in the library; the demo reads the raw nodes itself rather than
+  patching the toolkit; a DualSense against an established host is application policy,
+  neither promised nor gated; C7 runs before C6.
+- 2026-09-19, evening: C5's second half planned. The cursor's picture is decoded in the
+  library and delivered from a buffer the handle owns, valid until the next poll; scaling
+  the pointer is the application's, because nothing in the library can; the guest list is
+  handed over with the recipient's number rather than parsed, the library needing nothing
+  from it; the client's metrics take a shape of their own, with a recent-loss figure read
+  from late arrivals, and the host's structure stays the host's.
+- 2026-09-19: C5 planned in two halves, the decode half first. The declaration is a
+  preference masked by capability with no fallback to another decoder; the second backend is
+  driven from the library's own readers and probed by building a real decoder per
+  combination; the handle path is in this phase on Linux, the slots becoming exportable
+  device allocations sized at the stream's size and the application toolkit becoming a
+  vendored tree so its renderer can import them; the three deferred decisions are decided as
+  none in v1, the reader's lag being the application's warning; opcode 21 goes out on a time
+  cadence with both kinds.
+- 2026-09-18, evening: C4 planned and built. The playback window leaves the library for the
+  application's device, where every reference keeps it and where the clock is; sound is
+  decoded on the application's call rather than on a thread of its own; the pool drops and
+  counts; the demo reads resyncs from its device's own queue and logs them at once; "both
+  ways" in the hermetic gate is read as both codecs, the uplink being deferred in the same
+  phase. Gate 2 passed; gate 1 passed on the established host over eighty-five minutes (40 ppm
+  of drift read from the device's queue, a flush every 35 minutes, nothing dropped or
+  refused); the demo's resync counter was counting one flush three times and was fixed after
+  the run. The run from this host passed the letter and measured a null sink's timer, not
+  drift. C4 closed.
+- 2026-09-18, later: C3 closed. The gate found the demo's event loop bound to the display,
+  which is the wrong cadence for a toolkit that reads one pad event a pass; presenting moved
+  to its own thread, as every established client has it. The wire's vertical stick sign was
+  read live rather than argued.
+- 2026-09-18: C3 planned. The application hands over the rectangle it drew into and the
+  library computes no fit; keys are usage codes with the event's own modifier mask; the
+  input ring drops and counts rather than blocks; the relative-mode event carries the warp
+  position in window coordinates; the two-monitor gate item is driven from the demo through
+  the application protocol; the DualSense pair and a Unicode key message are recorded as
+  later, not lost.
+- 2026-09-17, later: C2 closed. The library reads both bitstreams itself in full syntax and
+  hands the device the picture and slice parameters, because the interfaces here decode from
+  those and the licence rule keeps every other reader out; the clips are checked against an
+  independent decoder, never against ourselves; the slots are sized at the ceiling, backed at
+  the first picture and laid out at the picture's own pitch; the read-back's cost is the
+  driver's mapping and was measured rather than optimised; the gate's cadence figures were
+  taken with the demo's own knobs on one display, the old-framing half of item 3 hermetically,
+  and an established host turned out to require the offer's `mode`. The deferred decisions
+  carry their numbers and are decided at C5's planning.
+- 2026-09-17: C1 closed. The receive thread owns the ring and therefore the catch-up; the
+  access-unit buffer is sized from the ring rather than at 16 MiB; the keyframe policy is a
+  state machine tested against a fake until C2 brings a decoder; both ciphers, with a setting
+  for the legacy one; no C# client, ever -- the demo is C on the toolkit.
+- 2026-09-16: the keyframe request is one act with the teardown, stream 0 declares through
+  the initialization, C2 records the cadence and lag numbers, and four deferred decisions are
+  written down with what decides each.
+- 2026-09-15: the plan is written, after C0 landed the same day.

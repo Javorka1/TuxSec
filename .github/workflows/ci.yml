@@ -1,0 +1,360 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - feat/*
+      - fix/*
+      - release/*
+      - pre/*
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: format, lints, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+
+      # The colour conversion is checked against a reference computed on the
+      # processor, and that check runs on the software driver rather than
+      # needing a graphics card. It is the only thing that catches a wrong
+      # colour matrix: comparing a converted desktop against its source is
+      # nearly blind to one, because a desktop is mostly grey and a grey pixel
+      # carries no colour for a matrix to act on.
+      # The rest is for the demo below: the toolkit's shader compiler, since
+      # its shader headers are made at build time rather than committed, and
+      # the three libraries whose headers it compiles against -- it opens
+      # every library at run time, but these three it declares from the
+      # system's own headers -- and the headers SDL's sound and pad backends
+      # are built against, which it likewise loads at run time.
+      - name: Install a graphics driver for the conversion test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libegl1 libgl1-mesa-dri libgbm1 vulkan-tools \
+            glslang-tools bsdextrautils libasound2-dev libpng-dev libjpeg-dev \
+            libpulse-dev libpipewire-0.3-dev libudev-dev
+
+      # What the software driver on this runner offers, in the log, so a test
+      # refused an interface can be read against the driver rather than
+      # guessed at.
+      - name: Describe the software driver
+        run: |
+          vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverInfo|apiVersion' || true
+          vulkaninfo 2>/dev/null | grep -E 'VK_EXT_image_drm_format_modifier|VK_EXT_external_memory_dma_buf|VK_KHR_external_memory_fd|VK_EXT_queue_family_foreign' | sort -u || true
+          ls -la /dev/udmabuf /dev/dri 2>&1 || true
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # AGENTS.md 1: ASCII only, section sign excepted. Runs first because it
+      # needs no toolchain and fails fast.
+      - name: ASCII check
+        run: python3 scripts/check-ascii.py
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Each half alone. Everything else here builds all features or the
+      # defaults, under which a reference from one half into the other's
+      # crates compiles; it is an error only when that other half is absent,
+      # which is the build a platform that can only be a client makes.
+      - name: Clippy, the client half alone
+        run: cargo clippy -p lowlat-sdk --no-default-features --features client -- -D warnings
+
+      - name: Clippy, the host half alone
+        run: cargo clippy -p lowlat-sdk --no-default-features --features host -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --all-features
+
+      # `--all-features` above turns on `gpl-libavcodec`, which a release
+      # build never has: the codec library's licence rule as shipped, where
+      # a GPL pair -- the runner's own, when it has one -- is refused.
+      - name: Tests, the licence rule as shipped
+        run: cargo test -p lowlat-drivers --lib lavc
+
+      - name: Build release
+        run: cargo build --workspace --release
+
+      # The client-only library, copied out at once: it lands on the same
+      # file the release build above wrote, and any later build would land on
+      # it in turn, so nothing reads it from where cargo put it.
+      - name: Build the client-only library
+        run: |
+          cargo build --release -p lowlat-sdk --no-default-features --features client
+          mkdir -p "$RUNNER_TEMP/client-only/lib"
+          cp target/release/liblowlat.so "$RUNNER_TEMP/client-only/lib/"
+          if nm -D --defined-only "$RUNNER_TEMP/client-only/lib/liblowlat.so" | grep -q ' lowlat_host_'; then
+            echo "a host symbol in the client-only library"; exit 1
+          fi
+
+      # SDL, for the demo's pads and sound, which this runner's system does
+      # not package: its release, built static.
+      - name: Build SDL for the demo
+        run: bash scripts/build-sdl3.sh "$RUNNER_TEMP/sdl3"
+
+      # The demo linked against that copy: the one thing that links the client
+      # symbols the way an application does, so a name the client half lost
+      # fails here, at the link, rather than in somebody's integration. A
+      # feature bit only says which half was asked for.
+      - name: Build the demo against the client-only library
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/sdl3/lib/pkgconfig
+        run: make -C examples/client LOWLAT_LIB="$RUNNER_TEMP/client-only/lib" client
+
+      # The websocket reader the demo's signaling reads through, against a
+      # loopback server that sends messages in fragments: only whole ones
+      # may come out. Needs no network.
+      - name: The toolkit's websocket reader
+        run: make -C examples/client check
+
+  # The crates with a Windows side, on Windows (docs/impl-plan-windows.md).
+  # Per-platform code is a module of the same name on each platform rather
+  # than a trait, so this build is the only thing holding the two sides to
+  # one shape. The crates with no Windows side yet build empty there, which
+  # keeps the whole workspace building; examples are left out, because the
+  # ones there are probes of Linux hardware.
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    # The environment's flags replace .cargo/config.toml's rather than adding
+    # to them, so the static C runtime is asked for again: CI builds what ships.
+    env:
+      RUSTFLAGS: -D warnings -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: rustup component add clippy
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # The display driver links the driver kit's stub libraries: the kit,
+      # pinned by its digest, unpacked into target/wdk (docs/11-drivers.md).
+      - name: Driver kit
+        run: python scripts/fetch-wdk.py
+
+      # vcpkg at the baseline both manifests name, so its ports are theirs, with
+      # the packages it builds kept between runs.
+      - name: vcpkg
+        run: |
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          git -C $vcpkg fetch --quiet origin 19780d9cdf84d0944cf9a318666703b89ab6629c
+          git -C $vcpkg checkout --quiet 19780d9cdf84d0944cf9a318666703b89ab6629c
+          & "$vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\vcpkg-cache" | Out-Null
+          "VCPKG_ROOT=$vcpkg" >> $env:GITHUB_ENV
+          "VCPKG_BINARY_SOURCES=clear;files,$env:RUNNER_TEMP\vcpkg-cache,readwrite" >> $env:GITHUB_ENV
+
+      - name: vcpkg's packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-${{ hashFiles('.github/windows-tools/vcpkg.json', 'examples/client/vcpkg.json') }}
+
+      # The runner has no GPU and no codec library: an LGPL pair built by vcpkg,
+      # its decoders alone, is what the software backend's clips decode through,
+      # and glslang's tools are what the demo's toolkit compiles its shaders with.
+      - name: The LGPL pair and the shader compiler
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --x-manifest-root=.github/windows-tools `
+            "--x-install-root=$env:RUNNER_TEMP\windows-tools" --triplet x64-windows --disable-metrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "LOWLAT_FFMPEG_DIR=$env:RUNNER_TEMP\windows-tools\x64-windows\bin" >> $env:GITHUB_ENV
+          "$env:RUNNER_TEMP\windows-tools\x64-windows\tools\glslang" >> $env:GITHUB_PATH
+
+      - name: Clippy
+        run: cargo clippy --workspace --lib --bins --tests -- -D warnings
+
+      # Every crate runs past a failure in another: a timing test's flake on
+      # the shared runner once stopped the job before the library's own gates.
+      # The pair named above opens the library's tests that wait for one.
+      - name: Tests
+        run: cargo test --workspace --lib --bins --tests --no-fail-fast
+
+      # The clips the software backend decodes, which wait for a pair and so
+      # run only where one is named; each target a step, so none hides another.
+      - name: The clips through the pair
+        run: cargo test -p lowlat-decode --test software_decode -- --ignored
+
+      - name: The software backend allocates nothing per unit
+        run: cargo test -p lowlat-decode --test software_no_alloc -- --ignored
+
+      - name: A session through the software backend
+        run: cargo test -p lowlat-client --test hermetic the_session_decodes_the_clip_through_the_software_backend -- --ignored
+
+      # The demo as the build workflow packages it, linked from the client-only
+      # static library: the one thing that links the client the way an
+      # application does, and the one build of the toolkit, which a fresh
+      # checkout makes. Started with no peer, it names that library and leaves.
+      - name: The demo against the client-only static library
+        run: |
+          cargo rustc --release -p lowlat-sdk --no-default-features --features client --crate-type staticlib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target\release\lowlat.lib "$env:RUNNER_TEMP\lowlat-client.lib"
+          . scripts\vs-env.ps1
+          Push-Location examples\client
+          cmake --preset win-x64-clang-release "-DLOWLAT_LIB=$env:RUNNER_TEMP\lowlat-client.lib"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build --preset win-x64-clang-release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          Remove-Item Env:\LOWLAT_PEER, Env:\LOWLAT_SESSION -ErrorAction SilentlyContinue
+          $out = & examples\client\build\win-x64-clang-release\client.exe 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $out
+          if ($code -ne 2) { "the demo left with $code"; exit 1 }
+          if ($out -notmatch 'features=0x2\b') { "the demo carries more than the client half"; exit 1 }
+          exit 0
+
+      # The drivers as they are packaged: release builds, linked.
+      - name: The display driver
+        run: cargo build -p lowlat-vdd --release
+
+      - name: The input driver
+        run: cargo build -p lowlat-hid --release
+
+  # The client's platform (docs/impl-plan-macos.md): each architecture on its
+  # own arm64 runner, x86_64's tests under the system's translation layer.
+  # Windows's form: the examples probe one platform's hardware.
+  macos:
+    name: macOS (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        run: |
+          rustup component add clippy
+          rustup target add ${{ matrix.target }}
+
+      - name: The translation layer
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --lib --bins --tests --target ${{ matrix.target }} -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --lib --bins --tests --no-fail-fast --target ${{ matrix.target }}
+
+  loom:
+    name: model checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # docs/08-testing.md 7: concurrency primitives are model checked, not
+      # soak tested. This job is not optional.
+      - name: Loom
+        run: cargo test -p lowlat-common --lib --release
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+
+  msrv:
+    name: the declared toolchain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The manifest's rust-version is what the resolver acts on: it holds back
+      # any release that asks for a newer compiler, a security fix included.
+      # Checking the workspace on exactly that toolchain keeps the number one a
+      # build has passed. It is read from the manifest, so a raise is made
+      # there alone.
+      - name: Check on the declared toolchain
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          rustup toolchain install "$version" --profile minimal --no-self-update
+          cargo +"$version" check --workspace --all-targets --all-features
+
+  deny:
+    name: licenses and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Run on the runner with the repository's own toolchain rather than in a
+      # musl container: rust-toolchain.toml pins a target the container has no
+      # toolchain for, which degrades dependency resolution before any policy
+      # is even evaluated.
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Deny
+        run: cargo deny check
+
+  sanitizers:
+    name: sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly
+        run: rustup toolchain install nightly --component rust-src
+
+      # The conversion tests run on the software driver here as they do in the
+      # check job; without it every one of them fails on an incompatible
+      # driver before the sanitizer has anything to look at.
+      - name: Install a graphics driver for the conversion test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libegl1 libgl1-mesa-dri libgbm1
+
+      # **Not the rate trajectories.** They are pure-Rust simulation of the
+      # congestion controller and took forty-nine of this job's fifty-two
+      # minutes sanitized, for code a memory sanitizer has nothing to say
+      # about; the plain job runs them. The simulator's other targets are
+      # cheap and drive the shell's real paths -- the browser pipe's record
+      # layer, recovery -- so they stay, named because cargo cannot leave one
+      # target of a crate out. A new target in that crate is added here.
+      - name: Address sanitizer
+        run: |
+          cargo +nightly test --workspace --exclude lowlat-sim --all-features \
+            -Z build-std --target x86_64-unknown-linux-gnu
+          cargo +nightly test -p lowlat-sim --all-features \
+            --lib --test netns --test recovery --test topology --test web_pair \
+            -Z build-std --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: -Z sanitizer=address
+          RUSTDOCFLAGS: -Z sanitizer=address
+          # The software driver's own allocations, which it never frees; see
+          # the file. Leak detection stays on for everything else.
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan-suppressions.txt

@@ -1,0 +1,52 @@
+[package]
+name = "lowlat-client"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# The software decoder takes a GPL build of the machine's codec library as
+# well as an LGPL one; see the drivers crate. Never on in a release build.
+gpl-libavcodec = ["lowlat-drivers/gpl-libavcodec"]
+
+[dependencies]
+lowlat-common.workspace = true
+lowlat-core.workspace = true
+lowlat-net.workspace = true
+# The gateway keeping this client's port open, and the port itself.
+lowlat-portmap.workspace = true
+# The offer's credentials are generated here; the core owns no generator.
+lowlat-crypto.workspace = true
+# The decoders, and the trait the feed drives one through.
+lowlat-decode.workspace = true
+lowlat-drivers.workspace = true
+# The sound decoder, the same one the host reads a microphone through.
+lowlat-audio.workspace = true
+# The inflate under the pointer's picture.
+miniz_oxide.workspace = true
+# The relay's credential, cleared when the configuration holding it is
+# dropped. Already in the graph beneath the credentials crate.
+zeroize = "1"
+
+# The tests run where the client builds; the hermetic session's beside the
+# host's crates, where a host runs.
+[target.'cfg(any(target_os = "linux", windows))'.dev-dependencies]
+# The hermetic session's other end: the host crate's own framing and
+# negotiation, driven under the simulator against this client.
+lowlat-host.workspace = true
+# The host's own expansion of input into device events, so what the client
+# sends is checked as the host would inject it.
+lowlat-inject.workspace = true
+
+[dev-dependencies]
+lowlat-sim.workspace = true
+# A gateway on loopback, so a handle's mapping is checked without the real one.
+lowlat-portmap = { workspace = true, features = ["fake"] }
+
+[lints]
+workspace = true

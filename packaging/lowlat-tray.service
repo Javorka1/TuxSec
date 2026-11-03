@@ -1,0 +1,21 @@
+# A user unit: starts with a graphical session and ends with it.
+[Unit]
+Description=lowlat tray
+PartOf=graphical-session.target
+# **After the target is reached, not as part of reaching it.** The compositor
+# socket and the session bus are imported into the user manager as the
+# desktop brings its session up, and its own services -- the clipboard's
+# among them -- start with it; a unit started alongside that sees neither.
+# Measured: started two seconds before the target was reached, with no
+# compositor socket in its environment.
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/lowlatd tray
+# Quit from the menu is an exit of zero and stays quit; the tray is back at
+# the next login, or by hand: systemctl --user start lowlat-tray.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
