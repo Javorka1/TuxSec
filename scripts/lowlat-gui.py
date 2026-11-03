@@ -332,6 +332,8 @@ def find_app_icon_path():
     candidates = [
         Path(__file__).resolve().parent.parent / "packaging" / "tuxsec.png",
         Path(__file__).resolve().parent.parent / "tuxsec.png",
+        Path.home() / ".local" / "share" / "pixmaps" / "tuxsec.png",
+        Path.home() / ".local" / "share" / "icons" / "hicolor" / "512x512" / "apps" / "tuxsec.png",
         Path("/usr/share/pixmaps/tuxsec.png"),
         Path("/usr/share/icons/hicolor/512x512/apps/tuxsec.png"),
     ]
@@ -694,6 +696,9 @@ class MainWindow(QMainWindow):
             def is_sys(name):
                 return name.lower().startswith(SYSTEM_AUDIO_PREFIXES)
 
+            def is_app_out_port(p):
+                return p.startswith(("output_", "playback_", "send_", "out_")) and not p.startswith("monitor_")
+
             if lowlat_fl is not None and lowlat_fr is not None:
                 if cfg["enabled"]:
                     for out_pid, in_pid in list(links):
@@ -704,18 +709,25 @@ class MainWindow(QMainWindow):
                             subprocess.run(["pw-link", "-d", str(out_pid), str(in_pid)], capture_output=True, timeout=1)
                             links.discard((out_pid, in_pid))
                     for out_pid, (node, port) in outputs.items():
-                        if is_sys(node) or is_blocked(node):
+                        if is_sys(node) or is_blocked(node) or not is_app_out_port(port):
                             continue
-                        if port == "output_FL" and (out_pid, lowlat_fl) not in links:
+                        if port.endswith(("_FL", "_0")) and (out_pid, lowlat_fl) not in links:
                             subprocess.run(["pw-link", str(out_pid), str(lowlat_fl)], capture_output=True, timeout=1)
                             links.add((out_pid, lowlat_fl))
-                        elif port == "output_FR" and (out_pid, lowlat_fr) not in links:
+                        elif port.endswith(("_FR", "_1")) and (out_pid, lowlat_fr) not in links:
                             subprocess.run(["pw-link", str(out_pid), str(lowlat_fr)], capture_output=True, timeout=1)
                             links.add((out_pid, lowlat_fr))
+                        elif port.endswith("_MONO"):
+                            if (out_pid, lowlat_fl) not in links:
+                                subprocess.run(["pw-link", str(out_pid), str(lowlat_fl)], capture_output=True, timeout=1)
+                                links.add((out_pid, lowlat_fl))
+                            if (out_pid, lowlat_fr) not in links:
+                                subprocess.run(["pw-link", str(out_pid), str(lowlat_fr)], capture_output=True, timeout=1)
+                                links.add((out_pid, lowlat_fr))
 
             apps = {}
             for pid, (node, port) in outputs.items():
-                if is_sys(node) or not port.startswith("output_"):
+                if is_sys(node) or not is_app_out_port(port):
                     continue
                 blk = is_blocked(node)
                 lnk = (lowlat_fl is not None and (pid, lowlat_fl) in links) or (

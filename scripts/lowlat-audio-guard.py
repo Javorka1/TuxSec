@@ -143,9 +143,12 @@ def enforce_once(cfg: dict | None = None) -> dict:
             elif port == "input_FR":
                 lowlat_fr = pid
 
+    def is_app_out_port(p: str) -> bool:
+        return p.startswith(("output_", "playback_", "send_", "out_")) and not p.startswith("monitor_")
+
     apps = {}  # node_name -> {"blocked": bool, "linked": bool}
     for pid, (node, port) in outputs.items():
-        if is_system_node(node) or not port.startswith("output_"):
+        if is_system_node(node) or not is_app_out_port(port):
             continue
         blocked = is_blocked_node(node, cfg["blocked"])
         is_linked = (
@@ -191,9 +194,9 @@ def enforce_once(cfg: dict | None = None) -> dict:
 
     # 2. Link all allowed application output_FL / output_FR / output_MONO ports to lowlat
     for out_pid, (node, port) in outputs.items():
-        if is_system_node(node) or is_blocked_node(node, cfg["blocked"]):
+        if is_system_node(node) or is_blocked_node(node, cfg["blocked"]) or not is_app_out_port(port):
             continue
-        if port == "output_FL" and (out_pid, lowlat_fl) not in links:
+        if port.endswith(("_FL", "_0")) and (out_pid, lowlat_fl) not in links:
             subprocess.run(
                 ["pw-link", str(out_pid), str(lowlat_fl)],
                 capture_output=True,
@@ -201,7 +204,7 @@ def enforce_once(cfg: dict | None = None) -> dict:
             )
             if node in apps:
                 apps[node]["linked"] = True
-        elif port == "output_FR" and (out_pid, lowlat_fr) not in links:
+        elif port.endswith(("_FR", "_1")) and (out_pid, lowlat_fr) not in links:
             subprocess.run(
                 ["pw-link", str(out_pid), str(lowlat_fr)],
                 capture_output=True,
@@ -209,7 +212,7 @@ def enforce_once(cfg: dict | None = None) -> dict:
             )
             if node in apps:
                 apps[node]["linked"] = True
-        elif port == "output_MONO":
+        elif port.endswith("_MONO"):
             if (out_pid, lowlat_fl) not in links:
                 subprocess.run(["pw-link", str(out_pid), str(lowlat_fl)], capture_output=True, timeout=1)
             if (out_pid, lowlat_fr) not in links:
