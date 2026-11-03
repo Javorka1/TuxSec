@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Universal Installer for Parsec Linux Host (lowlat + GUI Control Panel + PipeWire Anti-Echo)
+# Universal Installer for TuxSec — Parsec Linux Host (lowlat + GUI Control Panel + PipeWire Anti-Echo)
 # Supports: Arch / CachyOS / Manjaro, Debian / Ubuntu / Pop!_OS / Mint, Fedora / Nobara
 set -euo pipefail
 
@@ -14,7 +14,7 @@ if [ "$USER_ID" -eq 0 ]; then
 fi
 
 echo "============================================================"
-echo "  Parsec Linux Host — Instalador Automático com Interface"
+echo "  🐧 TuxSec — Instalador do Parsec Linux Host com Interface"
 echo "============================================================"
 
 install_deps() {
@@ -39,8 +39,8 @@ install_deps() {
 }
 
 build_if_needed() {
-    if [ -x "$HERE/target/release/lowlatd" ]; then
-        echo "[2/4] Binário pré-compilado 'lowlatd' encontrado! Pulando compilação."
+    if [ -x "$HERE/target/release/lowlatd" ] || [ -x "$HERE/bin/lowlatd" ]; then
+        echo "[2/4] Executável pré-compilado 'lowlatd' encontrado na pasta! Pulando compilação."
         return
     fi
     echo "[2/4] Compilando o daemon 'lowlatd' (Rust)..."
@@ -54,7 +54,7 @@ build_if_needed() {
 }
 
 install_files() {
-    echo "[3/4] Instalando serviços e painel gráfico no sistema..."
+    echo "[3/4] Instalando serviços, ícone TuxSec e painel gráfico no sistema..."
     sudo "$HERE/packaging/install.sh"
     sudo sed -i "s|^#* *PULSE_SERVER=.*|PULSE_SERVER=unix:/run/user/${USER_ID}/pulse/native|" /etc/lowlat/lowlatd.env || true
     if ! sudo grep -q "^PULSE_SERVER=" /etc/lowlat/lowlatd.env 2>/dev/null; then
@@ -72,7 +72,7 @@ build_if_needed
 install_files
 
 echo ""
-echo "✅ Instalação concluída com sucesso!"
-echo "   • Abrindo o Painel de Controle Parsec Linux Host..."
+echo "✅ Instalação do TuxSec concluída com sucesso!"
+echo "   • Abrindo o Painel de Controle TuxSec..."
 echo "   • Clique em '🔑 Conta Parsec' no topo do painel para fazer login!"
 nohup /usr/bin/lowlat-gui >/dev/null 2>&1 &

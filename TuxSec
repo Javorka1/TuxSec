@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Launcher direto do TuxSec (Parsec Linux Host)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ ! -x "/usr/bin/lowlatd" ]; then
+    echo "🐧 Primeira execução detectada! Instalando serviços do TuxSec..."
+    exec "$HERE/install-linux.sh"
+fi
+
+exec python3 "$HERE/scripts/lowlat-gui.py" "$@"

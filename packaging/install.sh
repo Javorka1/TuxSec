@@ -1,30 +1,28 @@
 #!/bin/sh
-# Install lowlatd where no package does: the layout the Debian package makes,
-# put in place by hand, and the same units enabled. Build it first, as yourself:
-#
-#     cargo build --release -p lowlatd
-#     sudo packaging/install.sh                # then: sudo lowlat-login --install
-#     sudo packaging/install.sh --uninstall    # keeps /etc/lowlat/lowlatd.env
-#
-# DESTDIR stages the files under a root of its own and touches nothing else on
-# this machine, which is what a distribution's own package recipe wants.
+# Install TuxSec / lowlatd system-wide.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 top=$(dirname "$here")
 dest=${DESTDIR:-}
-binary="$top/target/release/lowlatd"
+if [ -x "$top/target/release/lowlatd" ]; then
+    binary="$top/target/release/lowlatd"
+elif [ -x "$top/bin/lowlatd" ]; then
+    binary="$top/bin/lowlatd"
+else
+    binary="$top/target/release/lowlatd"
+fi
 env_file=/etc/lowlat/lowlatd.env
 
-# Every file but the configuration: where it goes, its mode, where it comes
-# from. The configuration is kept apart because it is the administrator's once
-# it exists.
 files() {
     cat <<EOF
 /usr/bin/lowlatd 755 $binary
 /usr/bin/lowlat-login 755 $top/scripts/kessel-login.py
 /usr/bin/lowlat-gui 755 $top/scripts/lowlat-gui.py
+/usr/bin/tuxsec 755 $top/scripts/lowlat-gui.py
 /usr/bin/lowlat-audio-guard 755 $top/scripts/lowlat-audio-guard.py
+/usr/share/pixmaps/tuxsec.png 644 $here/tuxsec.png
+/usr/share/icons/hicolor/512x512/apps/tuxsec.png 644 $here/tuxsec.png
 /usr/share/applications/lowlat-gui.desktop 644 $here/lowlat-gui.desktop
 /usr/lib/systemd/system/lowlatd.service 644 $here/lowlatd.service
 /usr/lib/systemd/user/lowlat-session.service 644 $here/lowlat-session.service
@@ -45,21 +43,16 @@ install_all() {
     files | while read -r to mode from; do
         install -D -m "$mode" "$from" "$dest$to"
     done
-    # A login writes the session into this file, so an existing one is kept.
     if [ ! -e "$dest$env_file" ]; then
         install -D -m 640 "$here/lowlatd.env" "$dest$env_file"
     fi
     [ -z "$dest" ] || return 0
     systemctl daemon-reload
     systemctl enable lowlatd.service
-    # Until it is logged in the service says so and exits, which is not a
-    # failure; a restart picks up a new binary over an old install.
     systemctl restart lowlatd.service
-    # For every user, the way a distribution enables its own: a login starts the
-    # helper and the tray, and a session already open picks them up at its next.
     systemctl --global enable lowlat-session.service lowlat-tray.service
     udevadm control --reload-rules 2>/dev/null || true
-    echo "lowlat: installed; log the host in with: sudo lowlat-login --install"
+    echo "tuxsec/lowlat: instalado com sucesso!"
 }
 
 uninstall_all() {

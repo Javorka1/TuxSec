@@ -1,10 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Parsec Linux Host
-Comment=Gerenciar conexões, monitores e permissões do Parsec Host no Linux
+Name=TuxSec (Parsec Linux Host)
+GenericName=Parsec Linux Host
+Comment=Gerenciar conexões, monitores, login e anti-eco do Parsec Host no Linux
 Exec=/usr/bin/lowlat-gui
-Icon=video-display
+Icon=/usr/share/pixmaps/tuxsec.png
 Terminal=false
 Categories=Network;RemoteAccess;Game;
-Keywords=parsec;lowlat;host;stream;remote;
+Keywords=tuxsec;parsec;lowlat;host;stream;remote;
 StartupNotify=true

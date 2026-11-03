@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtGui import QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -328,11 +328,28 @@ def parse_lowlatd_env():
     return cfg
 
 
+def find_app_icon_path():
+    candidates = [
+        Path(__file__).resolve().parent.parent / "packaging" / "tuxsec.png",
+        Path(__file__).resolve().parent.parent / "tuxsec.png",
+        Path("/usr/share/pixmaps/tuxsec.png"),
+        Path("/usr/share/icons/hicolor/512x512/apps/tuxsec.png"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return ""
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Parsec Linux Host — Painel de Controle")
-        self.setWindowIcon(QIcon.fromTheme("video-display"))
+        self.setWindowTitle("TuxSec — Parsec Linux Host")
+        icon_path = find_app_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
+        else:
+            self.setWindowIcon(QIcon.fromTheme("video-display"))
         self.resize(820, 720)
         self.setStyleSheet(STYLE_SHEET)
 
@@ -350,8 +367,18 @@ class MainWindow(QMainWindow):
 
         # Header
         header = QHBoxLayout()
+        if icon_path:
+            logo_lbl = QLabel()
+            pix = QPixmap(icon_path)
+            if not pix.isNull():
+                logo_lbl.setPixmap(
+                    pix.scaled(52, 52, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                )
+                header.addWidget(logo_lbl)
+                header.addSpacing(8)
+
         title_box = QVBoxLayout()
-        self.title_lbl = QLabel(f"Parsec Host • {socket.gethostname()}")
+        self.title_lbl = QLabel(f"TuxSec Host • {socket.gethostname()}")
         self.title_lbl.setProperty("class", "header-title")
         self.sub_lbl = QLabel("Gerenciamento em tempo real de tela, taxa de bits e convidados conectados")
         self.sub_lbl.setProperty("class", "muted")
