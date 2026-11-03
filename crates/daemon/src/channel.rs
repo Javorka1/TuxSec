@@ -475,6 +475,32 @@ pub(crate) fn is_permissions(
     ))
 }
 
+/// A tray's or control panel's request to approve a pending guest attempt.
+pub(crate) fn is_approve(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("approve")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// A tray's or control panel's request to decline a pending guest attempt.
+pub(crate) fn is_reject(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("reject")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// A tray's or control panel's request to toggle automatic guest approval in real time.
+pub(crate) fn is_approve_shared(body: &[u8]) -> Option<bool> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("approve_shared")?
+        .as_bool()
+}
+
 /// The state a frame carries, as the service described it.
 pub(crate) fn is_state(body: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice::<serde_json::Value>(body)

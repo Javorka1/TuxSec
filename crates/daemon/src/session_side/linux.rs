@@ -558,7 +558,9 @@ impl Side {
         settings: &app::Settings,
         peers: &HashMap<String, Introduced>,
         established: &HashSet<String>,
-    ) {
+        pending: &[serde_json::Value],
+        approve_shared: &mut bool,
+    ) -> (Vec<String>, Vec<String>) {
         // **A lease, held while somebody is watching.** The screen blanking
         // during a session is the desktop doing exactly what it was told, and
         // nothing below the session can argue with it, so the session is asked
@@ -601,10 +603,36 @@ impl Side {
         }
         channel::drop_overdue();
 
+        let mut approved = Vec::new();
+        let mut rejected = Vec::new();
         // **What a tray asked for, acted on here and attributed.** A tray's
         // frames wait in their own queue for the same reason a session's do:
         // only this loop may touch the guests.
         for (who, asked) in channel::take_acted() {
+            if let Some(attempt) = channel::is_approve(&asked) {
+                lowlat_common::log_info!(
+                    "lowlatd: tray pid={} uid={} approved pending attempt {attempt}",
+                    who.pid,
+                    who.uid
+                );
+                approved.push(attempt);
+            }
+            if let Some(attempt) = channel::is_reject(&asked) {
+                lowlat_common::log_info!(
+                    "lowlatd: tray pid={} uid={} rejected pending attempt {attempt}",
+                    who.pid,
+                    who.uid
+                );
+                rejected.push(attempt);
+            }
+            if let Some(flag) = channel::is_approve_shared(&asked) {
+                lowlat_common::log_info!(
+                    "lowlatd: tray pid={} uid={} set approve_shared={flag}",
+                    who.pid,
+                    who.uid
+                );
+                *approve_shared = flag;
+            }
             app::on_action(seam, settings, who, &asked);
         }
         // **Said on every pass while somebody is looking, and sent on
@@ -613,7 +641,14 @@ impl Side {
         // the channel decides whether it differs from what it last sent.
         // Nothing is worked out for nobody.
         if channel::trays() > 0 {
-            channel::state(&app::state(seam, &mut self.shown, peers, established));
+            channel::state(&app::state(
+                seam,
+                &mut self.shown,
+                peers,
+                established,
+                pending,
+                *approve_shared,
+            ));
         }
 
         // **The display belongs to whichever session is in front of it, and
@@ -678,6 +713,7 @@ impl Side {
         if self.placed.is_some() {
             seam.set_place(self.placed);
         }
+        (approved, rejected)
     }
 }
 

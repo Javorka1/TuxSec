@@ -503,6 +503,8 @@ pub(crate) fn state(
     shown: &mut Shown,
     peers: &std::collections::HashMap<String, crate::service::Introduced>,
     established: &std::collections::HashSet<String>,
+    pending: &[serde_json::Value],
+    approve_shared: bool,
 ) -> serde_json::Value {
     let captured = seam.captured();
     if captured != shown.captured || shown.outputs.is_empty() {
@@ -565,6 +567,8 @@ pub(crate) fn state(
         "bitrate": bitrate_mbps,
         "codec": codec,
         "guests": guests,
+        "pending": pending,
+        "approve_shared": approve_shared,
     })
 }
 

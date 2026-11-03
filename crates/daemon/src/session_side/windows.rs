@@ -29,7 +29,10 @@ impl Side {
         _settings: &app::Settings,
         _peers: &HashMap<String, Introduced>,
         _established: &HashSet<String>,
-    ) {
+        _pending: &[serde_json::Value],
+        _approve_shared: &mut bool,
+    ) -> (Vec<String>, Vec<String>) {
+        (Vec::new(), Vec::new())
     }
 }
 

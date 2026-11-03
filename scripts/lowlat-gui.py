@@ -539,7 +539,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         top = QHBoxLayout()
-        lbl = QLabel("👥  Convidados Conectados & Permissões")
+        lbl = QLabel("👥  Convidados Conectados & Pedidos de Entrada")
         lbl.setProperty("class", "section-title")
         top.addWidget(lbl)
         top.addStretch()
@@ -547,6 +547,19 @@ class MainWindow(QMainWindow):
         self.guests_count_lbl.setProperty("class", "muted")
         top.addWidget(self.guests_count_lbl)
         layout.addLayout(top)
+
+        cfg = parse_lowlatd_env()
+        self.chk_live_approve = QCheckBox(
+            "🔓 Aceitar entrada de amigos automaticamente (desmarque para exigir sua aprovação ao entrarem)"
+        )
+        self.chk_live_approve.setChecked(cfg["approve_shared"])
+        self.chk_live_approve.toggled.connect(self.toggle_live_approve_shared)
+        layout.addWidget(self.chk_live_approve)
+
+        self._notified_pending = set()
+        self.pending_box = QVBoxLayout()
+        self.pending_box.setSpacing(10)
+        layout.addLayout(self.pending_box)
 
         self.guests_box = QVBoxLayout()
         self.guests_box.setSpacing(10)
@@ -856,6 +869,7 @@ class MainWindow(QMainWindow):
 
         self.chk_approve = QCheckBox("Aceitar conexão de amigos automaticamente (--approve-shared)")
         self.chk_approve.setChecked(cfg["approve_shared"])
+        self.chk_approve.toggled.connect(self._sync_approve_from_defaults)
         row3.addWidget(self.chk_approve)
         layout.addLayout(row3)
 
@@ -868,6 +882,42 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         self.content_layout.addWidget(card)
+
+    def _sync_approve_from_defaults(self, checked):
+        if hasattr(self, "chk_live_approve") and self.chk_live_approve.isChecked() != checked:
+            self.chk_live_approve.blockSignals(True)
+            self.chk_live_approve.setChecked(checked)
+            self.chk_live_approve.blockSignals(False)
+        self.toggle_live_approve_shared(checked)
+
+    def toggle_live_approve_shared(self, checked):
+        if hasattr(self, "chk_approve") and self.chk_approve.isChecked() != checked:
+            self.chk_approve.blockSignals(True)
+            self.chk_approve.setChecked(checked)
+            self.chk_approve.blockSignals(False)
+        try:
+            self.bridge.send({"approve_shared": bool(checked)})
+            self.notify_msg(
+                "Entrada automática ATIVADA em tempo real."
+                if checked
+                else "Modo de aprovação manual ATIVADO! Quando alguém tentar entrar, aparecerá o pedido aqui."
+            )
+        except Exception as e:
+            self.notify_msg(f"Erro: {e}")
+
+    def approve_pending(self, attempt_id, guest_name):
+        try:
+            self.bridge.send({"approve": attempt_id})
+            self.notify_msg(f"✅ Entrada de {guest_name} aprovada!")
+        except Exception as e:
+            self.notify_msg(f"Erro ao aprovar: {e}")
+
+    def reject_pending(self, attempt_id, guest_name):
+        try:
+            self.bridge.send({"reject": attempt_id})
+            self.notify_msg(f"🚫 Entrada de {guest_name} recusada.")
+        except Exception as e:
+            self.notify_msg(f"Erro ao recusar: {e}")
 
     def set_live_output(self, output_id):
         try:
@@ -959,14 +1009,87 @@ class MainWindow(QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+        # Sync live approve_shared checkbox from daemon state if present
+        if "approve_shared" in self.state:
+            ap = bool(self.state["approve_shared"])
+            if hasattr(self, "chk_live_approve") and self.chk_live_approve.isChecked() != ap:
+                self.chk_live_approve.blockSignals(True)
+                self.chk_live_approve.setChecked(ap)
+                self.chk_live_approve.blockSignals(False)
+            if hasattr(self, "chk_approve") and self.chk_approve.isChecked() != ap:
+                self.chk_approve.blockSignals(True)
+                self.chk_approve.setChecked(ap)
+                self.chk_approve.blockSignals(False)
+
+        # Render pending connection requests waiting for host approval
+        pending = self.state.get("pending", [])
+        while self.pending_box.count():
+            item = self.pending_box.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        current_pending_ids = set()
+        for p in pending:
+            aid = p.get("attempt_id", "")
+            pname = p.get("name") or "Convidado"
+            current_pending_ids.add(aid)
+
+            p_frame = QFrame()
+            p_frame.setStyleSheet(
+                "QFrame { background-color: #2d2212; border: 2px solid #f59e0b; border-radius: 10px; }"
+            )
+            play = QHBoxLayout(p_frame)
+            play.setContentsMargins(14, 12, 14, 12)
+            play.setSpacing(12)
+
+            plbl = QLabel(f"🔔  <b>{pname}</b> está pedindo permissão para entrar no seu PC!")
+            plbl.setStyleSheet("color: #fef3c7; font-size: 14px; border: none;")
+            play.addWidget(plbl)
+            play.addStretch()
+
+            btn_allow = QPushButton("✅ Permitir Entrada")
+            btn_allow.setProperty("class", "perm-on")
+            btn_allow.clicked.connect(lambda _, a=aid, n=pname: self.approve_pending(a, n))
+            play.addWidget(btn_allow)
+
+            btn_deny = QPushButton("❌ Recusar")
+            btn_deny.setProperty("class", "danger")
+            btn_deny.clicked.connect(lambda _, a=aid, n=pname: self.reject_pending(a, n))
+            play.addWidget(btn_deny)
+
+            self.pending_box.addWidget(p_frame)
+
+            if aid and aid not in self._notified_pending:
+                self._notified_pending.add(aid)
+                self.notify_msg(f"🔔 {pname} está pedindo permissão para entrar!")
+                try:
+                    subprocess.Popen(
+                        [
+                            "notify-send",
+                            "-a",
+                            "TuxSec",
+                            "🐧 TuxSec — Pedido de Conexão",
+                            f"{pname} está pedindo permissão para entrar no seu PC! Abra o painel TuxSec para permitir ou recusar.",
+                        ]
+                    )
+                except Exception:
+                    pass
+                self.raise_()
+                self.activateWindow()
+
+        self._notified_pending.intersection_update(current_pending_ids)
+
         # Render guests
-        self.guests_count_lbl.setText(f"{len(guests)} conectado(s)")
+        self.guests_count_lbl.setText(
+            f"{len(guests)} conectado(s)"
+            + (f" • {len(pending)} aguardando aprovação" if pending else "")
+        )
         while self.guests_box.count():
             item = self.guests_box.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        if not guests:
+        if not guests and not pending:
             empty = QLabel("Nenhum convidado conectado no momento.")
             empty.setProperty("class", "muted")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1022,8 +1145,9 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def restart_service(self):
-        subprocess.Popen(["pkexec", "systemctl", "restart", "lowlatd.service"])
+        self.badge_lbl.setText("↻ REINICIANDO HOST...")
         self.notify_msg("Solicitando reinicialização do serviço lowlatd.service...")
+        subprocess.Popen(["pkexec", "systemctl", "restart", "lowlatd.service"])
 
     def save_persistent_settings(self):
         args = []
@@ -1041,6 +1165,25 @@ class MainWindow(QMainWindow):
         if self.chk_approve.isChecked():
             args.append("--approve-shared")
 
+        # Apply settings live immediately over the socket as well!
+        try:
+            self.bridge.send({"approve_shared": self.chk_approve.isChecked()})
+            self.bridge.send(
+                {
+                    "config": {
+                        "video": [
+                            {
+                                "output": out if out else "none",
+                                "encoderFPS": self.spn_fps.value(),
+                                "encoderMaxBitrate": self.spn_bitrate.value(),
+                            }
+                        ]
+                    }
+                }
+            )
+        except Exception:
+            pass
+
         args_line = "LOWLATD_ARGS=" + " ".join(args)
         uid = os.getuid()
         pulse_line = f"PULSE_SERVER=unix:/run/user/{uid}/pulse/native"
@@ -1050,8 +1193,9 @@ class MainWindow(QMainWindow):
             f"sed -i 's|^#* *PULSE_SERVER=.*|{pulse_line}|' /etc/lowlat/lowlatd.env && "
             "systemctl restart lowlatd.service"
         )
+        self.badge_lbl.setText("↻ SALVANDO E REINICIANDO...")
         subprocess.Popen(["pkexec", "/bin/sh", "-c", script])
-        self.notify_msg("Salvando configurações em /etc/lowlat/lowlatd.env e reiniciando o Host...")
+        self.notify_msg("Configurações aplicadas em tempo real e salvando em /etc/lowlat/lowlatd.env...")
 
 
 class LoginDialog(QDialog):

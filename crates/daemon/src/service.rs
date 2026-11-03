@@ -761,7 +761,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // needing approval, with the permissions it relayed: with no prompt here,
     // the one way to let an account the host was shared with in without its
     // being pre-approved.
-    let approve_shared = flag_set("--approve-shared");
+    let mut approve_shared = flag_set("--approve-shared");
     let base_port: u16 = flag("--port")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -1082,7 +1082,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &name,
                     max_guests,
                     reject_all,
-                    approve_shared,
+                    &mut approve_shared,
                     &settings,
                     &stop,
                 )
@@ -1173,6 +1173,107 @@ async fn end_guests(seam: &mut Admission) {
     );
 }
 
+fn admit_offer(
+    client: &mut Client,
+    seam: &mut Admission,
+    peers: &mut std::collections::HashMap<String, Introduced>,
+    offer: OfferRelay,
+    reject_all: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let refusal = if reject_all {
+        Some("policy".to_string())
+    } else {
+        let transport = if offer.data.wants_web() {
+            Transport::Web
+        } else {
+            Transport::Bud
+        };
+        seam.new_attempt(
+            &offer.attempt_id,
+            Peer {
+                ufrag: offer.data.creds.ice_ufrag,
+                pwd: offer.data.creds.ice_pwd,
+                aes256: offer.data.creds.aes256,
+                transport,
+                fingerprint: offer.data.creds.fingerprint,
+                permissions: lowlat_host::inject::Permissions {
+                    keyboard: offer.permissions.keyboard,
+                    pointer: offer.permissions.mouse,
+                    gamepad: offer.permissions.gamepad,
+                },
+                owner: offer.is_owner,
+            },
+        )
+        .err()
+        .map(|error| error.to_string())
+    };
+    if let Some(why) = refusal {
+        lowlat_common::log_info!("lowlatd: declining {}: {why}", offer.attempt_id);
+        let empty = no_credentials();
+        client.send(
+            "answer",
+            &Answer {
+                approved: false,
+                attempt_id: &offer.attempt_id,
+                data: AnswerData {
+                    base: HostDataBase::default(),
+                    creds: &empty,
+                },
+                to: &offer.from,
+            },
+        )?;
+        seam.end_connection(&offer.attempt_id);
+        peers.remove(&offer.attempt_id);
+        return Ok(());
+    }
+    let host = seam.begin_p2p(&offer.attempt_id, 0)?;
+
+    let creds = Credentials {
+        aes256: (!host.aes256.is_empty()).then_some(host.aes256),
+        fingerprint: host.fingerprint,
+        ice_ufrag: host.ufrag,
+        ice_pwd: host.pwd,
+    };
+    client.send(
+        "answer",
+        &Answer {
+            approved: true,
+            attempt_id: &offer.attempt_id,
+            data: AnswerData {
+                base: HostDataBase::default(),
+                creds: &creds,
+            },
+            to: &offer.from,
+        },
+    )?;
+    lowlat_common::log_info!("lowlatd: answered, guest bound to port {}", host.port);
+    Ok(())
+}
+
+fn apply_candex(seam: &mut Admission, relay: &CandexRelay) {
+    match relay.data.read() {
+        Relayed::Ready => {
+            seam.add_candidate(
+                &relay.attempt_id,
+                UNREAD_MARKER_ADDRESS,
+                true,
+                lowlat_host::admission::Kind::Direct,
+            );
+        }
+        Relayed::Probe(addr) => {
+            let kind = lowlat_host::admission::Kind::marked(
+                relay.data.lan,
+                relay.data.from_stun,
+            );
+            seam.add_candidate(&relay.attempt_id, addr, false, kind);
+        }
+        Relayed::Unreadable => lowlat_common::log_info!(
+            "lowlatd: candidate not an address, ignored: {}",
+            relay.data.ip
+        ),
+    }
+}
+
 /// One connection's lifetime. Returns true when the operator asked to stop, and
 /// false when the connection merely ended and should be retried.
 #[allow(
@@ -1187,7 +1288,7 @@ async fn session_loop(
     name: &str,
     capacity: u32,
     reject_all: bool,
-    approve_shared: bool,
+    approve_shared: &mut bool,
     settings: &app::Settings,
     stop: &Stop,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -1217,9 +1318,9 @@ async fn session_loop(
         settings.guest_clipboard.name()
     );
     let mut rostered = lowlat_common::clock::Time::now();
-    // Offers waiting for an approval nothing here gives, oldest first: the
-    // attempt, who sent it, and when.
-    let mut held: Vec<(String, String, lowlat_common::clock::Time)> = Vec::new();
+    // Offers waiting for approval from the GUI/tray, oldest first.
+    let mut held: Vec<(OfferRelay, lowlat_common::clock::Time)> = Vec::new();
+    let mut held_candidates: Vec<CandexRelay> = Vec::new();
     // What the session's side of this host keeps between passes.
     let mut side = session_side::Side::new();
 
@@ -1244,141 +1345,41 @@ async fn session_loop(
                                 name: offer.user.name.clone(),
                             },
                         );
-                        // **Signaling says who needs approval, and nothing here
-                        // gives one.** An offer that is neither the owner's nor
-                        // marked to skip it is held unanswered, as a host holds
-                        // one while nobody approves, and declined after
-                        // `HOLD_MS` -- unless the switch approves it.
                         if !offer.is_owner && !offer.skip_approval {
-                            if approve_shared {
+                            if *approve_shared {
                                 lowlat_common::log_info!(
                                     "lowlatd: approving {}, it needs approval and --approve-shared gives it",
                                     offer.attempt_id
                                 );
                             } else {
                                 lowlat_common::log_info!(
-                                    "lowlatd: holding {}, it needs approval and nothing here approves",
-                                    offer.attempt_id
+                                    "lowlatd: holding {} ({}) for host approval in GUI",
+                                    offer.attempt_id,
+                                    offer.user.name
                                 );
                                 held.push((
-                                    offer.attempt_id.clone(),
-                                    offer.from.clone(),
+                                    offer,
                                     lowlat_common::clock::Time::now(),
                                 ));
                                 continue;
                             }
                         }
 
-                        // Admission is the application's decision, and past
-                        // approval this application's policy is capacity alone.
-                        // **Silence is not a refusal.** A declined answer is a
-                        // wire event the peer acts on at once; no answer at all
-                        // leaves a peer that keeps no timer of its own
-                        // connecting indefinitely, because nothing in the
-                        // protocol reports a host that never replied. Every
-                        // offer gets an answer, including the ones we turn down
-                        // and the ones held for approval.
-                        let refusal = if reject_all {
-                            Some("policy".to_string())
-                        } else {
-                            let transport = if offer.data.wants_web() {
-                                Transport::Web
-                            } else {
-                                Transport::Bud
-                            };
-                            seam.new_attempt(&offer.attempt_id, Peer {
-                                ufrag: offer.data.creds.ice_ufrag,
-                                pwd: offer.data.creds.ice_pwd,
-                                aes256: offer.data.creds.aes256,
-                                transport,
-                                fingerprint: offer.data.creds.fingerprint,
-                                permissions: lowlat_host::inject::Permissions {
-                                    keyboard: offer.permissions.keyboard,
-                                    pointer: offer.permissions.mouse,
-                                    gamepad: offer.permissions.gamepad,
-                                },
-                                owner: offer.is_owner,
-                            })
-                            .err()
-                            .map(|error| error.to_string())
-                        };
-                        if let Some(why) = refusal {
-                            lowlat_common::log_info!("lowlatd: declining {}: {why}", offer.attempt_id);
-                            let empty = no_credentials();
-                            client.send("answer", &Answer {
-                                approved: false,
-                                attempt_id: &offer.attempt_id,
-                                data: AnswerData {
-                                    base: HostDataBase::default(),
-                                    creds: &empty,
-                                },
-                                to: &offer.from,
-                            })?;
-                            seam.end_connection(&offer.attempt_id);
-                            peers.remove(&offer.attempt_id);
-                            continue;
-                        }
-                        // **Zero: no opinion.** This service manages no
-                        // gateway mapping and no port pool, so the configured
-                        // base is the right start and the seam reports where it
-                        // landed.
-                        let host = seam.begin_p2p(&offer.attempt_id, 0)?;
-
-                        let creds = Credentials {
-                            // Empty means the attempt keys from the
-                            // fingerprint, and the answer omits the field a
-                            // peer of that generation cannot read.
-                            aes256: (!host.aes256.is_empty()).then_some(host.aes256),
-                            fingerprint: host.fingerprint,
-                            ice_ufrag: host.ufrag,
-                            ice_pwd: host.pwd,
-                        };
-                        client.send("answer", &Answer {
-                            approved: true,
-                            attempt_id: &offer.attempt_id,
-                            data: AnswerData { base: HostDataBase::default(), creds: &creds },
-                            to: &offer.from,
-                        })?;
-                        lowlat_common::log_info!("lowlatd: answered, guest bound to port {}", host.port);
-
-
+                        admit_offer(&mut client, seam, peers, offer, reject_all)?;
                     }
                     "candex_relay" => {
                         let relay: CandexRelay = serde_json::from_value(message.payload)?;
-                        match relay.data.read() {
-                            Relayed::Ready => {
-                                seam.add_candidate(
-                                    &relay.attempt_id,
-                                    UNREAD_MARKER_ADDRESS,
-                                    true,
-                                    lowlat_host::admission::Kind::Direct,
-                                );
-                            }
-                            Relayed::Probe(addr) => {
-                                // Both of the peer's markings, classified in
-                                // one place for every caller of the seam.
-                                let kind = lowlat_host::admission::Kind::marked(
-                                    relay.data.lan,
-                                    relay.data.from_stun,
-                                );
-                                seam.add_candidate(&relay.attempt_id, addr, false, kind);
-                            }
-                            // Not every candidate is an address: a peer may
-                            // anonymise a host candidate behind a `.local` name
-                            // that only multicast resolution answers. Nothing
-                            // here can probe one, and saying so is the
-                            // difference between a candidate declined and a
-                            // candidate lost.
-                            Relayed::Unreadable => lowlat_common::log_info!(
-                                "lowlatd: candidate not an address, ignored: {}",
-                                relay.data.ip
-                            ),
+                        if held.iter().any(|(o, _)| o.attempt_id == relay.attempt_id) {
+                            held_candidates.push(relay);
+                        } else {
+                            apply_candex(seam, &relay);
                         }
                     }
                     "offer_cancel_relay" => {
                         let cancel: CancelRelay = serde_json::from_value(message.payload)?;
                         lowlat_common::log_info!("lowlatd: cancelled {}", cancel.attempt_id);
-                        held.retain(|(attempt, _, _)| *attempt != cancel.attempt_id);
+                        held.retain(|(offer, _)| offer.attempt_id != cancel.attempt_id);
+                        held_candidates.retain(|c| c.attempt_id != cancel.attempt_id);
                         seam.end_connection(&cancel.attempt_id);
                         peers.remove(&cancel.attempt_id);
                         client.send("conn_update", &advertisement(name, capacity, occupancy(seam)))?;
@@ -1425,9 +1426,12 @@ async fn session_loop(
         // **A held offer gets its answer too**, once its hold is over.
         while held
             .first()
-            .is_some_and(|(_, _, since)| lowlat_common::clock::elapsed_ms(*since) >= HOLD_MS)
+            .is_some_and(|(_, since)| lowlat_common::clock::elapsed_ms(*since) >= HOLD_MS)
         {
-            let (attempt, to, _) = held.remove(0);
+            let (offer, _) = held.remove(0);
+            let attempt = offer.attempt_id;
+            let to = offer.from;
+            held_candidates.retain(|c| c.attempt_id != attempt);
             lowlat_common::log_info!("lowlatd: declining {attempt}: not approved in time");
             let empty = no_credentials();
             client.send(
@@ -1445,7 +1449,64 @@ async fn session_loop(
             peers.remove(&attempt);
         }
 
-        side.pass(seam, settings, peers, established);
+        let pending_json: Vec<serde_json::Value> = held
+            .iter()
+            .map(|(offer, _)| {
+                serde_json::json!({
+                    "attempt_id": offer.attempt_id,
+                    "name": offer.user.name,
+                    "from": offer.from,
+                })
+            })
+            .collect();
+
+        let (mut approved_ids, rejected_ids) =
+            side.pass(seam, settings, peers, established, &pending_json, approve_shared);
+
+        if *approve_shared && !held.is_empty() {
+            for (offer, _) in &held {
+                if !approved_ids.contains(&offer.attempt_id) {
+                    approved_ids.push(offer.attempt_id.clone());
+                }
+            }
+        }
+
+        for reject_id in rejected_ids {
+            if let Some(pos) = held.iter().position(|(o, _)| o.attempt_id == reject_id) {
+                let (offer, _) = held.remove(pos);
+                held_candidates.retain(|c| c.attempt_id != reject_id);
+                let empty = no_credentials();
+                client.send(
+                    "answer",
+                    &Answer {
+                        approved: false,
+                        attempt_id: &offer.attempt_id,
+                        data: AnswerData {
+                            base: HostDataBase::default(),
+                            creds: &empty,
+                        },
+                        to: &offer.from,
+                    },
+                )?;
+                peers.remove(&offer.attempt_id);
+            }
+        }
+
+        for approve_id in approved_ids {
+            if let Some(pos) = held.iter().position(|(o, _)| o.attempt_id == approve_id) {
+                let (offer, _) = held.remove(pos);
+                admit_offer(&mut client, seam, peers, offer, reject_all)?;
+                let mut remaining = Vec::new();
+                for relay in held_candidates.drain(..) {
+                    if relay.attempt_id == approve_id {
+                        apply_candex(seam, &relay);
+                    } else {
+                        remaining.push(relay);
+                    }
+                }
+                held_candidates = remaining;
+            }
+        }
 
         while let Some(received) = seam.poll_event() {
             // **Said out loud, because the queue is bounded.** An application
